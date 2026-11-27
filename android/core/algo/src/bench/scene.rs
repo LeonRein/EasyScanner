@@ -1,10 +1,11 @@
-//! The known world of a synthetic scan: the printed board on its z = 0 plane
-//! and simple solids standing on it, all in the OpenCV board frame (mm). The
+//! The known world of a synthetic scan: the printed board (on the plane
+//! z = 0, or bent to a [`BoardSurface`]) and simple solids standing on it, all in the OpenCV board frame (mm). The
 //! camera looks at the printed face from −Z, so "up" (toward the camera,
 //! where objects stand) is −Z, as in [`crate::geom::Pose::up_sign`].
 
 use serde::{Deserialize, Serialize};
 
+use crate::board_surface::BoardSurface;
 use crate::geom::{V3, add, dot, norm, scale, sub};
 use crate::recording::BoardDims;
 
@@ -89,7 +90,7 @@ impl Shape {
 /// What a ray hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Surface {
-    /// The board plane (inside the printed area or the table around it).
+    /// The board (inside the printed area or the table around it).
     Board,
     Shape(usize),
 }
@@ -130,23 +131,38 @@ impl BoardDims {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     pub board: BoardDims,
+    /// The board's true shape; the table around it continues it.
+    #[serde(default)]
+    pub surface: BoardSurface,
     pub shapes: Vec<Shape>,
+    /// Colour of the solids, per RGB channel on top of [`SHAPE_ALBEDO`]
+    /// (white by default; a reddish object pulls a red stripe's chroma).
+    #[serde(default = "white")]
+    pub shape_tint: [f64; 3],
+}
+
+fn white() -> [f64; 3] {
+    [1.0; 3]
 }
 
 /// Albedo of the solids (matte light grey).
 pub const SHAPE_ALBEDO: f64 = 0.7;
 
 impl Scene {
+    /// A flat board with `shapes` on it.
+    pub fn flat(board: BoardDims, shapes: Vec<Shape>) -> Self {
+        Scene { board, surface: BoardSurface::flat(), shapes, shape_tint: white() }
+    }
+
+    /// The board's corners where they really are: `(id, board point)`.
+    pub fn corners(&self) -> impl Iterator<Item = (u32, V3)> + '_ {
+        self.board.corners().map(|(id, p)| (id, self.surface.point(p[0], p[1])))
+    }
+
     /// Nearest hit of the ray `o + s·dir` (dir unit, board frame) with the
-    /// board plane (camera side) or a solid.
+    /// board (camera side) or a solid.
     pub fn trace(&self, o: V3, dir: V3) -> Option<(f64, Surface)> {
-        let mut best: Option<(f64, Surface)> = None;
-        if dir[2].abs() > 1e-12 {
-            let s = -o[2] / dir[2];
-            if s > 1e-7 {
-                best = Some((s, Surface::Board));
-            }
-        }
+        let mut best: Option<(f64, Surface)> = self.surface.meet(o, dir).filter(|&s| s > 1e-7).map(|s| (s, Surface::Board));
         for (i, sh) in self.shapes.iter().enumerate() {
             if let Some(s) = sh.hit(o, dir)
                 && best.is_none_or(|(b, _)| s < b)
@@ -172,6 +188,14 @@ impl Scene {
         match surf {
             Surface::Board => self.board.albedo(p[0], p[1]),
             Surface::Shape(_) => SHAPE_ALBEDO,
+        }
+    }
+
+    /// Per-channel factor on [`Scene::albedo`]: the board prints grey.
+    pub fn tint(&self, surf: Surface) -> [f64; 3] {
+        match surf {
+            Surface::Board => white(),
+            Surface::Shape(_) => self.shape_tint,
         }
     }
 
@@ -210,7 +234,7 @@ mod tests {
 
     #[test]
     fn occlusion() {
-        let sc = Scene { board: BoardDims::default(), shapes: vec![Shape::ball_on_board(100.0, 100.0, 20.0)] };
+        let sc = Scene::flat(BoardDims::default(), vec![Shape::ball_on_board(100.0, 100.0, 20.0)]);
         assert!(!sc.visible([100.0, 100.0, -300.0], [100.0, 100.0, 0.0]));
         assert!(sc.visible([100.0, 100.0, -300.0], [100.0, 100.0, -40.0]));
         assert!(sc.visible([0.0, 0.0, -300.0], [0.0, 0.0, 0.0]));

@@ -168,17 +168,27 @@ impl BoardSurface {
     }
 
     /// Where the camera ray `s·dir` (camera frame) meets the surface, for
-    /// the board→camera `pose`: `(camera point, board point)`. Newton on the
-    /// ray parameter from the plane's intersection; `None` when the ray runs
-    /// (nearly) parallel to the board or does not converge.
+    /// the board→camera `pose`: `(camera point, board point)`. `None` when
+    /// the ray runs (nearly) parallel to the board, misses it, or does not
+    /// converge.
     pub fn intersect(&self, pose: &Pose, dir: V3) -> Option<(V3, V3)> {
         let o = pose.camera_position();
         let d = mat_t_vec(&pose.r, dir);
+        let s = self.meet(o, d)?;
+        Some((scale(dir, s), add(o, scale(d, s))))
+    }
+
+    /// The ray parameter `s > 0` where the board-frame ray `o + s·d` meets
+    /// the surface: Newton from the plane's intersection.
+    pub fn meet(&self, o: V3, d: V3) -> Option<f64> {
         if d[2].abs() < 1e-9 {
             return None;
         }
         let at = |s: f64| add(o, scale(d, s));
         let mut s = -o[2] / d[2];
+        if self.is_flat() {
+            return (s > 0.0).then_some(s);
+        }
         for _ in 0..8 {
             let b = at(s);
             let f = b[2] - self.height(b[0], b[1]);
@@ -194,7 +204,7 @@ impl BoardSurface {
             }
         }
         let b = at(s);
-        ((b[2] - self.height(b[0], b[1])).abs() < 1e-6 && s > 0.0).then(|| (scale(dir, s), b))
+        ((b[2] - self.height(b[0], b[1])).abs() < 1e-6 && s > 0.0).then_some(s)
     }
 
     /// Largest height difference between two surfaces over a

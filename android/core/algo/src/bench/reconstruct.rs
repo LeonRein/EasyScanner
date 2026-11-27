@@ -5,10 +5,9 @@
 //! camera ray ∩ laser plane → the frame's reference instant → board frame →
 //! keep if inside the working volume.
 
-use std::convert::Infallible;
-
 use serde::{Deserialize, Serialize};
 
+use crate::board_surface::{BoardSurface, refine_pose};
 use crate::fusion::{FusionCfg, PoseFusion};
 use crate::gate::{FrameQuality, ScanGateCfg};
 use crate::geom::{Intrinsics, Pose, V3};
@@ -93,8 +92,16 @@ pub struct Reconstruction {
 }
 
 /// The frame's pose: the recorded one, or solved from its corners (with the
-/// rolling-shutter correction when there is one).
-pub fn frame_pose(f: &FrameRec, board: &BoardDims, k: &Intrinsics, from: PoseFrom, corr: Option<&Correction>) -> Option<FramePose> {
+/// rolling-shutter correction when there is one) as the app does: planar
+/// PnP, then refined against the board's `surface`.
+pub fn frame_pose(
+    f: &FrameRec,
+    board: &BoardDims,
+    surface: &BoardSurface,
+    k: &Intrinsics,
+    from: PoseFrom,
+    corr: Option<&Correction>,
+) -> Option<FramePose> {
     let recorded = f.pose.map(|p| FramePose {
         pose: p.pose(),
         reproj_rms: p.reproj_rms,
@@ -106,11 +113,10 @@ pub fn frame_pose(f: &FrameRec, board: &BoardDims, k: &Intrinsics, from: PoseFro
             return None;
         }
         let ids: Vec<(u32, V3)> = board.corners().collect();
-        let (obj, px): (Vec<V3>, Vec<[f64; 2]>) =
+        let (flat, px): (Vec<V3>, Vec<[f64; 2]>) =
             f.corners.iter().filter_map(|c| ids.get(c.id as usize).map(|&(_, p)| (p, [c.u, c.v]))).unzip();
-        let Ok(solved) = solve_corrected(corr, k, &obj, &px, |px| Ok::<_, Infallible>(pnp::solve_planar(k, &obj, px)), |s| s.0);
-        let (pose, rms) = solved?;
-        Some(FramePose { pose, reproj_rms: rms, corners: obj.len(), margin: f64::INFINITY })
+        let (pose, rms) = solve_on(surface, k, &flat, &px, corr)?;
+        Some(FramePose { pose, reproj_rms: rms, corners: flat.len(), margin: f64::INFINITY })
     };
     match from {
         PoseFrom::Recorded => recorded,
@@ -119,7 +125,21 @@ pub fn frame_pose(f: &FrameRec, board: &BoardDims, k: &Intrinsics, from: PoseFro
     }
 }
 
-/// Triangulate one frame's stripe into board-frame points inside the volume.
+/// Pose and reprojection RMS from corners at their nominal board positions
+/// `flat` (z = 0) and pixels `px`, on `surface`.
+pub fn solve_on(surface: &BoardSurface, k: &Intrinsics, flat: &[V3], px: &[[f64; 2]], corr: Option<&Correction>) -> Option<(Pose, f64)> {
+    let xy: Vec<[f64; 2]> = flat.iter().map(|p| [p[0], p[1]]).collect();
+    let obj: Vec<V3> = xy.iter().map(|&[x, y]| surface.point(x, y)).collect();
+    let solve = |px: &[[f64; 2]]| -> Result<Option<(Pose, f64)>, std::convert::Infallible> {
+        let planar = pnp::solve_planar(k, flat, px);
+        Ok(planar.map(|(pose, rms)| refine_pose(k, surface, &xy, px, pose).unwrap_or((pose, rms))))
+    };
+    let Ok(solved) = solve_corrected(corr, k, &obj, px, solve, |s| s.0);
+    solved
+}
+
+/// Triangulate one frame's stripe into board-frame points inside the volume
+/// and above the board's `surface`.
 pub fn triangulate(
     px: &[[f32; 2]],
     k: &Intrinsics,
@@ -127,15 +147,17 @@ pub fn triangulate(
     pose: &Pose,
     corr: Option<&Correction>,
     vol: &Volume,
-    mut out: impl FnMut(V3),
-) {
+    surface: &BoardSurface,
+) -> Vec<V3> {
+    let mut out = Vec::new();
     stripe::to_laser_plane(px, k, plane.0, plane.1, |i, x| {
         let x = corr.map_or(x, |c| c.stripe_point(x, px[i][1] as f64));
         let b = pose.to_board(x);
-        if vol.contains(pose, b) {
-            out(b);
+        if vol.contains(pose, b, surface) {
+            out.push(b);
         }
     });
+    out
 }
 
 pub fn reconstruct(rec: &Recording, cfg: &ReplayCfg) -> Reconstruction {
@@ -161,7 +183,9 @@ pub fn reconstruct(rec: &Recording, cfg: &ReplayCfg) -> Reconstruction {
         let k = f.intrinsics(setup);
         let corr = fusion.correction(&clock);
         r.corrected_frames += usize::from(corr.is_some());
-        let fp = frame_pose(f, &h.board, &k, cfg.pose_from, corr.as_ref());
+        let flat = BoardSurface::flat();
+        let surface = setup.board_surface.as_ref().unwrap_or(&flat);
+        let fp = frame_pose(f, &h.board, surface, &k, cfg.pose_from, corr.as_ref());
         // the fusion learns only from poses the gate's pose checks trust, as on the device
         let trusted = fp.filter(|p| {
             let q = FrameQuality { reproj_rms: p.reproj_rms, corners: p.corners, margin: p.margin, speed: None };
@@ -173,10 +197,9 @@ pub fn reconstruct(rec: &Recording, cfg: &ReplayCfg) -> Reconstruction {
             FrameSelection::Kept => f.scan.is_none_or(|s| s == ScanOutcome::Kept),
         };
         if let (true, Some(fp), Some(plane)) = (selected, &fp, setup.laser_plane) {
-            triangulate(&f.laser_px, &k, (plane.n, plane.d), &fp.pose, corr.as_ref(), &vol, |b| {
-                r.points.push(b);
-                r.point_frame.push(i as u32);
-            });
+            let points = triangulate(&f.laser_px, &k, (plane.n, plane.d), &fp.pose, corr.as_ref(), &vol, surface);
+            r.point_frame.extend(std::iter::repeat_n(i as u32, points.len()));
+            r.points.extend(points);
         }
         r.poses.push(fp);
     }

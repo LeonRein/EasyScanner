@@ -564,12 +564,12 @@ impl Engine {
             let mut pushed = false;
             // a frame that fails the gate is classified and shown, never kept
             let keep = self.scan_on && scan_verdict == Some(Ok(()));
-            let (cloud, px, scan_on) = (&mut self.cloud, &self.laser_px, keep);
+            let (cloud, px, scan_on, surface) = (&mut self.cloud, &self.laser_px, keep, self.surface.surface());
             stripe::to_laser_plane(px, &k, n, d, |i, x| {
                 // the point in the camera frame of the instant the pose describes
                 let x = correction.as_ref().map_or(x, |c| c.stripe_point(x, px[i][1] as f64));
                 let b = p.to_board(x);
-                if vol.contains(&p, b) {
+                if vol.contains(&p, b, surface) {
                     inside[i] = true;
                     if scan_on {
                         let (u, v) = (px[i][0].round() as usize, px[i][1].round() as usize);

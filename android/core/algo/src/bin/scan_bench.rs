@@ -4,10 +4,12 @@
 //! scan_bench sweep [--fast] [--seconds S] [--json]
 //!     every scenario of the error budget, one table
 //! scan_bench run [--config cfg.json] [--realistic] [--fast] [--seconds S]
-//!                [--save rec.json] [--ply out.ply] [--json]
+//!                [--save rec.jsonl] [--ply out.ply] [--json]
 //!     one scenario; --save keeps the recording, --ply the cloud
-//! scan_bench eval rec.json [--json]
-//!     reconstruct and score a saved recording (synthetic or, later, real)
+//! scan_bench eval rec.jsonl [--pose auto|recorded|corners] [--ply out.ply] [--json]
+//!     reconstruct and score a saved recording: synthetic, or a phone
+//!     session's recording.jsonl; --pose picks the device's poses or this
+//!     build's PnP on the recorded corners
 //! scan_bench eval-ply scan.ply [--radius R]
 //!     sphere fit of a scanned reference ball (radius error if R is given)
 //! scan_bench config [--realistic]
@@ -177,10 +179,20 @@ fn main() -> ExitCode {
             Ok(())
         }
         "eval" => {
+            let from = match a.value("--pose").as_deref() {
+                None | Some("auto") => PoseFrom::Auto,
+                Some("recorded") => PoseFrom::Recorded,
+                Some("corners") => PoseFrom::Corners,
+                Some(other) => return Err(format!("--pose {other}: expected auto, recorded or corners")),
+            };
+            let ply = a.value("--ply");
             let p = a.rest.first().ok_or("eval needs a recording")?.clone();
             let rec = Recording::load(Path::new(&p)).map_err(|e| format!("{p}: {e}"))?;
-            let recon = reconstruct::reconstruct(&rec, PoseFrom::Auto, &FusionCfg::default());
-            print_reports(&[metrics::evaluate(&rec.source, &rec, &recon)], json);
+            let recon = reconstruct::reconstruct(&rec, from, &FusionCfg::default());
+            if let Some(out) = ply {
+                save_ply(&recon.points, &out).map_err(|e| format!("{out}: {e}"))?;
+            }
+            print_reports(&[metrics::evaluate(&rec.header.source, &rec, &recon)], json);
             Ok(())
         }
         "eval-ply" => {

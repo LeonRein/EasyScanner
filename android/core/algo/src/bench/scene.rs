@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::BoardSpec;
 use crate::geom::{V3, add, dot, norm, scale, sub};
 
 /// A solid whose surface the scan should reproduce.
@@ -108,6 +109,17 @@ impl Default for BoardDims {
     /// The app's default board (`BoardSpec::default`): 8x8, 36 mm.
     fn default() -> Self {
         BoardDims { squares_x: 8, squares_y: 8, square_mm: 36.0, marker_mm: 26.64 }
+    }
+}
+
+impl From<BoardSpec> for BoardDims {
+    fn from(b: BoardSpec) -> Self {
+        BoardDims {
+            squares_x: b.squares_x as u32,
+            squares_y: b.squares_y as u32,
+            square_mm: b.square_mm.into(),
+            marker_mm: b.marker_mm.into(),
+        }
     }
 }
 

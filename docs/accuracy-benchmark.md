@@ -13,8 +13,8 @@ cd android/core
 cargo run --release -p scan-algo --bin scan_bench -- sweep          # error budget, ~2 min
 cargo run --release -p scan-algo --bin scan_bench -- sweep --fast   # analytic stripe only, ~20 s
 cargo run --release -p scan-algo --bin scan_bench -- config --realistic > my.json   # edit, then:
-cargo run --release -p scan-algo --bin scan_bench -- run --config my.json --save rec.json --ply cloud.ply
-cargo run --release -p scan-algo --bin scan_bench -- eval rec.json
+cargo run --release -p scan-algo --bin scan_bench -- run --config my.json --save rec.jsonl --ply cloud.ply
+cargo run --release -p scan-algo --bin scan_bench -- eval rec.jsonl
 cargo run --release -p scan-algo --bin scan_bench -- eval-ply scan.ply --radius 25
 cargo test -p scan-algo bench                                        # the benchmark's own tests
 ```
@@ -94,11 +94,23 @@ What it says (for this geometry, synthetic data):
 
 ## Real recordings
 
-`bench::recording::Recording` (JSON) holds per frame the corner pixels and/or
-the device pose and the stripe pixels, plus the intrinsics and laser plane
-the pipeline uses. The simulator writes it with a `truth` attached; a real
-session saved in the same shape (corners and stripe pixels from
-`engine.rs`, follow-up work) runs through the same `reconstruct` and
-`evaluate`, then without ground-truth metrics but with the sphere fit. Until
-then, a real scan of a reference ball exported as PLY can be scored with
-`eval-ply --radius <mm>`.
+`bench::recording::Recording` holds per frame the corner pixels and/or the
+device pose and the stripe pixels, the row timing, the gyro samples, and the
+intrinsics and laser plane the pipeline uses. It is stored as JSON lines (a
+header, then frames and gyro batches as they arrived, then the truth for a
+synthetic one), so the phone can stream it: every scan session writes its
+`recording.jsonl` next to `scan.ply` (Settings → Diagnostics → Record every
+scan, on by default; about 20–40 MB per minute of scanning). It starts with
+the first scanning frame, carries the gyro samples of the second before it,
+and ends early only if the calibration or the frame size changes under it.
+A file cut off mid-line (the app was killed) reads up to its last whole line.
+
+```sh
+cargo run --release -p scan-algo --bin scan_bench -- eval recording.jsonl --ply replay.ply
+cargo run --release -p scan-algo --bin scan_bench -- eval recording.jsonl --pose corners   # this build's PnP, not the phone's poses
+```
+
+A real recording has no ground truth, so `eval` reports what the pipeline
+saw (posed frames, points, reprojection error, the gyro calibration); a scan
+of a reference ball is scored with `eval-ply scan.ply --radius <mm>`, or on
+the replayed cloud.

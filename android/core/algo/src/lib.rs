@@ -23,6 +23,7 @@ pub mod laser;
 pub mod overlay;
 pub mod photo_session;
 pub mod plane;
+pub mod recorder;
 pub mod rolling;
 pub mod stripe;
 pub mod volume;

@@ -69,7 +69,7 @@ pub fn frame_pose(f: &FrameRec, rec: &Recording, k: &Intrinsics, from: PoseFrom,
         if f.corners.len() < MIN_CORNERS {
             return None;
         }
-        let ids: Vec<(u32, V3)> = rec.board.corners().collect();
+        let ids: Vec<(u32, V3)> = rec.header.board.corners().collect();
         let (obj, px): (Vec<V3>, Vec<[f64; 2]>) =
             f.corners.iter().filter_map(|c| ids.get(c.id as usize).map(|&(_, p)| (p, [c.u, c.v]))).unzip();
         let Ok(solved) = solve_corrected(corr, k, &obj, &px, |px| Ok::<_, Infallible>(pnp::solve_planar(k, &obj, px)), |s| s.0);
@@ -103,14 +103,15 @@ pub fn triangulate(
 }
 
 pub fn reconstruct(rec: &Recording, from: PoseFrom, fusion_cfg: &FusionCfg) -> Reconstruction {
-    let k: Intrinsics = rec.intrinsics.into();
-    let vol = rec.volume.volume(&rec.board);
-    let plane = (rec.laser_plane.n, rec.laser_plane.d);
+    let h = &rec.header;
+    let k: Intrinsics = h.intrinsics.into();
+    let vol = h.volume.volume(&h.board);
+    let plane = (h.laser_plane.n, h.laser_plane.d);
     // the app trusts a pose for the gyro calibration when it passes the
     // scan gate's pose checks
     let gate = ScanGateCfg::default();
     let mut fusion = PoseFusion::new(*fusion_cfg);
-    fusion.set_platform_mount(rec.cam_from_imu);
+    fusion.set_platform_mount(h.cam_from_imu);
     let mut gyro = rec.gyro.iter().peekable();
     let mut r = Reconstruction::default();
     for (i, f) in rec.frames.iter().enumerate() {

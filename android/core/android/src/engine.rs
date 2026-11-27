@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use opencv::core::{CV_8UC1, Mat};
+use scan_algo::bench::recording::{CornerRec, FrameRec, Header, PlaneRec, PoseRec, Recording};
 use scan_algo::cloud::PointCloud;
 use scan_algo::config::{self, Config, IntrinsicsFile, SavedPlane};
 use scan_algo::focus::laplacian_variance;
@@ -27,6 +28,7 @@ use scan_algo::laser::{LaserDetector, LaserParams, Roi, YuvFrame};
 use scan_algo::overlay;
 use scan_algo::photo_session::{Cylinder, PhotoSession, SessionInfo};
 use scan_algo::plane::{PlaneCalibrator, PlaneFit};
+use scan_algo::recorder::SessionRecorder;
 use scan_algo::rolling::RowClock;
 use scan_algo::stripe::{self, BoardStripe};
 use scan_algo::volume::Volume;
@@ -179,6 +181,8 @@ pub struct Engine {
     stripe_seen: VecDeque<i64>,
     /// The scan gate's verdicts on posed frames since the scan started.
     gate_stats: GateStats,
+    /// The open session's raw recording, when sessions are recorded.
+    recorder: Option<SessionRecorder>,
 }
 
 impl Engine {
@@ -224,6 +228,7 @@ impl Engine {
             photo_serial: 0.0,
             stripe_seen: VecDeque::new(),
             gate_stats: GateStats::default(),
+            recorder: None,
             cfg,
         };
         e.reload_calibrations();
@@ -307,9 +312,51 @@ impl Engine {
     }
 
     /// Gyroscope samples that arrived since the last frame (oldest first).
-    pub fn push_gyro(&mut self, samples: impl IntoIterator<Item = GyroSample>) {
+    pub fn push_gyro(&mut self, samples: &[GyroSample]) {
         for s in samples {
-            self.fusion.push_gyro(s);
+            self.fusion.push_gyro(*s);
+        }
+        if let Some(r) = &mut self.recorder {
+            r.push_gyro(samples);
+        }
+    }
+
+    /// The set-up a scanning frame is triangulated in, as a recording's header.
+    fn recording_header(&self, k: &Intrinsics, (n, d): (V3, f64)) -> Header {
+        Header {
+            version: Recording::VERSION,
+            source: format!("easyscanner, camera {}", self.cfg.camera.id),
+            board: self.cfg.board.into(),
+            volume: self.cfg.volume.into(),
+            intrinsics: (*k).into(),
+            laser_plane: PlaneRec { n, d },
+            cam_from_imu: self.cfg.camera.cam_from_imu,
+        }
+    }
+
+    /// Hand a scanning frame's raw observations to the session's recorder.
+    fn record_frame(&mut self, k: &Intrinsics, clock: &RowClock, pose: Option<&PoseResult>, found: bool) {
+        if self.recorder.is_none() {
+            return;
+        }
+        let Some(plane) = self.usable_plane() else { return };
+        let header = self.recording_header(k, plane);
+        let frame = FrameRec {
+            ts_ns: clock.start_ns,
+            readout_ns: clock.readout_ns,
+            exposure_ns: clock.exposure_ns,
+            pose: pose.map(|p| PoseRec::from(p.pose)),
+            corners: self
+                .tracker
+                .ids
+                .iter()
+                .zip(self.tracker.corners.iter())
+                .filter_map(|(id, q)| Some(CornerRec { id: u32::try_from(id).ok()?, u: q.x.into(), v: q.y.into() }))
+                .collect(),
+            laser_px: if found { self.laser_px.clone() } else { Vec::new() },
+        };
+        if let Some(r) = &mut self.recorder {
+            r.frame(&header, &frame);
         }
     }
 
@@ -496,6 +543,9 @@ impl Engine {
             self.cloud.sample(PREVIEW_POINTS, &mut self.preview);
         }
         let t_laser = t_laser0.elapsed();
+        if self.scan_on {
+            self.record_frame(&k, &clock, pose_res.as_ref(), found);
+        }
 
         // ── photo keyframes: this frame's pose for the stills, then the trigger ──
         self.track.set_latest_stripe(if found { self.laser_px.len() } else { 0 }, self.pts_in.len());
@@ -889,6 +939,9 @@ impl Engine {
     /// `scan.ply` Z up) when it has points the session lacks, so leaving the
     /// screen or a killed process loses nothing. Returns a note for the status line.
     fn checkpoint(&mut self) -> String {
+        if let Some(r) = &mut self.recorder {
+            r.flush();
+        }
         if self.photos.is_none() || self.cloud.is_empty() {
             return String::new();
         }
@@ -961,6 +1014,7 @@ impl Engine {
                 }
                 // whatever the cloud holds now is not in this session yet
                 self.cloud_unsaved = !self.cloud.is_empty();
+                self.recorder = self.cfg.record_sessions.then(|| SessionRecorder::new(s.dir()));
                 self.photos = Some(s);
                 self.photos_enabled = a.photos;
                 self.photo_serial = a.serial;
@@ -995,6 +1049,7 @@ impl Engine {
                 Err(e) => format!("the cloud was NOT written: {e}"),
             }
         };
+        let recording = self.recorder.take().map(|r| format!(" | {}", r.finish())).unwrap_or_default();
         let s = self.photos.take().expect("checked above");
         if s.count() == 0 && self.cloud.is_empty() {
             // nothing taken: leave no session behind
@@ -1002,7 +1057,7 @@ impl Engine {
             self.msgs.photos = format!("photos {why}: nothing taken");
             return self.msgs.photos.clone();
         }
-        self.msgs.photos = format!("photos {why}: {} in {} | {laser}", s.count(), s.dir().display());
+        self.msgs.photos = format!("photos {why}: {} in {} | {laser}{recording}", s.count(), s.dir().display());
         self.msgs.photos.clone()
     }
 

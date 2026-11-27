@@ -44,7 +44,7 @@ use crate::stripe;
 
 use metrics::Report;
 use reconstruct::{PoseFrom, Reconstruction};
-use recording::{CornerRec, FrameRec, PlaneRec, Recording, Truth, VolumeDims};
+use recording::{CornerRec, FrameRec, Header, PlaneRec, Recording, Truth, VolumeDims};
 use scene::{BoardDims, Scene, Shape};
 use sim::{Camera, CameraModel, GyroModel, IntrinsicsError, LaserMount, StripeModel, TimingError, Trajectory, look_at, uniform};
 
@@ -299,14 +299,16 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Recording, String> {
         g.sample(&cfg.trajectory, end, &mut Rng::new(cfg.seed ^ 0x6E70))
     });
     Ok(Recording {
-        version: Recording::VERSION,
-        source: format!("synthetic: {}", cfg.name),
-        board: cfg.board,
-        volume: cfg.volume,
-        intrinsics: cfg.intrinsics_error.apply(cfg.camera),
-        laser_plane: used,
+        header: Header {
+            version: Recording::VERSION,
+            source: format!("synthetic: {}", cfg.name),
+            board: cfg.board,
+            volume: cfg.volume,
+            intrinsics: cfg.intrinsics_error.apply(cfg.camera),
+            laser_plane: used,
+            cam_from_imu: cfg.gyro.map(|g| g.platform_mount()),
+        },
         frames,
-        cam_from_imu: cfg.gyro.map(|g| g.platform_mount()),
         gyro,
         truth: Some(Truth {
             scene,
@@ -438,14 +440,17 @@ mod tests {
     }
 
     #[test]
-    fn recording_round_trips_through_json() {
-        let mut cfg = short(BenchCfg::default());
+    fn recording_round_trips_through_json_lines() {
+        let mut cfg = short(BenchCfg { gyro: Some(GyroModel::default()), ..BenchCfg::default() });
         cfg.trajectory.duration_s = 0.2;
         let rec = simulate(&cfg).unwrap();
-        let json = serde_json::to_string(&rec).unwrap();
-        let back: Recording = serde_json::from_str(&json).unwrap();
+        let mut file = Vec::new();
+        rec.write(&mut file).unwrap();
+        let back = Recording::read(file.as_slice()).unwrap();
         // serde_json may round the last bit of a float: compare the content
+        assert_eq!(rec.header.board, back.header.board);
         assert_eq!(rec.frames.len(), back.frames.len());
+        assert_eq!(rec.gyro.len(), back.gyro.len());
         assert_eq!(rec.truth.as_ref().unwrap().scene, back.truth.as_ref().unwrap().scene);
         for (a, b) in rec.frames.iter().zip(&back.frames) {
             assert_eq!(a.corners.len(), b.corners.len());
@@ -454,5 +459,37 @@ mod tests {
                 assert!(p.id == q.id && (p.u - q.u).abs() < 1e-9 && (p.v - q.v).abs() < 1e-9);
             }
         }
+    }
+
+    #[test]
+    fn a_recording_cut_off_mid_line_reads_up_to_its_last_whole_line() {
+        let mut cfg = short(BenchCfg::default());
+        cfg.trajectory.duration_s = 0.2;
+        let mut rec = simulate(&cfg).unwrap();
+        rec.truth = None;
+        let mut file = Vec::new();
+        rec.write(&mut file).unwrap();
+        // the process died while writing the last frame
+        file.truncate(file.len() - 10);
+        let back = Recording::read(file.as_slice()).unwrap();
+        assert_eq!(back.frames.len(), rec.frames.len() - 1);
+        // a broken line in the middle is an error, not a cut-off
+        let mut broken = Vec::new();
+        rec.write(&mut broken).unwrap();
+        let at = broken.iter().position(|&b| b == b'\n').unwrap() + 3;
+        broken[at] = b'#';
+        assert!(Recording::read(broken.as_slice()).is_err());
+    }
+
+    #[test]
+    fn a_recording_of_another_version_is_refused() {
+        let mut cfg = short(BenchCfg::default());
+        cfg.trajectory.duration_s = 0.1;
+        let mut rec = simulate(&cfg).unwrap();
+        rec.header.version = 2;
+        let mut file = Vec::new();
+        rec.write(&mut file).unwrap();
+        let err = Recording::read(file.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("version 2"), "{err}");
     }
 }

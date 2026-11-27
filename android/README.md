@@ -192,6 +192,8 @@ exposure) is retried after 3 s; five failures in a row close the session.
                         corners, sharpness, laser_on / pass_id, sensor timestamp
   photos/left_0001.jpg  the camera's JPEG
   laser.ply             the laser cloud, written when Photos is stopped
+  recording.jsonl       the scan's raw observations, to replay it offline
+                        (Settings → Diagnostics; docs/accuracy-benchmark.md)
   ```
 
   Everything is in native's board frame: origin at the board centre, +Z out

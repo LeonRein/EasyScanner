@@ -193,6 +193,14 @@
             app:useSimpleSummaryProvider="true" />
     </PreferenceCategory>
 
+    <PreferenceCategory android:title="Diagnostics">
+        <SwitchPreferenceCompat
+            android:key="record_sessions"
+            android:title="Record every scan"
+            android:summary="recording.jsonl in the scan's folder: board corners, poses, laser pixels and gyro samples, to replay the scan offline (scan_bench eval). About 20–40 MB per minute of scanning."
+            android:defaultValue="true" />
+    </PreferenceCategory>
+
     <PreferenceCategory android:title="Calibration">
         <SeekBarPreference
             android:key="calib_views"

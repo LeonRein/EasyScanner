@@ -222,7 +222,7 @@ pub fn evaluate(name: &str, rec: &Recording, recon: &Reconstruction) -> Report {
     rep.pose_pos_mm = Stats::of(&pos);
 
     let (tn, td) = (truth.laser_plane.n, truth.laser_plane.d);
-    let (un, ud) = (rec.laser_plane.n, rec.laser_plane.d);
+    let (un, ud) = (rec.header.laser_plane.n, rec.header.laser_plane.d);
     rep.plane_angle_deg = Some(dot(tn, un).abs().min(1.0).acos().to_degrees());
     // the true sheet's point on the optical axis, measured against the used plane
     if tn[2].abs() > 1e-9 {

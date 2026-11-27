@@ -2,5 +2,7 @@
 <resources>
     <!-- Launcher icon palette, shared by the adaptive icon layers. -->
     <color name="ic_launcher_background">#0E1117</color>
+    <color name="ic_launcher_board_light">#F1F2F6</color>
+    <color name="ic_launcher_board_dark">#4E5055</color>
     <color name="ic_launcher_laser">#FF3B30</color>
 </resources>

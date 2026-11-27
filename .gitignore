@@ -39,3 +39,5 @@ desktop.ini
 *.jks
 *.keystore
 keystore.properties
+# …except the shared debug key, which is public by design (app/build.gradle.kts)
+!android/debug.keystore

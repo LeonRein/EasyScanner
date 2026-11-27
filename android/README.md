@@ -251,6 +251,13 @@ gradlew testDebugUnitTest    # Kotlin governor tests
 cd core && cargo test -p scan-algo   # Rust algorithm tests (host)
 ```
 
+Every build is signed with the shared debug key `android/debug.keystore`, on
+every machine and in CI, so any newer APK installs over an older one and the
+app keeps its calibrations and scans. An APK signed with another key (an
+older CI build, or one built before this key existed) has to be uninstalled
+first, which deletes the app's files; copy the sessions out first (Finish,
+or `tools/pull-scans.ps1`).
+
 The engine's end-to-end tests (`core/android/src/e2e_tests.rs`) render ChArUco
 frames from a known pose and laser plane, push them through the engine as YUV
 and check the recovered pose, intrinsics and plane. They need OpenCV, so they

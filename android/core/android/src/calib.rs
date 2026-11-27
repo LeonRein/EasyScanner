@@ -32,6 +32,9 @@ const MAX_FOCAL_SIGMA_REL: f64 = 0.002;
 /// least `OUTLIER_MIN_PX`) is dropped and K solved again without it.
 const OUTLIER_FACTOR: f64 = 3.0;
 const OUTLIER_MIN_PX: f64 = 0.5;
+/// At most this fraction of the views is dropped as outliers. More than
+/// that is no stray view but a systematic problem, left to the RMS gate.
+const MAX_OUTLIER_FRAC: f64 = 0.2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalibState {
@@ -211,17 +214,12 @@ fn solve(
 
     // views far worse than the rest (blurred, a misdetected corner): drop
     // them and solve again
-    let mut median = solved.view_errors.clone();
-    median.sort_by(f64::total_cmp);
-    let limit = (OUTLIER_FACTOR * median[median.len() / 2]).max(OUTLIER_MIN_PX);
-    let keep: Vec<bool> = solved.view_errors.iter().map(|&e| e <= limit).collect();
-    let outliers = keep.iter().filter(|&&k| !k).count();
     let mut dropped = 0;
-    if outliers > 0 && obj_all.len() - outliers >= min_views {
+    if let Some(keep) = inliers(&solved.view_errors) {
+        dropped = keep.iter().filter(|&&k| !k).count();
         obj_all = obj_all.iter().zip(&keep).filter(|&(_, &k)| k).map(|(v, _)| v).collect();
         img_all = img_all.iter().zip(&keep).filter(|&(_, &k)| k).map(|(v, _)| v).collect();
         solved = calibrate(&obj_all, &img_all, size, &solved.k)?;
-        dropped = outliers;
     }
 
     // the board's shape from the solve's poses, then K again with the
@@ -279,6 +277,20 @@ struct Solved {
 
 /// `cv::calibrateCamera` from `seed`. Board points off the plane z = 0 need
 /// the intrinsic guess, which is always given.
+/// Which views to keep, given each view's reprojection error: `None` when
+/// there is no outlier, or more than [`MAX_OUTLIER_FRAC`] of them. The drop
+/// may leave fewer views than the target: the solve runs as soon as the
+/// target is reached, so any drop at all would otherwise be refused.
+fn inliers(view_errors: &[f64]) -> Option<Vec<bool>> {
+    let mut sorted = view_errors.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let median = *sorted.get(sorted.len() / 2)?;
+    let limit = (OUTLIER_FACTOR * median).max(OUTLIER_MIN_PX);
+    let keep: Vec<bool> = view_errors.iter().map(|&e| e <= limit).collect();
+    let outliers = keep.iter().filter(|&&k| !k).count();
+    (outliers > 0 && outliers as f64 <= MAX_OUTLIER_FRAC * view_errors.len() as f64).then_some(keep)
+}
+
 fn calibrate(obj: &Vector<Vector<Point3f>>, img: &Vector<Vector<Point2f>>, size: Size, seed: &Intrinsics) -> opencv::Result<Solved> {
     let mut k = Mat::from_slice_2d(&[[seed.fx, 0.0, seed.cx], [0.0, seed.fy, seed.cy], [0.0, 0.0, 1.0]])?;
     let mut d = Mat::from_slice(&seed.dist)?.try_clone()?;
@@ -348,4 +360,29 @@ fn measure_surface(
 /// The views' board points moved onto `surface`.
 fn on_surface(obj: &Vector<Vector<Point3f>>, surface: &BoardSurface) -> Vector<Vector<Point3f>> {
     obj.iter().map(|o| o.iter().map(|p| Point3f::new(p.x, p.y, surface.height(f64::from(p.x), f64::from(p.y)) as f32)).collect()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_blurred_view_is_dropped_even_at_the_target_count() {
+        let mut errors = vec![0.3; 64];
+        errors[17] = 2.4;
+        let keep = inliers(&errors).expect("an outlier");
+        assert_eq!(keep.iter().filter(|&&k| !k).count(), 1);
+        assert!(!keep[17]);
+    }
+
+    #[test]
+    fn small_or_widespread_errors_drop_nothing() {
+        assert_eq!(inliers(&[0.3; 64]), None);
+        // above 3x the median but below the floor: the views are all fine
+        assert_eq!(inliers(&[0.05, 0.05, 0.05, 0.4]), None);
+        // a quarter of the views off is a systematic problem, not stray views
+        let errors: Vec<f64> = (0..64).map(|i| if i % 4 == 0 { 3.0 } else { 0.3 }).collect();
+        assert_eq!(inliers(&errors), None);
+        assert_eq!(inliers(&[]), None);
+    }
 }

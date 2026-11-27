@@ -101,13 +101,6 @@ impl ScanGateCfg {
     /// Every check: the pose, then the motion.
     pub fn check(&self, q: &FrameQuality) -> Result<(), Reject> {
         self.check_pose(q)?;
-        self.check_motion(q.speed)
-    }
-
-    /// The motion check alone: camera `speed` (mm/s, deg/s) within the
-    /// limits. Used for the camera calibration too, whose views must be
-    /// sharp and unsheared, while its poses come from a K still being solved.
-    pub fn check_motion(&self, speed: Option<(f64, f64)>) -> Result<(), Reject> {
         if !self.enabled {
             return Ok(());
         }

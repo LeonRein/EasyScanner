@@ -470,7 +470,10 @@ impl Engine {
 
         // ── the board's shape: steady frames through a calibrated camera ──
         let t_s = ts_ns as f64 * 1e-9;
-        if let Some(p) = pose_res.as_ref().filter(|_| self.k_ok() && scan_verdict == Some(Ok(()))) {
+        // not the scan verdict: its RMS is computed with the shape in use, so
+        // a board laid down with another shape would starve its own re-measurement
+        let view_ok = quality.as_ref().is_some_and(|q| gate.check_view(q).is_ok());
+        if let Some(p) = pose_res.as_ref().filter(|_| self.k_ok() && view_ok) {
             self.surface.offer(t_s, || p.surface_view());
         }
         if let Some(settled) = self.surface.step(&self.dir, t_s, &k) {
@@ -699,6 +702,7 @@ impl Engine {
     /// Report what came of a board-shape fit.
     fn surface_settled(&mut self, Settled { verdict, saved }: Settled) {
         let verdict_changed = verdict.changed_shape();
+        let moved = matches!(verdict, Verdict::Replaced { .. });
         let pv = self.surface.measured().map_or(0.0, |m| m.surface.peak_to_valley(self.cfg.board.width_mm(), self.cfg.board.height_mm()));
         let msg = match verdict {
             Verdict::Undetermined => return,
@@ -718,6 +722,14 @@ impl Engine {
         };
         log::info!("{msg}");
         if verdict_changed {
+            // the laser lines collected so far were met with the old shape
+            self.plane_cal.reset();
+            self.plane_solved_at = 0;
+            if moved {
+                // the board was laid down anew: the cloud so far is in the old placement's frame
+                self.close_photos("board moved");
+                self.scan_on = false;
+            }
             self.announce_setup();
         }
         self.msgs.surface = match saved {

@@ -424,20 +424,20 @@ impl Engine {
         let mut roi_frac = f64::NAN;
         let mut board_stripe: Option<BoardStripe> = None;
         if self.cfg.laser.enabled {
-            if self.full_roi.spans.len() != f.height || self.full_roi.spans.first().map(|s| s.1) != Some(w) {
-                self.full_roi = Roi::full(f.width, f.height);
+            if self.full_roi.spans.len() != f.height() || self.full_roi.spans.first().map(|s| s.1) != Some(w) {
+                self.full_roi = Roi::full(f.width(), f.height());
             }
             let volume_roi;
             let roi = match pose {
                 Some(p) => {
-                    volume_roi = vol.roi(&p, &k, f.width, f.height);
+                    volume_roi = vol.roi(&p, &k, f.width(), f.height());
                     volume_roi.as_ref()
                 }
                 None if self.cfg.laser.without_board => Some(&self.full_roi),
                 None => None,
             };
             if let Some(roi) = roi {
-                roi_frac = roi.area() as f64 / (f.width * f.height) as f64;
+                roi_frac = roi.area() as f64 / (f.width() * f.height()) as f64;
                 found = self.laser.detect(f, roi, &params, &mut self.laser_px);
             }
             if let (true, Some(p)) = (found, pose) {

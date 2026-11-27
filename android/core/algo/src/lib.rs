@@ -9,6 +9,7 @@
 //! Units: millimetres for 3-D geometry, pixels for image coordinates. The
 //! camera frame is OpenCV's (x right, y down, z forward).
 
+pub mod atomic_file;
 pub mod bench;
 pub mod cloud;
 pub mod config;

@@ -86,7 +86,11 @@ impl LiveCalibrator {
         true
     }
 
+    /// Start the set over. A solve still running is abandoned: its views
+    /// belong to the set being dropped (another camera, focus or board), so
+    /// its result must never be saved. The thread finishes on its own.
     pub fn reset(&mut self) {
+        self.job = None;
         self.views.clear();
         self.solved_at = 0;
         self.last_rms = None;

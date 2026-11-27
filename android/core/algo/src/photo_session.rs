@@ -20,12 +20,13 @@
 //! analysis size, not the photograph's, and orbiter-recon builds a missing
 //! sidecar's mask from the photograph's own pixels (its documented fallback).
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use crate::atomic_file::{write_atomic, write_bytes_atomic};
 use crate::cloud::PointCloud;
 use crate::config::BoardSpec;
 use crate::geom::{FaceOutFrame, Intrinsics, quat_from_mat};
@@ -146,14 +147,7 @@ impl PhotoSession {
         if cloud.is_empty() {
             return Ok(None);
         }
-        let path = self.dir.join(LASER_PLY);
-        let tmp = self.dir.join(format!("{LASER_PLY}.tmp"));
-        let mut w = BufWriter::new(File::create(&tmp)?);
-        let n = cloud.write_ply_in(&mut w, &self.frame)?;
-        w.flush()?;
-        drop(w);
-        fs::rename(&tmp, &path)?;
-        Ok(Some(n))
+        write_atomic(&self.dir.join(LASER_PLY), |w| cloud.write_ply_in(w, &self.frame)).map(Some)
     }
 
     fn write_session_json(&self, wh: (u32, u32)) -> io::Result<()> {
@@ -189,7 +183,7 @@ impl PhotoSession {
             "extrinsics": null,
             "params": i.params,
         });
-        fs::write(self.dir.join("session.json"), serde_json::to_string_pretty(&doc)?)
+        write_bytes_atomic(&self.dir.join("session.json"), serde_json::to_string_pretty(&doc)?)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -3,7 +3,12 @@
 //! `live_intrinsics.json` / `laser_plane.json`.
 
 use std::fs;
+use std::io;
 use std::path::Path;
+
+use serde::de::DeserializeOwned;
+
+use crate::atomic_file::write_bytes_atomic;
 
 use crate::fusion::FusionCfg;
 use crate::gate::ScanGateCfg;
@@ -247,8 +252,7 @@ pub fn intrinsics_plausible(k: &Intrinsics) -> bool {
 /// The saved live calibration, if present, plausible and taken with this
 /// camera.
 pub fn load_intrinsics(dir: &Path, camera_id: &str) -> Option<IntrinsicsFile> {
-    let text = fs::read_to_string(dir.join(INTRINSICS_FILE)).ok()?;
-    let f: IntrinsicsFile = serde_json::from_str(&text).ok()?;
+    let f: IntrinsicsFile = read_json(&dir.join(INTRINSICS_FILE))?;
     if f.camera_id.as_deref().is_some_and(|id| id != camera_id) {
         log::warn!("{INTRINSICS_FILE} is for camera {:?}, not {camera_id}", f.camera_id);
         return None;
@@ -261,7 +265,22 @@ pub fn load_intrinsics(dir: &Path, camera_id: &str) -> Option<IntrinsicsFile> {
 }
 
 pub fn save_intrinsics(dir: &Path, f: &IntrinsicsFile) -> std::io::Result<()> {
-    fs::write(dir.join(INTRINSICS_FILE), serde_json::to_string_pretty(f)?)
+    write_bytes_atomic(&dir.join(INTRINSICS_FILE), serde_json::to_string_pretty(f)?)
+}
+
+/// A calibration file's content. `None` when there is none; a file that
+/// cannot be read or parsed is `None` too, but logged, so a lost calibration
+/// leaves a trace instead of silently looking like a fresh install.
+fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::warn!("{}: unreadable ({e}) — ignoring", path.display());
+            return None;
+        }
+    };
+    serde_json::from_str(&text).map_err(|e| log::warn!("{}: corrupt ({e}) — ignoring", path.display())).ok()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -297,8 +316,7 @@ impl SavedPlane {
 
 /// The saved laser plane, if present and taken with this camera.
 pub fn load_plane(dir: &Path, camera_id: &str) -> Option<SavedPlane> {
-    let text = fs::read_to_string(dir.join(PLANE_FILE)).ok()?;
-    let f: PlaneFile = serde_json::from_str(&text).ok()?;
+    let f: PlaneFile = read_json(&dir.join(PLANE_FILE))?;
     if f.camera_id.as_deref().is_some_and(|id| id != camera_id) {
         log::warn!("{PLANE_FILE} is for camera {:?}, not {camera_id}", f.camera_id);
         return None;
@@ -318,7 +336,7 @@ pub fn save_plane(dir: &Path, camera_id: &str, plane: &SavedPlane, rms_mm: f64, 
         camera_id: Some(camera_id.into()),
         k: plane.k.map(Into::into),
     };
-    fs::write(dir.join(PLANE_FILE), serde_json::to_string_pretty(&f)?)
+    write_bytes_atomic(&dir.join(PLANE_FILE), serde_json::to_string_pretty(&f)?)
 }
 
 #[cfg(test)]
@@ -365,6 +383,39 @@ mod tests {
         // the desktop prototype's file has no model: present, but not usable
         fs::write(dir.join(PLANE_FILE), r#"{"n":[0,0.8,-0.6],"d":-120,"rms_mm":0.7,"n_points":10,"frame":"opencv_camera_mm"}"#).unwrap();
         assert!(!load_plane(&dir, "0").unwrap().fits(&k));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intrinsics_belong_to_their_camera() {
+        let dir = std::env::temp_dir().join(format!("es-intrinsics-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = IntrinsicsFile {
+            fx: 1400.0,
+            fy: 1400.0,
+            cx: 960.0,
+            cy: 540.0,
+            dist: vec![0.05, -0.1, 0.0, 0.0, 0.0],
+            calibrated: true,
+            width: 1920,
+            height: 1080,
+            camera_id: Some("0".into()),
+            focus_diopters: Some(4.0),
+            rms_px: Some(0.4),
+        };
+        save_intrinsics(&dir, &file).unwrap();
+        let back = load_intrinsics(&dir, "0").unwrap();
+        assert!(back.intrinsics().same_model(&file.intrinsics()));
+        assert_eq!(back.focus_diopters, Some(4.0));
+        assert!(load_intrinsics(&dir, "2").is_none(), "another camera's calibration");
+        // the desktop prototype's file names no camera: it is taken as this one's
+        save_intrinsics(&dir, &IntrinsicsFile { camera_id: None, ..file.clone() }).unwrap();
+        assert!(load_intrinsics(&dir, "2").is_some());
+        save_intrinsics(&dir, &IntrinsicsFile { cx: 100.0, ..file.clone() }).unwrap();
+        assert!(load_intrinsics(&dir, "0").is_none(), "an implausible K is ignored");
+        // a truncated file (the write was cut short) reads as no calibration
+        fs::write(dir.join(INTRINSICS_FILE), r#"{"fx":1400.0,"fy":14"#).unwrap();
+        assert!(load_intrinsics(&dir, "0").is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

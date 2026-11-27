@@ -53,26 +53,158 @@ impl Default for LaserParams {
     }
 }
 
-/// A borrowed YUV_420_888 image as Camera2's `Image` exposes it: a full-size
-/// luma plane and two half-size chroma planes with a shared row stride and a
-/// pixel stride of 1 (planar) or 2 (semi-planar NV12/NV21).
-#[derive(Clone, Copy)]
-pub struct YuvFrame<'a> {
+/// The geometry of a YUV_420_888 image as Camera2's `Image` exposes it: a
+/// full-size luma plane and two half-size chroma planes with a shared row
+/// stride and a pixel stride of 1 (planar) or 2 (semi-planar NV12/NV21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YuvLayout {
     pub width: usize,
     pub height: usize,
-    pub y: &'a [u8],
     pub y_stride: usize,
-    pub u: &'a [u8],
-    pub v: &'a [u8],
     pub uv_stride: usize,
     pub uv_pixel_stride: usize,
 }
 
-impl YuvFrame<'_> {
-    /// Full-range BT.601 (JFIF) RGB of one pixel.
+impl YuvLayout {
+    /// Smallest frame the detector and the board tracker work on.
+    pub const MIN_SIDE: usize = 16;
+
+    /// Tightly packed planar I420: no row padding, chroma pixel stride 1.
+    pub fn packed_planar(width: usize, height: usize) -> Self {
+        Self { width, height, y_stride: width, uv_stride: width / 2, uv_pixel_stride: 1 }
+    }
+
+    /// Bytes the luma plane must hold: the last row needs only `width`.
+    fn y_len(&self) -> Option<usize> {
+        (self.height - 1).checked_mul(self.y_stride)?.checked_add(self.width)
+    }
+
+    /// Bytes each chroma plane must hold. A semi-planar plane may stop one
+    /// byte short of a full row, so the last sample is the bound.
+    fn uv_len(&self) -> Option<usize> {
+        let last_row = (self.height / 2 - 1).checked_mul(self.uv_stride)?;
+        let last_col = (self.width / 2 - 1).checked_mul(self.uv_pixel_stride)?;
+        last_row.checked_add(last_col)?.checked_add(1)
+    }
+
+    fn check(&self) -> Result<(), FrameError> {
+        let bad = |why| Err(FrameError::Geometry { layout: *self, why });
+        if self.width < Self::MIN_SIDE || self.height < Self::MIN_SIDE {
+            return bad("smaller than 16 px");
+        }
+        if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
+            return bad("odd size (4:2:0 chroma needs even sides)");
+        }
+        if i32::try_from(self.width).is_err() || i32::try_from(self.height).is_err() {
+            return bad("too large");
+        }
+        if self.y_stride < self.width {
+            return bad("luma stride shorter than a row");
+        }
+        if !(1..=2).contains(&self.uv_pixel_stride) {
+            return bad("chroma pixel stride is not 1 or 2");
+        }
+        if self.uv_stride < (self.width / 2 - 1) * self.uv_pixel_stride + 1 {
+            return bad("chroma stride shorter than a row");
+        }
+        Ok(())
+    }
+}
+
+/// Which plane of a [`YuvFrame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plane {
+    Y,
+    U,
+    V,
+}
+
+/// Why a [`YuvFrame`] could not be built.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The layout itself is unusable.
+    Geometry { layout: YuvLayout, why: &'static str },
+    /// A plane holds fewer bytes than the layout addresses (`need` is `None`
+    /// when that size does not even fit in `usize`).
+    PlaneTooShort { plane: Plane, len: usize, need: Option<usize> },
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Geometry { layout: l, why } => write!(
+                f,
+                "bad frame geometry {}x{} (stride {}, chroma stride {}, pixel stride {}): {why}",
+                l.width, l.height, l.y_stride, l.uv_stride, l.uv_pixel_stride
+            ),
+            FrameError::PlaneTooShort { plane, len, need: Some(need) } => {
+                write!(f, "{plane:?} plane holds {len} bytes, its geometry needs {need}")
+            }
+            FrameError::PlaneTooShort { plane, len, need: None } => {
+                write!(f, "{plane:?} plane holds {len} bytes, its geometry overflows")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// A borrowed YUV_420_888 image whose planes are known to cover its
+/// [`YuvLayout`]: every pixel `(x, y)` with `x < width`, `y < height` can be
+/// read from all three planes. [`YuvFrame::new`] is the only way to build
+/// one, so code reading the planes (including OpenCV through a raw pointer)
+/// may rely on it.
+#[derive(Clone, Copy)]
+pub struct YuvFrame<'a> {
+    layout: YuvLayout,
+    y: &'a [u8],
+    u: &'a [u8],
+    v: &'a [u8],
+}
+
+impl<'a> YuvFrame<'a> {
+    /// Check the layout and that each plane is long enough for it.
+    pub fn new(layout: YuvLayout, y: &'a [u8], u: &'a [u8], v: &'a [u8]) -> Result<Self, FrameError> {
+        layout.check()?;
+        let fits = |plane, buf: &[u8], need: Option<usize>| match need {
+            Some(n) if buf.len() >= n => Ok(()),
+            _ => Err(FrameError::PlaneTooShort { plane, len: buf.len(), need }),
+        };
+        fits(Plane::Y, y, layout.y_len())?;
+        fits(Plane::U, u, layout.uv_len())?;
+        fits(Plane::V, v, layout.uv_len())?;
+        Ok(Self { layout, y, u, v })
+    }
+
+    pub fn layout(&self) -> &YuvLayout {
+        &self.layout
+    }
+
+    pub fn width(&self) -> usize {
+        self.layout.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.layout.height
+    }
+
+    /// The luma plane: `height` rows `y_stride` bytes apart, the last one
+    /// possibly cut right after `width` bytes.
+    pub fn luma(&self) -> &'a [u8] {
+        self.y
+    }
+
+    pub fn y_stride(&self) -> usize {
+        self.layout.y_stride
+    }
+
+    /// Full-range BT.601 (JFIF) RGB of one pixel. Coordinates past the
+    /// frame's edge read its border pixel.
     pub fn rgb_at(&self, x: usize, y: usize) -> [u8; 3] {
-        let yv = self.y[y * self.y_stride + x] as i32;
-        let ci = (y >> 1) * self.uv_stride + (x >> 1) * self.uv_pixel_stride;
+        let l = &self.layout;
+        let (x, y) = (x.min(l.width - 1), y.min(l.height - 1));
+        let yv = self.y[y * l.y_stride + x] as i32;
+        let ci = (y >> 1) * l.uv_stride + (x >> 1) * l.uv_pixel_stride;
         let (ar, ag, ab) = chroma_offsets(self.u[ci], self.v[ci]);
         [(yv + ar).clamp(0, 255) as u8, (yv + ag).clamp(0, 255) as u8, (yv + ab).clamp(0, 255) as u8]
     }
@@ -242,7 +374,7 @@ impl LaserDetector {
     }
 
     fn detect_color(&mut self, f: &YuvFrame, roi: &Roi, p: &LaserParams, color: LaserColor, out: &mut Vec<[f32; 2]>) -> bool {
-        let (w, h) = (f.width, f.height);
+        let (w, h) = (f.width(), f.height());
         let tol = Tolerances::for_frame(w, h, p);
         let y0 = roi.y0.min(h);
         let y1 = roi.y1().min(h);
@@ -282,7 +414,7 @@ impl LaserDetector {
                 band.u4.resize(cw, 0);
                 band.v4.resize(cw, 0);
                 let by0 = y0 + bi * band_rows;
-                let ps = f.uv_pixel_stride;
+                let ps = f.layout.uv_pixel_stride;
                 for (ri, (row_out, cen)) in resp_band.chunks_mut(w).zip(cen_band.iter_mut()).enumerate() {
                     let y = by0 + ri;
                     let (sx0, sx1) = roi.spans[y - roi.y0];
@@ -292,12 +424,12 @@ impl LaserDetector {
                     if sx1 <= sx0 {
                         continue;
                     }
-                    let y_row = &f.y[y * f.y_stride..y * f.y_stride + w];
+                    let y_row = &f.y[y * f.layout.y_stride..y * f.layout.y_stride + w];
                     // vertical half of the triangle filter: 3/4 own chroma row,
                     // 1/4 the neighbour on this luma row's side
                     let cy = (y >> 1).min(ch - 1);
                     let cyn = if y & 1 == 0 { cy.saturating_sub(1) } else { (cy + 1).min(ch - 1) };
-                    let (r0, r1) = (cy * f.uv_stride, cyn * f.uv_stride);
+                    let (r0, r1) = (cy * f.layout.uv_stride, cyn * f.layout.uv_stride);
                     let c0 = (sx0 >> 1).saturating_sub(1);
                     let c1 = (((sx1 - 1) >> 1) + 1).min(cw - 1);
                     for cx in c0..=c1 {
@@ -485,16 +617,7 @@ mod tests {
         }
 
         fn frame(&self) -> YuvFrame<'_> {
-            YuvFrame {
-                width: self.w,
-                height: self.h,
-                y: &self.y,
-                y_stride: self.w,
-                u: &self.u,
-                v: &self.v,
-                uv_stride: self.w / 2,
-                uv_pixel_stride: 1,
-            }
+            YuvFrame::new(YuvLayout::packed_planar(self.w, self.h), &self.y, &self.u, &self.v).unwrap()
         }
     }
 
@@ -579,12 +702,48 @@ mod tests {
             uv.push(*u);
             uv.push(*v);
         }
-        let nv12 = YuvFrame { width: 256, height: 128, y: &img.y, y_stride: 256, u: &uv, v: &uv[1..], uv_stride: 256, uv_pixel_stride: 2 };
+        let layout = YuvLayout { width: 256, height: 128, y_stride: 256, uv_stride: 256, uv_pixel_stride: 2 };
+        let nv12 = YuvFrame::new(layout, &img.y, &uv, &uv[1..]).unwrap();
         let mut det = LaserDetector::default();
         let (mut a, mut b) = (Vec::new(), Vec::new());
         assert!(det.detect(&img.frame(), &Roi::full(256, 128), &LaserParams::default(), &mut a));
         assert!(det.detect(&nv12, &Roi::full(256, 128), &LaserParams::default(), &mut b));
         assert_eq!(a, b);
         assert_eq!(img.frame().rgb_at(10, 10), nv12.rgb_at(10, 10));
+    }
+
+    #[test]
+    fn frame_accepts_exact_camera_layouts() {
+        let (y, uv) = (vec![0u8; 64 * 32], vec![0u8; 64 * 16]);
+        // semi-planar: the V plane starts one byte in and stops one byte short
+        let nv12 = YuvLayout { width: 64, height: 32, y_stride: 64, uv_stride: 64, uv_pixel_stride: 2 };
+        assert!(YuvFrame::new(nv12, &y, &uv[..uv.len() - 1], &uv[1..]).is_ok());
+        // padded rows: the last one ends right after its pixels
+        let padded = YuvLayout { width: 64, height: 32, y_stride: 80, uv_stride: 40, uv_pixel_stride: 1 };
+        let (y, uv) = (vec![0u8; 31 * 80 + 64], vec![0u8; 15 * 40 + 32]);
+        let f = YuvFrame::new(padded, &y, &uv, &uv).unwrap();
+        assert_eq!(f.rgb_at(1000, 1000), f.rgb_at(63, 31));
+    }
+
+    #[test]
+    fn frame_rejects_bad_geometry_and_short_planes() {
+        let ok = YuvLayout::packed_planar(64, 32);
+        let (y, uv) = (vec![0u8; 64 * 32], vec![0u8; 32 * 16]);
+        let geometry = |l: YuvLayout| matches!(YuvFrame::new(l, &y, &uv, &uv), Err(FrameError::Geometry { .. }));
+        assert!(geometry(YuvLayout { width: 8, ..ok }));
+        assert!(geometry(YuvLayout { height: 31, ..ok }));
+        assert!(geometry(YuvLayout { y_stride: 63, ..ok }));
+        assert!(geometry(YuvLayout { uv_pixel_stride: 0, ..ok }));
+        assert!(geometry(YuvLayout { uv_pixel_stride: 3, ..ok }));
+        assert!(geometry(YuvLayout { uv_stride: 31, ..ok }));
+        assert!(geometry(YuvLayout { width: 1 << 40, ..ok }));
+
+        let short = YuvFrame::new(ok, &y[1..], &uv, &uv);
+        assert!(matches!(short, Err(FrameError::PlaneTooShort { plane: Plane::Y, .. })));
+        let short = YuvFrame::new(ok, &y, &uv, &uv[1..]);
+        assert!(matches!(short, Err(FrameError::PlaneTooShort { plane: Plane::V, .. })));
+        // a stride whose size overflows usize is refused, not wrapped
+        let huge = YuvLayout { y_stride: usize::MAX / 2, ..ok };
+        assert!(matches!(YuvFrame::new(huge, &y, &uv, &uv), Err(FrameError::PlaneTooShort { need: None, .. })));
     }
 }

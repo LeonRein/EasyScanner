@@ -8,7 +8,7 @@
 //! without needing OpenCV on the host. It does not model IPPE's flip
 //! ambiguity.
 
-use crate::geom::{Intrinsics, M3, Pose, V3, mat_mul, rodrigues, sym3_eigen, transpose};
+use crate::geom::{Intrinsics, M3, Pose, V3, mat_mul, nearest_rotation, rodrigues};
 
 /// Solve the dense `n×n` system `a·x = b` by Gaussian elimination with
 /// partial pivoting. `None` when singular.
@@ -72,22 +72,6 @@ fn homography(obj: &[[f64; 2]], img: &[[f64; 2]]) -> Option<M3> {
     let to: M3 = [[os, 0.0, -os * ox], [0.0, os, -os * oy], [0.0, 0.0, 1.0]];
     let ti_inv: M3 = [[1.0 / is, 0.0, ix], [0.0, 1.0 / is, iy], [0.0, 0.0, 1.0]];
     Some(mat_mul(&ti_inv, &mat_mul(&hn, &to)))
-}
-
-/// Nearest rotation to `m` (polar decomposition `m·(mᵀm)^-½`).
-fn nearest_rotation(m: &M3) -> M3 {
-    let mtm = mat_mul(&transpose(m), m);
-    let (vals, vecs) = sym3_eigen(&mtm);
-    let mut inv_sqrt = [[0.0; 3]; 3];
-    for k in 0..3 {
-        let w = 1.0 / vals[k].max(1e-300).sqrt();
-        for i in 0..3 {
-            for j in 0..3 {
-                inv_sqrt[i][j] += w * vecs[k][i] * vecs[k][j];
-            }
-        }
-    }
-    mat_mul(m, &inv_sqrt)
 }
 
 /// Initial pose from the homography of a z = 0 target.

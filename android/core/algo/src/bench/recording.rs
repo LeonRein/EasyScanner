@@ -11,6 +11,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::geom::{M3, Pose, V3};
+use crate::imu::{GyroCalib, GyroSample};
+use crate::rolling::RowClock;
 use crate::volume::Volume;
 
 use super::scene::{BoardDims, Scene};
@@ -53,6 +55,12 @@ pub struct CornerRec {
 pub struct FrameRec {
     /// Sensor timestamp: start of exposure of the first row.
     pub ts_ns: i64,
+    /// Rolling-shutter readout, first to last row (ns); 0 = global shutter.
+    #[serde(default)]
+    pub readout_ns: i64,
+    /// Exposure time (ns).
+    #[serde(default)]
+    pub exposure_ns: i64,
     /// The pose the device computed, if recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose: Option<PoseRec>,
@@ -62,6 +70,13 @@ pub struct FrameRec {
     /// Detected stripe centre-line pixels.
     #[serde(default)]
     pub laser_px: Vec<[f32; 2]>,
+}
+
+impl FrameRec {
+    /// When each row of this frame was exposed, for an image `height` rows tall.
+    pub fn clock(&self, height: f64) -> RowClock {
+        RowClock { start_ns: self.ts_ns, readout_ns: self.readout_ns, exposure_ns: self.exposure_ns, height }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,8 +106,12 @@ pub struct Truth {
     pub scene: Scene,
     pub intrinsics: CameraModel,
     pub laser_plane: PlaneRec,
-    /// Pose at each frame's timestamp (first row).
+    /// Pose at each frame's reference instant: the middle row
+    /// ([`RowClock::mid_ns`]), the instant a corrected pose describes.
     pub poses: Vec<PoseRec>,
+    /// The gyro's true calibration, when one was simulated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gyro: Option<GyroCalib>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -108,12 +127,19 @@ pub struct Recording {
     /// The laser plane the pipeline uses.
     pub laser_plane: PlaneRec,
     pub frames: Vec<FrameRec>,
+    /// The IMU→camera rotation the phone reported (Camera2 lens pose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cam_from_imu: Option<M3>,
+    /// Gyroscope samples (gyro clock, IMU frame), oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gyro: Vec<GyroSample>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truth: Option<Truth>,
 }
 
 impl Recording {
-    pub const VERSION: u32 = 1;
+    /// 2: row timing per frame, gyro samples, truth poses at the middle row.
+    pub const VERSION: u32 = 2;
 
     pub fn load(path: &Path) -> io::Result<Recording> {
         let f = std::fs::File::open(path)?;

@@ -1,5 +1,6 @@
 //! The per-frame pipeline and the scanner's modes — the desktop prototype's `app.py`
-//! main loop without the window: board pose → live intrinsics calibration →
+//! main loop without the window: board pose (gyro-fused, rolling-shutter
+//! corrected) → live intrinsics calibration →
 //! laser stripe in the working volume → laser-plane calibration → plane
 //! triangulation into the board-frame cloud → overlay layers.
 //!
@@ -17,12 +18,15 @@ use opencv::core::{CV_8UC1, Mat};
 use scan_algo::cloud::PointCloud;
 use scan_algo::config::{self, Config, IntrinsicsFile, SavedPlane};
 use scan_algo::focus::laplacian_variance;
+use scan_algo::fusion::PoseFusion;
 use scan_algo::gate::{FrameQuality, GateStats, Reject};
 use scan_algo::geom::{FaceOutFrame, Intrinsics, Pose, V3, euler_xyz_deg};
+use scan_algo::imu::GyroSample;
 use scan_algo::keyframe::{Due, Hold, Miss, PoseTrack, TrackedPose, Trigger};
 use scan_algo::laser::{LaserDetector, LaserParams, Roi, YuvFrame};
 use scan_algo::photo_session::{Cylinder, PhotoSession, SessionInfo};
 use scan_algo::plane::{PlaneCalibrator, PlaneFit};
+use scan_algo::rolling::RowClock;
 use scan_algo::stripe::{self, BoardStripe};
 use scan_algo::volume::Volume;
 use scan_algo::overlay;
@@ -163,6 +167,8 @@ pub struct Engine {
     pts_in: Vec<[f32; 2]>,
     pts_out: Vec<[f32; 2]>,
     track: PoseTrack,
+    /// Gyro samples, the gyro calibration and the recent motion.
+    fusion: PoseFusion,
     trigger: Trigger,
     photos: Option<PhotoSession>,
     photos_enabled: bool,
@@ -209,6 +215,7 @@ impl Engine {
             pts_in: Vec::new(),
             pts_out: Vec::new(),
             track: PoseTrack::new(TRACK_FRAMES),
+            fusion: PoseFusion::new(cfg.fusion),
             trigger: Trigger::default(),
             photos: None,
             photos_enabled: true,
@@ -239,7 +246,11 @@ impl Engine {
         }
         if cfg.camera.id != self.cfg.camera.id {
             self.close_photos("camera changed");
+            // another camera sits at another angle to the gyro
+            self.fusion = PoseFusion::new(cfg.fusion);
         }
+        self.fusion.set_cfg(cfg.fusion);
+        self.fusion.set_nominal_mount(cfg.camera.cam_from_imu);
         self.calib.target = cfg.calib_views.max(4);
         self.plane_cal.min_lines = cfg.plane_views.max(3);
         self.plane_cal.fit = cfg.plane_fit;
@@ -296,10 +307,19 @@ impl Engine {
         }
     }
 
-    /// One analysis frame; `ts_ns` is its sensor timestamp, the clock the
-    /// stills of a photo session are matched on.
-    pub fn process(&mut self, f: &YuvFrame, ts_ns: i64) -> opencv::Result<&[f32]> {
+    /// Gyroscope samples that arrived since the last frame (oldest first).
+    pub fn push_gyro(&mut self, samples: impl IntoIterator<Item = GyroSample>) {
+        for s in samples {
+            self.fusion.push_gyro(s);
+        }
+    }
+
+    /// One analysis frame. `clock` says when its rows were exposed; its
+    /// start (the sensor timestamp) is the clock the stills of a photo
+    /// session are matched on.
+    pub fn process(&mut self, f: &YuvFrame, clock: RowClock) -> opencv::Result<&[f32]> {
         let t0 = Instant::now();
+        let ts_ns = clock.start_ns;
         let (w, hgt) = (f.width as u32, f.height as u32);
         if self.last_wh != (w, hgt) {
             // sharpness is not comparable across resolutions
@@ -315,7 +335,9 @@ impl Engine {
             Mat::new_rows_cols_with_data_unsafe(hgt as i32, w as i32, CV_8UC1, f.y.as_ptr() as *mut _, f.y_stride)
         }?;
         let n_corners = self.tracker.detect(&gray)?;
-        let pose_res = self.tracker.solve_pose(&k)?;
+        let correction = self.fusion.correction(&clock);
+        let expected = self.fusion.expected_rotation(&clock);
+        let pose_res = self.tracker.solve_pose(&k, expected.as_ref(), correction.as_ref())?;
         let t_board = t0.elapsed();
 
         let sharpness = corner_bbox(&self.tracker.corners)
@@ -340,7 +362,9 @@ impl Engine {
                 sharpness: sharpness.unwrap_or(f64::NAN),
             }),
         );
-        let speed = self.track.speed(Trigger::SPEED_WINDOW_NS);
+        // the gyro's turn rate is instant and jitter-free; the board's is a window behind
+        let turn = self.fusion.turn_rate_deg_s(&clock);
+        let speed = self.track.speed(Trigger::SPEED_WINDOW_NS).map(|(v, w)| (v, turn.unwrap_or(w)));
 
         // ── quality gate: may this frame's laser points be kept? ──
         let quality = pose_res.as_ref().map(|p| FrameQuality {
@@ -353,6 +377,8 @@ impl Engine {
         // the plane calibration tilts the board between still views: pose checks only
         let plane_pose_ok = quality.as_ref().is_some_and(|q| gate.check_pose(q).is_ok());
         let scan_verdict: Option<Result<(), Reject>> = quality.as_ref().map(|q| gate.check(q));
+        // a pose good enough for the plane calibration is good enough to calibrate the gyro against
+        self.fusion.observe(&clock, pose_res.as_ref().map(|p| &p.pose), plane_pose_ok);
 
         // ── live intrinsics calibration: every genuinely new view ──
         if self.calib_active && pose_res.is_some() && !self.calib.solving() {
@@ -441,6 +467,8 @@ impl Engine {
             let keep = self.scan_on && scan_verdict == Some(Ok(()));
             let (cloud, px, scan_on) = (&mut self.cloud, &self.laser_px, keep);
             stripe::to_laser_plane(px, &k, n, d, |i, x| {
+                // the point in the camera frame of the instant the pose describes
+                let x = correction.as_ref().map_or(x, |c| c.stripe_point(x, px[i][1] as f64));
                 let b = p.to_board(x);
                 if vol.contains(&p, b) {
                     inside[i] = true;
@@ -498,6 +526,8 @@ impl Engine {
         if let Some(v) = scan_verdict {
             o.set(h::SCAN_GATE, v.err().map_or(0.0, |r| r as i32 as f64));
         }
+        o.set(h::GYRO_STATE, self.fusion.gyro_state() as i32 as f64);
+        o.set(h::RS_CORRECTED, correction.is_some() as u8 as f64);
         o.set(h::GATE_KEPT, self.gate_stats.kept as f64);
         o.set(h::GATE_REJECTED, self.gate_stats.rejected() as f64);
         o.set(h::EVENTS, self.events as f64);

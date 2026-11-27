@@ -17,6 +17,7 @@ use scan_algo::config::{self, BoardSpec};
 use scan_algo::gate::Reject;
 use scan_algo::geom::{Intrinsics, M3, Pose, V3, dot, mat_mul, mat_vec, normalize, rodrigues, sub};
 use scan_algo::laser::YuvFrame;
+use scan_algo::rolling::RowClock;
 
 use crate::board::make_board;
 use crate::engine::{Engine, cmd};
@@ -189,7 +190,12 @@ fn step(e: &mut Engine, yuv: &Yuv) -> Vec<f32> {
 }
 
 fn step_at(e: &mut Engine, yuv: &Yuv, ts_ns: i64) -> Vec<f32> {
-    let out = e.process(&yuv.frame(), ts_ns).unwrap().to_vec();
+    // a global shutter: the tests' images are rendered for one instant
+    step_clocked(e, yuv, RowClock { start_ns: ts_ns, readout_ns: 0, exposure_ns: 0, height: yuv.frame().height as f64 })
+}
+
+fn step_clocked(e: &mut Engine, yuv: &Yuv, clock: RowClock) -> Vec<f32> {
+    let out = e.process(&yuv.frame(), clock).unwrap().to_vec();
     e.clear_events();
     out
 }
@@ -500,4 +506,33 @@ fn scan_gate_keeps_steady_frames_and_rejects_fast_motion() {
     .unwrap();
     let out = step(&mut e, &still);
     assert_eq!(out[h::SCAN_GATE], 0.0);
+}
+
+#[test]
+fn gyro_and_row_timing_reach_the_pose() {
+    use scan_algo::imu::GyroSample;
+    let k = truth_k();
+    let (mut e, _) = engine("gyro", k);
+    let p = pose(500.0, 0.3, -0.2, 0.4, [10.0, -5.0]);
+    let yuv = Renderer::new().render(&k, &p, None);
+    let start = CLOCK_NS.fetch_add(20 * FRAME_NS, Ordering::Relaxed);
+    let mut gyro_t = start - 100_000_000;
+    let mut out = Vec::new();
+    for i in 0..12 {
+        let ts = start + i * FRAME_NS;
+        // a phone lying still: 200 Hz of zero rate up to the frame's end
+        let samples = std::iter::from_fn(|| (gyro_t <= ts + FRAME_NS).then(|| {
+            gyro_t += 5_000_000;
+            GyroSample { t_ns: gyro_t, rate: [0.0; 3] }
+        }));
+        e.push_gyro(samples.collect::<Vec<_>>());
+        out = step_clocked(&mut e, &yuv, RowClock { start_ns: ts, readout_ns: 20_000_000, exposure_ns: 2_000_000, height: H as f64 });
+        assert_eq!(out[h::DETECTED], 1.0, "frame {i}");
+    }
+    // still: nothing to calibrate the gyro against, but the motion is known (none)
+    assert_eq!(out[h::GYRO_STATE], 1.0, "calibrating");
+    assert_eq!(out[h::RS_CORRECTED], 1.0);
+    let got = [out[h::CAM_X] as f64, out[h::CAM_Y] as f64, out[h::CAM_Z] as f64];
+    let err = scan_algo::geom::norm(sub(got, p.camera_position()));
+    assert!(err < 1.5, "a correction for no motion moved the camera by {err:.2} mm");
 }

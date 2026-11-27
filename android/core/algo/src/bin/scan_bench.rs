@@ -26,6 +26,7 @@ use scan_algo::bench::recording::Recording;
 use scan_algo::bench::sim::StripeModel;
 use scan_algo::bench::{self, BenchCfg};
 use scan_algo::cloud::PointCloud;
+use scan_algo::fusion::FusionCfg;
 
 struct Args {
     rest: Vec<String>,
@@ -66,14 +67,15 @@ fn f(x: Option<f64>, digits: usize) -> String {
 
 fn table(reports: &[Report]) {
     println!(
-        "{:<30} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
-        "scenario", "posed", "points", "pos mm", "rot °", "plane°", "mean", "median", "p95", "rms", ">1mm %", "ball Δr"
+        "{:<30} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>8}",
+        "scenario", "posed", "points", "pos mm", "rot °", "plane°", "mean", "median", "p95", "rms", ">1mm %", "ball Δr", "RS %",
+        "gyro"
     );
     for r in reports {
         let s = |x: Option<Stats>, g: fn(&Stats) -> f64| x.as_ref().map(g);
         let ball = r.spheres.first();
         println!(
-            "{:<30} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+            "{:<30} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>8}",
             r.name.chars().take(30).collect::<String>(),
             format!("{}/{}", r.frames_posed, r.frames),
             r.points,
@@ -86,12 +88,15 @@ fn table(reports: &[Report]) {
             f(s(r.surface_mm, |s| s.rms), 3),
             f(r.outliers_1mm.map(|x| 100.0 * x), 2),
             f(ball.and_then(|b| b.radius_err_mm), 3),
+            f(Some(100.0 * r.corrected_frames as f64 / r.frames.max(1) as f64), 0),
+            r.gyro.and_then(|g| g.from_frame).map_or("-".into(), |i| format!("@{i}")),
         );
     }
     println!(
         "\npos/rot: camera pose error RMS · plane°: laser-plane angle error · mean … rms (mm): signed distance of\n\
          every point to the true surface (median/p95 of |e|) · >1mm %: points off by more than 1 mm ·\n\
-         ball Δr: sphere-fit radius error of the 25 mm ball (mm)"
+         ball Δr: sphere-fit radius error of the 25 mm ball (mm) · RS %: frames rolling-shutter corrected ·\n\
+         gyro: frame from which the self-calibrated gyro was in use"
     );
 }
 
@@ -155,7 +160,7 @@ fn main() -> ExitCode {
         "eval" => {
             let p = a.rest.first().ok_or("eval needs a recording")?.clone();
             let rec = Recording::load(Path::new(&p)).map_err(|e| format!("{p}: {e}"))?;
-            let recon = reconstruct::reconstruct(&rec, PoseFrom::Auto);
+            let recon = reconstruct::reconstruct(&rec, PoseFrom::Auto, &FusionCfg::default());
             print_reports(&[metrics::evaluate(&rec.source, &rec, &recon)], json);
             Ok(())
         }

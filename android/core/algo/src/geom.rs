@@ -87,6 +87,44 @@ pub fn rodrigues(r: V3) -> M3 {
     ]
 }
 
+/// Axis-angle vector of a rotation matrix: the inverse of [`rodrigues`]
+/// (angle in `[0, π]`).
+pub fn rotation_vector(m: &M3) -> V3 {
+    let [w, x, y, z] = quat_from_mat(m);
+    let s = (x * x + y * y + z * z).sqrt();
+    if s < 1e-12 {
+        // first order: q ≈ (1, r/2)
+        return [2.0 * x, 2.0 * y, 2.0 * z];
+    }
+    let angle = 2.0 * s.atan2(w);
+    scale([x, y, z], angle / s)
+}
+
+pub fn determinant(m: &M3) -> f64 {
+    dot(m[0], cross(m[1], m[2]))
+}
+
+/// The rotation closest to `m` in the Frobenius norm (the orthogonal polar
+/// factor `m·(mᵀm)^-½`, with the reflection removed when `det m < 0`).
+///
+/// Also the Kabsch solution: for `m = Σ bᵢ·aᵢᵀ` it is the rotation `R`
+/// that best maps every `aᵢ` onto its `bᵢ`.
+pub fn nearest_rotation(m: &M3) -> M3 {
+    let (vals, vecs) = sym3_eigen(&mat_mul(&transpose(m), m));
+    // the smallest singular direction takes the sign that makes det = +1
+    let flip = if determinant(m) < 0.0 { -1.0 } else { 1.0 };
+    let mut inv_sqrt = [[0.0; 3]; 3];
+    for k in 0..3 {
+        let w = if k == 2 { flip } else { 1.0 } / vals[k].max(1e-300).sqrt();
+        for (i, row) in inv_sqrt.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell += w * vecs[k][i] * vecs[k][j];
+            }
+        }
+    }
+    mat_mul(m, &inv_sqrt)
+}
+
 /// Angle (rad) of the relative rotation `aᵀ·b` — the geodesic distance.
 pub fn rotation_distance(a: &M3, b: &M3) -> f64 {
     let rel = mat_mul(&transpose(a), b);
@@ -437,6 +475,24 @@ mod tests {
 
     fn close(a: f64, b: f64, eps: f64) -> bool {
         (a - b).abs() <= eps
+    }
+
+    #[test]
+    fn rotation_vector_inverts_rodrigues() {
+        for r in [[0.0, 0.0, 0.0], [1e-9, -2e-9, 0.0], [0.3, -0.2, 0.1], [0.0, 3.0, 0.0], [-1.2, 2.1, 0.7]] {
+            let back = rotation_vector(&rodrigues(r));
+            assert!((0..3).all(|i| close(back[i], r[i], 1e-9)), "{r:?} -> {back:?}");
+        }
+    }
+
+    #[test]
+    fn nearest_rotation_recovers_rotations_and_drops_reflections() {
+        let r = rodrigues([0.4, -1.1, 0.25]);
+        let noisy = std::array::from_fn(|i| std::array::from_fn(|j| 2.5 * r[i][j] + if i == j { 1e-4 } else { 0.0 }));
+        assert!(rotation_distance(&nearest_rotation(&noisy), &r) < 1e-4);
+        let reflected = [r[0], r[1], scale(r[2], -1.0)];
+        let q = nearest_rotation(&reflected);
+        assert!(close(determinant(&q), 1.0, 1e-9));
     }
 
     fn test_k() -> Intrinsics {

@@ -17,9 +17,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
 use jni::JNIEnv;
-use jni::objects::{JByteBuffer, JClass, JFloatArray, JString};
+use jni::objects::{JByteBuffer, JClass, JFloatArray, JLongArray, JString};
 use jni::sys::{jint, jlong, jstring};
+use scan_algo::imu::GyroSample;
 use scan_algo::laser::YuvFrame;
+use scan_algo::rolling::RowClock;
 
 use engine::Engine;
 
@@ -131,9 +133,10 @@ pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeMess
     })
 }
 
-/// Process one YUV_420_888 frame (`timestamp_ns`: its sensor timestamp).
-/// Returns the number of floats written to `out`, or `-needed` when `out` is
-/// too small (nothing written).
+/// Process one YUV_420_888 frame (`timestamp_ns`: its sensor timestamp,
+/// `readout_ns`: its rolling-shutter skew, `exposure_ns`: its exposure time;
+/// 0 when unknown). Returns the number of floats written to `out`, or
+/// `-needed` when `out` is too small (nothing written).
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeProcess<'l>(
@@ -149,6 +152,8 @@ pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeProc
     width: jint,
     height: jint,
     timestamp_ns: jlong,
+    readout_ns: jlong,
+    exposure_ns: jlong,
     out: JFloatArray<'l>,
 ) -> jint {
     guard(&mut env, 0, |env| {
@@ -163,7 +168,8 @@ pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeProc
             return Err("image planes smaller than their geometry".into());
         }
         let frame = YuvFrame { width: w, height: h, y: yb, y_stride: ys, u: ub, v: vb, uv_stride: uvs, uv_pixel_stride: ps };
-        let data = unsafe { engine(handle) }?.process(&frame, timestamp_ns).map_err(|e| e.to_string())?;
+        let clock = RowClock { start_ns: timestamp_ns, readout_ns: readout_ns.max(0), exposure_ns: exposure_ns.max(0), height: h as f64 };
+        let data = unsafe { engine(handle) }?.process(&frame, clock).map_err(|e| e.to_string())?;
         let cap = env.get_array_length(&out).map_err(|e| e.to_string())? as usize;
         if data.len() > cap {
             return Ok(-(data.len() as jint));
@@ -172,5 +178,28 @@ pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeProc
         env.set_float_array_region(&out, 0, data).map_err(|e| e.to_string())?;
         unsafe { engine(handle) }?.clear_events();
         Ok(n)
+    })
+}
+
+/// Hand the engine `count` gyroscope samples: `timestamps_ns[i]` (the
+/// `SensorEvent` clock) and the rate `rates[3i..3i+3]` (rad/s, device axes).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativePushGyro<'l>(
+    mut env: JNIEnv<'l>,
+    _cls: JClass<'l>,
+    handle: jlong,
+    timestamps_ns: JLongArray<'l>,
+    rates: JFloatArray<'l>,
+    count: jint,
+) {
+    guard(&mut env, (), |env| {
+        let n = count.max(0) as usize;
+        let mut ts = vec![0i64; n];
+        let mut w = vec![0f32; 3 * n];
+        env.get_long_array_region(&timestamps_ns, 0, &mut ts).map_err(|e| e.to_string())?;
+        env.get_float_array_region(&rates, 0, &mut w).map_err(|e| e.to_string())?;
+        let samples = ts.iter().zip(w.chunks_exact(3)).map(|(&t_ns, r)| GyroSample { t_ns, rate: [r[0], r[1], r[2]].map(f64::from) });
+        unsafe { engine(handle) }?.push_gyro(samples);
+        Ok(())
     })
 }

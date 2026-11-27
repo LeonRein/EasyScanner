@@ -5,8 +5,9 @@
 use std::fs;
 use std::path::Path;
 
+use crate::fusion::FusionCfg;
 use crate::gate::ScanGateCfg;
-use crate::geom::{Intrinsics, V3, normalize};
+use crate::geom::{Intrinsics, M3, V3, normalize};
 use crate::keyframe::KeyframeCfg;
 use crate::laser::LaserColor;
 use crate::plane::PlaneFitCfg;
@@ -148,6 +149,10 @@ pub struct CameraCfg {
     pub guess: Option<IntrinsicsJson>,
     /// Locked lens focus (diopters); `None` while autofocus runs.
     pub focus_diopters: Option<f64>,
+    /// IMU→camera rotation (row-major) as Camera2 reports it (lens pose
+    /// relative to the gyroscope); the gyro self-calibration falls back on
+    /// it while the camera turns about one axis only.
+    pub cam_from_imu: Option<M3>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -164,6 +169,8 @@ pub struct Config {
     pub scan_gate: ScanGateCfg,
     /// When a laser-plane fit is good enough to save.
     pub plane_fit: PlaneFitCfg,
+    /// Gyroscope fusion and rolling-shutter correction.
+    pub fusion: FusionCfg,
     pub calib_views: usize,
     pub plane_views: usize,
     pub max_cloud_points: usize,
@@ -181,6 +188,7 @@ impl Default for Config {
             keyframes: KeyframeCfg::default(),
             scan_gate: ScanGateCfg::default(),
             plane_fit: PlaneFitCfg::default(),
+            fusion: FusionCfg::default(),
             calib_views: 64,
             plane_views: 10,
             max_cloud_points: 6_000_000,

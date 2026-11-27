@@ -7,13 +7,15 @@
 //! 1. [`sim`] simulates a hand-held scan of known solids ([`scene`]) on the
 //!    board: ChArUco corner pixels with noise and occlusion, the laser stripe
 //!    either projected exactly or rendered into a YUV frame and found by the
-//!    app's own [`crate::laser::LaserDetector`], rolling shutter, a wrong
+//!    app's own [`crate::laser::LaserDetector`], rolling shutter, the phone's
+//!    gyroscope (noise, bias, clock offset, mounting), a wrong
 //!    camera calibration, and the app's laser-plane calibration replayed on
 //!    simulated board stripes.
 //! 2. The result is a [`recording::Recording`] — the same format a real phone
 //!    session can be saved in — with the ground truth attached.
 //! 3. [`reconstruct`] turns a recording into a cloud with the engine's steps
-//!    (pose from the corners, stripe ∩ laser plane, working-volume test).
+//!    (gyro fusion and rolling-shutter correction, pose from the corners,
+//!    stripe ∩ laser plane, working-volume test).
 //! 4. [`metrics`] scores it: pose error, laser-plane error, signed distance
 //!    of every point to the true surface, and a sphere fit per ball (which
 //!    also works on a real scan of a reference ball, see
@@ -34,15 +36,18 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fusion::FusionCfg;
 use crate::geom::{Intrinsics, Pose, V3, dot, mat_vec, rodrigues};
+use crate::plane::Rng;
 use crate::plane::{PlaneCalibrator, PlaneFit};
+use crate::rolling::MotionSource;
 use crate::stripe;
 
 use metrics::Report;
 use reconstruct::{PoseFrom, Reconstruction};
 use recording::{CornerRec, FrameRec, PlaneRec, Recording, Truth, VolumeDims};
 use scene::{BoardDims, Scene, Shape};
-use sim::{Camera, CameraModel, IntrinsicsError, LaserMount, StripeModel, Trajectory, look_at};
+use sim::{Camera, CameraModel, GyroModel, IntrinsicsError, LaserMount, StripeModel, Trajectory, look_at};
 
 /// Which laser plane the reconstruction uses.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -78,6 +83,11 @@ pub struct BenchCfg {
     /// Rolling-shutter readout, first to last row (ms); 0 = global shutter.
     pub rolling_shutter_ms: f64,
     pub stripe: StripeModel,
+    /// The phone's gyroscope; `None` = no gyro samples in the recording.
+    pub gyro: Option<GyroModel>,
+    /// The reconstruction's gyro fusion and rolling-shutter correction (the
+    /// app's settings).
+    pub fusion: FusionCfg,
 }
 
 impl Default for BenchCfg {
@@ -97,6 +107,8 @@ impl Default for BenchCfg {
             corner_noise_px: 0.0,
             rolling_shutter_ms: 0.0,
             stripe: StripeModel::Analytic { noise_px: 0.0 },
+            gyro: None,
+            fusion: FusionCfg::default(),
         }
     }
 }
@@ -111,6 +123,7 @@ impl BenchCfg {
             corner_noise_px: 0.2,
             rolling_shutter_ms: 20.0,
             stripe: StripeModel::render(),
+            gyro: Some(GyroModel::default()),
             ..BenchCfg::default()
         }
     }
@@ -124,12 +137,13 @@ impl BenchCfg {
 pub fn scenarios() -> Vec<BenchCfg> {
     let ideal = BenchCfg::default();
     let noisy = BenchCfg { corner_noise_px: 0.2, stripe: StripeModel::Analytic { noise_px: 0.3 }, ..ideal.clone() };
-    vec![
+    let no_correction = FusionCfg { rolling_shutter: MotionSource::Off, ..FusionCfg::default() };
+    let mut out = vec![
         ideal.clone(),
         BenchCfg { corner_noise_px: 0.2, ..ideal.named("corner noise 0.2 px") },
         BenchCfg { stripe: StripeModel::Analytic { noise_px: 0.3 }, ..ideal.named("stripe noise 0.3 px") },
         BenchCfg { stripe: StripeModel::render(), ..ideal.named("stripe rendered + detector") },
-        BenchCfg { rolling_shutter_ms: 20.0, ..ideal.named("rolling shutter 20 ms") },
+        BenchCfg { rolling_shutter_ms: 20.0, fusion: no_correction, ..ideal.named("rolling shutter 20 ms") },
         BenchCfg { intrinsics_error: IntrinsicsError { focal_rel: 0.005, ..Default::default() }, ..ideal.named("focal length +0.5 %") },
         BenchCfg {
             intrinsics_error: IntrinsicsError { focal_rel: 0.005, ..Default::default() },
@@ -141,8 +155,17 @@ pub fn scenarios() -> Vec<BenchCfg> {
         BenchCfg { plane: PlaneSource::Perturbed { tilt_deg: 0.0, offset_mm: 0.5 }, ..ideal.named("laser plane shifted 0.5 mm") },
         noisy.named("corner + stripe noise"),
         BenchCfg { plane: PlaneSource::Calibrated { frames: 120, min_lines: 10 }, ..noisy.named("… + plane calibrated in sim") },
+        BenchCfg { fusion: no_correction, ..BenchCfg::realistic().named("realistic, uncorrected") },
         BenchCfg::realistic(),
-    ]
+    ];
+    // a brisk hand: ~200 mm/s, ~35°/s — what the scan gate rejects today
+    let brisk = BenchCfg { rolling_shutter_ms: 20.0, trajectory: Trajectory { sweep_hz: 0.75, ..Trajectory::default() }, ..noisy };
+    out.extend([
+        BenchCfg { fusion: no_correction, ..brisk.named("brisk, RS 20 ms, uncorrected") },
+        BenchCfg { fusion: FusionCfg { rolling_shutter: MotionSource::Poses, ..FusionCfg::default() }, ..brisk.named("brisk, RS corrected (poses)") },
+        BenchCfg { gyro: Some(GyroModel::default()), ..brisk.named("brisk, RS corrected (gyro)") },
+    ]);
+    out
 }
 
 fn frac(x: f64) -> f64 {
@@ -221,20 +244,28 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Recording, String> {
             PlaneRec { n: fit.n, d: fit.d }
         }
     };
-    let mut cam = Camera::new(&scene, cfg.camera.into(), cfg.laser, cfg.stripe, cfg.corner_noise_px, cfg.rolling_shutter_ms * 1e-3, cfg.seed);
+    let readout_s = cfg.rolling_shutter_ms * 1e-3;
+    let mut cam = Camera::new(&scene, cfg.camera.into(), cfg.laser, cfg.stripe, cfg.corner_noise_px, readout_s, cfg.seed);
     let traj = |t: f64| cfg.trajectory.pose(t);
     let mut frames = Vec::new();
     let mut poses = Vec::new();
     for t in cfg.trajectory.frame_times() {
         let obs = cam.observe(&traj, t);
-        frames.push(FrameRec {
+        let frame = FrameRec {
             ts_ns: (t * 1e9).round() as i64,
+            readout_ns: (readout_s * 1e9).round() as i64,
+            exposure_ns: 0,
             pose: None,
             corners: obs.corners.iter().map(|&(id, q)| CornerRec { id, u: q[0], v: q[1] }).collect(),
             laser_px: obs.laser_px,
-        });
-        poses.push(traj(t).into());
+        };
+        poses.push(traj(frame.clock(cfg.camera.height).mid_ns() * 1e-9).into());
+        frames.push(frame);
     }
+    let gyro = cfg.gyro.map_or_else(Vec::new, |g| {
+        let end = cfg.trajectory.duration_s + readout_s + 0.1;
+        g.sample(&cfg.trajectory, end, &mut Rng::new(cfg.seed ^ 0x6E70))
+    });
     Ok(Recording {
         version: Recording::VERSION,
         source: format!("synthetic: {}", cfg.name),
@@ -243,7 +274,15 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Recording, String> {
         intrinsics: cfg.intrinsics_error.apply(cfg.camera),
         laser_plane: used,
         frames,
-        truth: Some(Truth { scene, intrinsics: cfg.camera, laser_plane: PlaneRec { n: tn, d: td }, poses }),
+        cam_from_imu: cfg.gyro.map(|g| g.reported_mount()),
+        gyro,
+        truth: Some(Truth {
+            scene,
+            intrinsics: cfg.camera,
+            laser_plane: PlaneRec { n: tn, d: td },
+            poses,
+            gyro: cfg.gyro.map(|g| g.calib()),
+        }),
     })
 }
 
@@ -257,7 +296,7 @@ pub struct Outcome {
 pub fn run(cfg: &BenchCfg) -> Result<Outcome, String> {
     let t0 = Instant::now();
     let recording = simulate(cfg)?;
-    let reconstruction = reconstruct::reconstruct(&recording, PoseFrom::Auto);
+    let reconstruction = reconstruct::reconstruct(&recording, PoseFrom::Auto, &cfg.fusion);
     let mut report = metrics::evaluate(&cfg.name, &recording, &reconstruction);
     report.runtime_s = t0.elapsed().as_secs_f64();
     Ok(Outcome { recording, reconstruction, report })
@@ -318,6 +357,40 @@ mod tests {
         assert!(r.points > 1_000, "{} points", r.points);
         let s = r.surface_mm.unwrap();
         assert!(s.rms < 3.0, "{s:?}");
+    }
+
+    #[test]
+    fn rolling_shutter_correction_pays_off_at_speed() {
+        let brisk = BenchCfg {
+            corner_noise_px: 0.2,
+            rolling_shutter_ms: 20.0,
+            gyro: Some(GyroModel::default()),
+            trajectory: Trajectory { duration_s: 6.0, azimuth_span_deg: 108.0, sweep_hz: 0.75, ..Trajectory::default() },
+            ..BenchCfg::default()
+        };
+        let off = BenchCfg { fusion: FusionCfg { rolling_shutter: MotionSource::Off, ..FusionCfg::default() }, ..brisk.clone() };
+        let (raw, corrected) = (run(&off).unwrap().report, run(&brisk).unwrap().report);
+        let (a, b) = (raw.pose_pos_mm.unwrap().rms, corrected.pose_pos_mm.unwrap().rms);
+        assert!(b < 0.6 * a, "pose error {a:.2} mm uncorrected, {b:.2} mm corrected");
+        assert!(corrected.corrected_frames > corrected.frames * 9 / 10);
+    }
+
+    #[test]
+    fn gyro_self_calibration_finds_the_simulated_gyro() {
+        let cfg = BenchCfg {
+            corner_noise_px: 0.2,
+            rolling_shutter_ms: 20.0,
+            gyro: Some(GyroModel::default()),
+            trajectory: Trajectory { duration_s: 6.0, azimuth_span_deg: 108.0, ..Trajectory::default() },
+            ..BenchCfg::default()
+        };
+        let g = run(&cfg).unwrap().report.gyro.expect("the gyro calibrates");
+        // the smooth orbit turns about one axis: the reported mounting (0.5° off) is kept
+        assert!(g.rotation_err_deg.unwrap() < 1.0, "{g:?}");
+        // the offset is the one that makes gyro and board agree; it also takes
+        // up the few ms by which the not yet gyro-corrected poses lag
+        assert!(g.offset_err_ms.unwrap().abs() < 10.0, "{g:?}");
+        assert!(g.from_frame.is_some_and(|f| f < 90), "{g:?}");
     }
 
     #[test]

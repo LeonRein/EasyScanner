@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::geom::{V3, dot, norm, sub};
+use crate::geom::{V3, dot, norm, rotation_distance, sub};
 
 use super::pnp::{pose_error, solve_dense};
 use super::recording::Recording;
@@ -137,6 +137,19 @@ pub struct SphereReport {
     pub center_err_mm: Option<f64>,
 }
 
+/// The gyro self-calibration at the end of the reconstruction.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct GyroReport {
+    /// First frame the calibration was in use.
+    pub from_frame: Option<usize>,
+    /// Its fit residual (deg).
+    pub residual_deg: f64,
+    /// Errors against the simulated gyro (synthetic recordings only).
+    pub rotation_err_deg: Option<f64>,
+    pub bias_err_dps: Option<f64>,
+    pub offset_err_ms: Option<f64>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Report {
     pub name: String,
@@ -145,7 +158,11 @@ pub struct Report {
     pub points: usize,
     /// Reprojection RMS of the solved poses (px).
     pub reproj_px: Option<Stats>,
-    /// Pose error against the truth at the frame timestamp.
+    /// Frames whose observations were rolling-shutter corrected.
+    pub corrected_frames: usize,
+    /// `None` when the recording has no gyro or it never calibrated.
+    pub gyro: Option<GyroReport>,
+    /// Pose error against the truth at the frame's reference instant.
     pub pose_rot_deg: Option<Stats>,
     pub pose_pos_mm: Option<Stats>,
     /// Angle between the used and the true laser plane.
@@ -168,10 +185,22 @@ pub fn evaluate(name: &str, rec: &Recording, recon: &Reconstruction) -> Report {
         frames: rec.frames.len(),
         frames_posed: recon.poses.iter().filter(|p| p.is_some()).count(),
         points: recon.points.len(),
+        corrected_frames: recon.corrected_frames,
         ..Report::default()
     };
     let rms: Vec<f64> = recon.poses.iter().flatten().map(|p| p.reproj_rms).collect();
     rep.reproj_px = Stats::of(&rms);
+    let true_gyro = rec.truth.as_ref().and_then(|t| t.gyro);
+    rep.gyro = recon.gyro_fit.map(|fit| {
+        let c = fit.calib;
+        GyroReport {
+            from_frame: recon.gyro_from_frame,
+            residual_deg: fit.residual_deg,
+            rotation_err_deg: true_gyro.map(|t| rotation_distance(&c.cam_from_imu, &t.cam_from_imu).to_degrees()),
+            bias_err_dps: true_gyro.map(|t| norm(sub(c.bias, t.bias)).to_degrees()),
+            offset_err_ms: true_gyro.map(|t| (c.offset_ns - t.offset_ns) * 1e-6),
+        }
+    });
     let Some(truth) = &rec.truth else { return rep };
 
     let (mut rot, mut pos) = (Vec::new(), Vec::new());

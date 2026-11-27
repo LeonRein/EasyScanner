@@ -30,11 +30,38 @@ data class IntrinsicsGuess(
     val dist: DoubleArray, val width: Double, val height: Double,
 )
 
+/** How a frame's rows were exposed, from its capture result; 0 = unknown. */
+data class RowTiming(
+    /** Rolling-shutter skew: first to last row readout. */
+    val readoutNs: Long,
+    val exposureNs: Long,
+) {
+    companion object {
+        val UNKNOWN = RowTiming(0, 0)
+    }
+}
+
+/** Something that knows the row timing of the frames it streams. */
+interface RowTimingSource {
+    val rowTiming: RowTiming
+}
+
 /** What the app needs to know about one back camera. */
 data class CameraInfo(
     val id: String,
     val label: String,
     val sensorOrientation: Int,
+    /**
+     * Frame timestamps are on the `SensorEvent` clock (timestamp source
+     * REALTIME), so gyro samples can be matched to frames.
+     */
+    val gyroClockShared: Boolean,
+    /**
+     * Nominal rotation from the device's sensor axes (Android sensor
+     * coordinates) to this back camera's axes (x right, y down, z forward
+     * in the raw sensor image), rows = camera axes. The core refines it.
+     */
+    val camFromImu: Array<DoubleArray>,
     /** YUV sizes with the sensor's aspect that reach the target fps, largest first. */
     val analysisSizes: List<Size>,
     /** JPEG sizes with exactly the analysis stream's aspect, largest first: photo keyframes. */
@@ -68,6 +95,23 @@ data class CameraInfo(
     companion object {
         fun backCameraIds(mgr: CameraManager): List<String> = mgr.cameraIdList.filter {
             mgr.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK
+        }
+
+        /**
+         * A back camera looks along −z of the device; its raw image, turned
+         * clockwise by the sensor orientation θ, stands upright with the
+         * device's +x to the right and +y up. Undoing that turn gives the raw
+         * image's axes in device coordinates: x = (cos θ, −sin θ, 0),
+         * y = (−sin θ, −cos θ, 0), z = (0, 0, −1).
+         */
+        fun backCameraFromDevice(orientationDeg: Int): Array<DoubleArray> {
+            val t = Math.toRadians(orientationDeg.toDouble())
+            val (c, s) = Math.cos(t) to Math.sin(t)
+            return arrayOf(
+                doubleArrayOf(c, -s, 0.0),
+                doubleArrayOf(-s, -c, 0.0),
+                doubleArrayOf(0.0, 0.0, -1.0),
+            )
         }
 
         fun query(mgr: CameraManager, id: String, targetFps: Int, maxLongSide: Int): CameraInfo {
@@ -111,10 +155,14 @@ data class CameraInfo(
                 focal?.let { append(" · f %.2f mm".format(it)) }
                 append(" · ").append(active.width()).append('x').append(active.height())
             }
+            val orientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
             return CameraInfo(
                 id = id,
                 label = label,
-                sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
+                sensorOrientation = orientation,
+                gyroClockShared = c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
+                    CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME,
+                camFromImu = backCameraFromDevice(orientation),
                 analysisSizes = analysis,
                 stillSizes = stills,
                 previewSize = preview,
@@ -200,7 +248,7 @@ class CameraController(
      * can be had at all, so asking again is pointless.
      */
     private val onStillFailed: (msg: String, fatal: Boolean) -> Unit,
-) {
+) : RowTimingSource {
     private val thread = HandlerThread("es-camera").apply { start() }
     private val handler = Handler(thread.looper)
     private val stillThread = HandlerThread("es-still").apply { start() }
@@ -233,12 +281,20 @@ class CameraController(
     @Volatile var focusSettled = false
         private set
 
+    /** Row timing of the last completed frame: constant per sensor mode and exposure. */
+    @Volatile override var rowTiming = RowTiming.UNKNOWN
+        private set
+
     private val frameCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
             val af = result.get(CaptureResult.CONTROL_AF_STATE)
             focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
             focusSettled = request.get(CaptureRequest.CONTROL_AF_MODE) == CameraMetadata.CONTROL_AF_MODE_OFF ||
                 af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED || af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+            rowTiming = RowTiming(
+                readoutNs = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L,
+                exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
+            )
         }
     }
 

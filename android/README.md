@@ -25,7 +25,11 @@ the four tool modes underneath instead:
 How the phone's position in the world is determined is deliberately left
 open: today it is the ChArUco board pose (IPPE + temporal disambiguation),
 produced in one place (`core/android/src/board.rs`) so another source can
-replace it.
+replace it. The phone's gyroscope is fused with it (`core/algo/src/fusion.rs`,
+[`docs/imu-fusion.md`](../docs/imu-fusion.md)): it calibrates itself against
+the board, supplies the turn rate for the scan gate and the expected rotation
+for IPPE's branch choice, and, with the board poses' velocity, undoes the
+rolling shutter of the corners and the stripe.
 
 ## Layout
 
@@ -35,7 +39,8 @@ android/
   core/                   Rust workspace
     algo/                 pure Rust, host-testable: laser detector, geometry, plane fit,
                           stripe reconstruction, volume ROI, overlay geometry, focus,
-                          point cloud + PLY, config and calibration file formats
+                          gyro fusion + rolling-shutter correction, point cloud + PLY,
+                          config and calibration file formats
     android/              cdylib libeasyscanner_core.so: OpenCV ChArUco + PnP +
                           calibrateCamera, the per-frame engine, JNI bridge
 ```
@@ -43,8 +48,10 @@ android/
 Data flow per frame, all on one processing thread:
 
 ```
-Camera2 YUV_420_888 ──(direct ByteBuffers, no copy)──▶ nativeProcess
-  luma plane wrapped as cv::Mat ─▶ CharucoDetector (tracking ROI) ─▶ solvePnPGeneric IPPE
+SensorManager gyroscope (200 Hz) ──▶ GyroStream ──(batch before each frame)──▶ nativePushGyro
+Camera2 YUV_420_888 ──(direct ByteBuffers, no copy)──▶ nativeProcess (+ rolling-shutter skew)
+  luma plane wrapped as cv::Mat ─▶ CharucoDetector (tracking ROI)
+            ─▶ solvePnPGeneric IPPE (corners rolling-shutter corrected, branch by gyro)
   YUV planes ─▶ laser response inside the projected volume (rayon bands)
             ─▶ per-line peaks + centroids ─▶ chains ─▶ board-plane / laser-plane rays
   ─▶ float[] header + layers ──▶ TripleBuffer ──▶ OverlayView (drawn in place) + HUD

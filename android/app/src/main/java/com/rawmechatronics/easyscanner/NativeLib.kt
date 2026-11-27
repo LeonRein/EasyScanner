@@ -19,16 +19,23 @@ internal object NativeLib {
 
     /**
      * Process one YUV_420_888 frame in place ([timestampNs]: its sensor
-     * timestamp). Returns the number of floats written to [out], or `-needed`
-     * when [out] is too small.
+     * timestamp, [readoutNs]: its rolling-shutter skew, [exposureNs]: its
+     * exposure time; 0 when unknown). Returns the number of floats written
+     * to [out], or `-needed` when [out] is too small.
      */
     @JvmStatic external fun nativeProcess(
         handle: Long,
         y: ByteBuffer, yStride: Int,
         u: ByteBuffer, v: ByteBuffer, uvStride: Int, uvPixelStride: Int,
-        width: Int, height: Int, timestampNs: Long,
+        width: Int, height: Int, timestampNs: Long, readoutNs: Long, exposureNs: Long,
         out: FloatArray,
     ): Int
+
+    /**
+     * Hand the core [count] gyroscope samples: [timestampsNs] on the
+     * `SensorEvent` clock, [rates] as x, y, z per sample (rad/s, device axes).
+     */
+    @JvmStatic external fun nativePushGyro(handle: Long, timestampsNs: LongArray, rates: FloatArray, count: Int)
 }
 
 /** Engine commands; codes mirror `engine::cmd`. */

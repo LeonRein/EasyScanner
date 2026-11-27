@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.SurfaceTexture
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
@@ -60,6 +61,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private lateinit var mgr: CameraManager
     private lateinit var processor: FrameProcessor
     private lateinit var camera: CameraController
+    private lateinit var gyro: GyroStream
     private val main = Handler(Looper.getMainLooper())
 
     @Volatile private var info: CameraInfo? = null
@@ -119,6 +121,9 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             onStill = ::onStill,
             onStillFailed = { msg, fatal -> main.post { onStillFailed(msg, fatal) } },
         )
+        gyro = GyroStream(getSystemService(SensorManager::class.java))
+        processor.gyro = gyro
+        processor.timing = camera
         b.overlay.source = processor.results
         settings = AppSettings.load(this)
 
@@ -178,6 +183,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         // in case the process does not come back
         if (photoDir != null) processor.command(Cmd.CHECKPOINT)
         camera.close()
+        gyro.stop()
         cameraStarted = false
         super.onPause()
     }
@@ -210,6 +216,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         b.overlay.sensorOrientation = inf.sensorOrientation
 
         processor.configure(st.nativeConfig(inf))
+        if (inf.gyroClockShared) gyro.start() else gyro.stop()
         val sizes = inf.analysisSizes
         governor = if (st.autoResolution) {
             ResolutionGovernor(sizes.map { FrameSize(it.width, it.height) }, st.targetFps, 0)
@@ -364,6 +371,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             val rejected = f(H.GATE_REJECTED).toInt()
             sb.append("\nframes kept %d / rejected %d".format(kept, rejected))
             if (has(H.SCAN_GATE)) sb.append("  now: %s".format(FrameResult.Gate.label(f(H.SCAN_GATE).toInt())))
+            sb.append("\ngyro: %s".format(FrameResult.Gyro.label(f(H.GYRO_STATE).toInt())))
+            if (r.flag(H.RS_CORRECTED)) sb.append("  rolling shutter corrected")
         }
         val photoState = f(H.PHOTO_STATE).toInt()
         if (photoState != Photo.OFF) {

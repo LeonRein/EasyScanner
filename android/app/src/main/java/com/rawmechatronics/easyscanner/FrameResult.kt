@@ -88,7 +88,31 @@ class FrameResult(capacity: Int = 32 * 1024) {
         const val K_OK = 52
         const val PLANE_STALE = 53
         const val N_MARKERS = 54
-        const val LEN = 55
+        /** Scan-gate verdict: 0 kept, else a [Gate] reason; NaN without a board pose. */
+        const val SCAN_GATE = 55
+        const val GATE_KEPT = 56
+        const val GATE_REJECTED = 57
+        const val LEN = 58
+    }
+
+    /** Reasons in [H.SCAN_GATE], mirroring `scan_algo::gate::Reject`. */
+    object Gate {
+        const val KEPT = 0
+        const val POSE_RMS = 1
+        const val FEW_CORNERS = 2
+        const val AMBIGUOUS = 3
+        const val MOVING = 4
+        const val SETTLING = 5
+
+        fun label(code: Int) = when (code) {
+            KEPT -> "kept"
+            POSE_RMS -> "pose fit poor"
+            FEW_CORNERS -> "too few corners"
+            AMBIGUOUS -> "pose ambiguous"
+            MOVING -> "moving too fast"
+            SETTLING -> "settling"
+            else -> "?"
+        }
     }
 
     /** Event bits in [H.EVENTS], mirroring `frame_out::ev`. */

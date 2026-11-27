@@ -5,9 +5,11 @@
 use std::fs;
 use std::path::Path;
 
+use crate::gate::ScanGateCfg;
 use crate::geom::{Intrinsics, V3, normalize};
 use crate::keyframe::KeyframeCfg;
 use crate::laser::LaserColor;
+use crate::plane::PlaneFitCfg;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -158,6 +160,10 @@ pub struct Config {
     pub draw: DrawCfg,
     pub camera: CameraCfg,
     pub keyframes: KeyframeCfg,
+    /// Which frames may add points to the scan.
+    pub scan_gate: ScanGateCfg,
+    /// When a laser-plane fit is good enough to save.
+    pub plane_fit: PlaneFitCfg,
     pub calib_views: usize,
     pub plane_views: usize,
     pub max_cloud_points: usize,
@@ -173,6 +179,8 @@ impl Default for Config {
             draw: DrawCfg::default(),
             camera: CameraCfg::default(),
             keyframes: KeyframeCfg::default(),
+            scan_gate: ScanGateCfg::default(),
+            plane_fit: PlaneFitCfg::default(),
             calib_views: 64,
             plane_views: 10,
             max_cloud_points: 6_000_000,
@@ -336,6 +344,12 @@ mod tests {
         assert_eq!(cfg.board.squares_y, 8);
         assert_eq!(cfg.laser.laser_color(), LaserColor::Green);
         assert_eq!(cfg.calib_views, 64);
+        assert_eq!(cfg.scan_gate, ScanGateCfg::default());
+        let cfg: Config =
+            serde_json::from_str(r#"{"scan_gate":{"max_speed_mm_s":60},"plane_fit":{"max_rms_mm":0.8}}"#).unwrap();
+        assert_eq!(cfg.scan_gate.max_speed_mm_s, 60.0);
+        assert_eq!(cfg.scan_gate.min_corners, ScanGateCfg::default().min_corners);
+        assert_eq!(cfg.plane_fit.max_rms_mm, 0.8);
     }
 
     #[test]

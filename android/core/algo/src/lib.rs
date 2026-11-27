@@ -12,6 +12,7 @@
 pub mod cloud;
 pub mod config;
 pub mod focus;
+pub mod gate;
 pub mod geom;
 pub mod keyframe;
 pub mod laser;

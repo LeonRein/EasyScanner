@@ -17,6 +17,7 @@ use opencv::core::{CV_8UC1, Mat};
 use scan_algo::cloud::PointCloud;
 use scan_algo::config::{self, Config, IntrinsicsFile, SavedPlane};
 use scan_algo::focus::laplacian_variance;
+use scan_algo::gate::{FrameQuality, GateStats, Reject};
 use scan_algo::geom::{FaceOutFrame, Intrinsics, Pose, V3, euler_xyz_deg};
 use scan_algo::keyframe::{Due, Hold, Miss, PoseTrack, TrackedPose, Trigger};
 use scan_algo::laser::{LaserDetector, LaserParams, Roi, YuvFrame};
@@ -170,6 +171,8 @@ pub struct Engine {
     photo_serial: f64,
     /// Timestamps of recent frames with a laser stripe in view.
     stripe_seen: VecDeque<i64>,
+    /// The scan gate's verdicts on posed frames since the scan started.
+    gate_stats: GateStats,
 }
 
 impl Engine {
@@ -213,6 +216,7 @@ impl Engine {
             photo_state: photo_state::OFF,
             photo_serial: 0.0,
             stripe_seen: VecDeque::new(),
+            gate_stats: GateStats::default(),
             cfg,
         };
         e.reload_calibrations();
@@ -238,6 +242,7 @@ impl Engine {
         }
         self.calib.target = cfg.calib_views.max(4);
         self.plane_cal.min_lines = cfg.plane_views.max(3);
+        self.plane_cal.fit = cfg.plane_fit;
         self.cloud.max_points = cfg.max_cloud_points;
         self.cfg = cfg;
         let k_before = self.k_base;
@@ -320,6 +325,35 @@ impl Engine {
             100.0 * s / self.focus_max
         });
 
+        // ── this frame's pose into the track (its stripe numbers follow
+        // below), so the camera speed includes it ──
+        self.track.push(
+            ts_ns,
+            pose_res.as_ref().map(|p| TrackedPose {
+                ts_ns,
+                pose: p.pose,
+                reproj_rms: p.reproj_rms,
+                corners: n_corners,
+                margin: p.margin.unwrap_or(f64::NAN),
+                stripe_px: 0,
+                kept: 0,
+                sharpness: sharpness.unwrap_or(f64::NAN),
+            }),
+        );
+        let speed = self.track.speed(Trigger::SPEED_WINDOW_NS);
+
+        // ── quality gate: may this frame's laser points be kept? ──
+        let quality = pose_res.as_ref().map(|p| FrameQuality {
+            reproj_rms: p.reproj_rms,
+            corners: n_corners,
+            margin: p.margin.unwrap_or(f64::NAN),
+            speed,
+        });
+        let gate = &self.cfg.scan_gate;
+        // the plane calibration tilts the board between still views: pose checks only
+        let plane_pose_ok = quality.as_ref().is_some_and(|q| gate.check_pose(q).is_ok());
+        let scan_verdict: Option<Result<(), Reject>> = quality.as_ref().map(|q| gate.check(q));
+
         // ── live intrinsics calibration: every genuinely new view ──
         if self.calib_active && pose_res.is_some() && !self.calib.solving() {
             if self.calib.capture(&self.tracker.corners, &self.tracker.ids, (w, hgt)) {
@@ -372,7 +406,7 @@ impl Engine {
         }
 
         // ── laser-plane calibration: on-board stripes across tilts ──
-        if self.plane_active && let Some(s) = &board_stripe {
+        if self.plane_active && plane_pose_ok && let Some(s) = &board_stripe {
             let n_lines = self.plane_cal.add(&s.cam_pts);
             let last = self.plane_cal.last_rms.map(|r| format!(" — last fit {r:.1}mm")).unwrap_or_default();
             self.msgs.plane = format!("vary board tilt{last}");
@@ -383,7 +417,13 @@ impl Engine {
                     Some(fit) => self.accept_plane(fit, false),
                     None => {
                         self.msgs.plane =
-                            format!("fit {:.1}mm > 6 — vary tilt or force", self.plane_cal.last_rms.unwrap_or(f64::NAN));
+                            format!(
+                                "fit {:.1}mm, {:.0}% inliers (need ≤ {:.1}mm, ≥ {:.0}%) — vary tilt or force",
+                                self.plane_cal.last_rms.unwrap_or(f64::NAN),
+                                100.0 * self.plane_cal.last_inlier_frac.unwrap_or(f64::NAN),
+                                self.cfg.plane_fit.max_rms_mm,
+                                100.0 * self.cfg.plane_fit.min_inlier_frac,
+                            );
                     }
                 }
             }
@@ -397,7 +437,9 @@ impl Engine {
         if let (true, Some((n, d)), Some(p)) = (classified, plane, pose) {
             let mut inside = vec![false; self.laser_px.len()];
             let mut pushed = false;
-            let (cloud, px, scan_on) = (&mut self.cloud, &self.laser_px, self.scan_on);
+            // a frame that fails the gate is classified and shown, never kept
+            let keep = self.scan_on && scan_verdict == Some(Ok(()));
+            let (cloud, px, scan_on) = (&mut self.cloud, &self.laser_px, keep);
             stripe::to_laser_plane(px, &k, n, d, |i, x| {
                 let b = p.to_board(x);
                 if vol.contains(&p, b) {
@@ -410,6 +452,12 @@ impl Engine {
                 }
             });
             self.cloud_unsaved |= pushed;
+            if self.scan_on
+                && inside.iter().any(|&i| i)
+                && let Some(v) = scan_verdict
+            {
+                self.gate_stats.record(v);
+            }
             for (q, ins) in self.laser_px.iter().zip(&inside) {
                 if *ins { self.pts_in.push(*q) } else { self.pts_out.push(*q) }
             }
@@ -422,17 +470,7 @@ impl Engine {
         let t_laser = t_laser0.elapsed();
 
         // ── photo keyframes: this frame's pose for the stills, then the trigger ──
-        let tracked = pose_res.as_ref().map(|p| TrackedPose {
-            ts_ns,
-            pose: p.pose,
-            reproj_rms: p.reproj_rms,
-            corners: n_corners,
-            margin: p.margin.unwrap_or(f64::NAN),
-            stripe_px: if found { self.laser_px.len() } else { 0 },
-            kept: self.pts_in.len(),
-            sharpness: sharpness.unwrap_or(f64::NAN),
-        });
-        self.track.push(ts_ns, tracked);
+        self.track.set_latest_stripe(if found { self.laser_px.len() } else { 0 }, self.pts_in.len());
         if found {
             self.stripe_seen.push_back(ts_ns);
         }
@@ -453,10 +491,15 @@ impl Engine {
         o.set(h::PHOTO_STATE, self.photo_state);
         o.set(h::PHOTO_COUNT, self.photos.as_ref().map_or(0, |s| s.count()) as f64);
         o.set(h::PHOTO_SERIAL, self.photo_serial);
-        if let Some((v, w)) = self.track.speed(Trigger::SPEED_WINDOW_NS) {
+        if let Some((v, w)) = speed {
             o.set(h::CAM_SPEED, v);
             o.set(h::CAM_TURN, w);
         }
+        if let Some(v) = scan_verdict {
+            o.set(h::SCAN_GATE, v.err().map_or(0.0, |r| r as i32 as f64));
+        }
+        o.set(h::GATE_KEPT, self.gate_stats.kept as f64);
+        o.set(h::GATE_REJECTED, self.gate_stats.rejected() as f64);
         o.set(h::EVENTS, self.events as f64);
         Ok(&self.out.buf)
     }
@@ -706,6 +749,7 @@ impl Engine {
                     "the laser plane was fitted with another camera calibration — calibrate it again".to_string()
                 } else {
                     self.scan_on = true;
+                    self.gate_stats = GateStats::default();
                     self.plane_active = false;
                     self.calib_active = false;
                     "scanning…".to_string()

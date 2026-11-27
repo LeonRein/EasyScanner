@@ -128,6 +128,15 @@ impl PoseTrack {
         self.frames.back().map(|f| f.0)
     }
 
+    /// Fill in the newest frame's stripe numbers, known only after the pose
+    /// was pushed (the laser stage runs after the speed is needed).
+    pub fn set_latest_stripe(&mut self, stripe_px: usize, kept: usize) {
+        if let Some((_, Some(p))) = self.frames.back_mut() {
+            p.stripe_px = stripe_px;
+            p.kept = kept;
+        }
+    }
+
     pub fn latest(&self) -> Option<&TrackedPose> {
         self.frames.back().and_then(|f| f.1.as_ref())
     }

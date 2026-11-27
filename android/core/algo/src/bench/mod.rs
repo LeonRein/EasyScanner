@@ -222,13 +222,19 @@ pub fn scenarios() -> Vec<BenchCfg> {
         },
     ]);
     // A board that does not lie flat (1.6 mm peak to valley), with the plane
-    // calibrated on it: taken as flat, measured like the app does, and exact.
+    // calibrated on it: taken as flat, measured like the app does (degree 3,
+    // from the plane calibration's static views), and exact. Curled three
+    // times as much, it rises above the volume's board margin.
     let bent =
         BenchCfg { board_shape: bent_board(&ideal.board), plane: PlaneSource::Calibrated { frames: 120, min_lines: 10 }, ..noisy.clone() };
+    let curled = BenchCfg { board_shape: curled_board(&ideal.board), ..bent.clone() };
+    let measured = SurfaceModel::Measured { views: 60, degree: 3 };
     out.extend([
         bent.named("bent board, taken as flat"),
-        BenchCfg { surface_model: SurfaceModel::Measured { views: 60, degree: 3 }, ..bent.named("bent board, shape measured") },
+        BenchCfg { surface_model: measured, ..bent.named("bent board, shape measured") },
         BenchCfg { surface_model: SurfaceModel::Truth, ..bent.named("bent board, true shape") },
+        curled.named("curled board, taken as flat"),
+        BenchCfg { surface_model: measured, ..curled.named("curled board, shape measured") },
     ]);
     // The stripe detector's hard cases, rendered: a wide, overexposed line
     // and a reddish object under a red laser.
@@ -246,10 +252,29 @@ pub fn scenarios() -> Vec<BenchCfg> {
 }
 
 /// A sheet of paper bowed and twisted on a table: 1.6 mm peak to valley.
+/// It has terms up to degree 5, so the app's degree-3 model cannot match
+/// it exactly, as it cannot match real paper.
 pub fn bent_board(b: &BoardDims) -> BoardSurface {
-    BoardSurface::for_board(b.width_mm(), b.height_mm(), 3)
-        .with_coeffs(vec![-1.5, 0.5, -1.2, 0.0, 0.15, 0.0, -0.1])
-        .expect("7 terms for degree 3")
+    bent(b, 1.0)
+}
+
+/// The same sheet curled three times as much: more than the volume's
+/// board margin, so board points measured from the plane would leak.
+pub fn curled_board(b: &BoardDims) -> BoardSurface {
+    bent(b, 3.0)
+}
+
+fn bent(b: &BoardDims, gain: f64) -> BoardSurface {
+    let coeffs = [
+        [-1.5, 0.5, -1.2].as_slice(),       // degree 2
+        &[0.0, 0.15, 0.0, -0.1],            // degree 3
+        &[0.12, 0.0, -0.08, 0.0, 0.1],      // degree 4: edges curling up
+        &[0.0, 0.06, 0.0, 0.0, -0.05, 0.0], // degree 5
+    ]
+    .concat();
+    BoardSurface::for_board(b.width_mm(), b.height_mm(), 5)
+        .with_coeffs(coeffs.into_iter().map(|c| gain * c).collect())
+        .expect("18 terms for degree 5")
 }
 
 fn frac(x: f64) -> f64 {

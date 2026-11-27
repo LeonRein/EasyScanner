@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::geom::{V3, add, dot, norm, scale, sub};
+use crate::recording::BoardDims;
 
 /// A solid whose surface the scan should reproduce.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -93,42 +94,9 @@ pub enum Surface {
     Shape(usize),
 }
 
-/// The printed ChArUco board's geometry (OpenCV layout: square (0,0) black,
-/// markers in the white squares).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BoardDims {
-    pub squares_x: u32,
-    pub squares_y: u32,
-    pub square_mm: f64,
-    pub marker_mm: f64,
-}
-
-impl Default for BoardDims {
-    /// The app's default board (`BoardSpec::default`): 8x8, 36 mm.
-    fn default() -> Self {
-        BoardDims { squares_x: 8, squares_y: 8, square_mm: 36.0, marker_mm: 26.64 }
-    }
-}
-
+/// Simulation-only geometry of the printed board ([`BoardDims`] lives with
+/// the recording format).
 impl BoardDims {
-    pub fn width_mm(&self) -> f64 {
-        self.squares_x as f64 * self.square_mm
-    }
-
-    pub fn height_mm(&self) -> f64 {
-        self.squares_y as f64 * self.square_mm
-    }
-
-    /// The inner ChArUco corners with OpenCV's ids (row-major, x fastest).
-    pub fn corners(&self) -> impl Iterator<Item = (u32, V3)> + '_ {
-        let nx = self.squares_x - 1;
-        (0..nx * (self.squares_y - 1)).map(move |id| {
-            let (i, j) = (id % nx + 1, id / nx + 1);
-            (id, [i as f64 * self.square_mm, j as f64 * self.square_mm, 0.0])
-        })
-    }
-
     /// Reflectance of the printed face at board point `(x, y)`: black squares,
     /// white squares with a pseudo-random 7x7 marker bit pattern, and a grey
     /// table outside the print.

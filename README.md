@@ -99,6 +99,10 @@ What you need:
    opens the cloud (drag to orbit, pinch to zoom, two fingers to pan, double
    tap to frame it again) and the scan's photos, full screen on a tap.
 
+Building the scanner for the first time? [docs/first-test.md](docs/first-test.md)
+is the checklist: what the app calibrates by itself, what needs you, and
+what to keep for tuning.
+
 ## First scan on a real phone
 
 2026-10-19, from the phone's screen recording: calibrating the camera (64
@@ -164,7 +168,9 @@ EasyScanner/
 │   └── phone-clamp/ ← the phone clamp, a remix of a third-party model
 │       └── LICENSE  ← CC BY-NC-SA 4.0
 ├── charuco/         ← ChArUco board generator and ready PDFs (A4–A0)
-└── docs/images/     ← renders used in this README
+├── firmware/        ← ESP32-S3 laser switch (Rust), powered by the phone over USB-C
+├── protocol/        ← laser-link: the phone ↔ laser switch protocol (no_std Rust)
+└── docs/            ← first-test checklist, accuracy benchmark, gyro fusion; images/ for this README
 ```
 
 ## License

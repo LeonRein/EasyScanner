@@ -226,4 +226,12 @@
         <SwitchPreferenceCompat android:key="draw_volume" android:title="Draw the working volume" android:defaultValue="true" />
         <SwitchPreferenceCompat android:key="draw_cloud" android:title="Draw the scan cloud" android:defaultValue="true" />
     </PreferenceCategory>
+
+    <PreferenceCategory android:title="Diagnostics">
+        <SwitchPreferenceCompat
+            android:key="record_sessions"
+            android:title="Save raw scan data"
+            android:summary="Keeps what the camera and gyro saw in recording.jsonl next to the scan, so the scan can be re-run and tuned later. About 20–40 MB per minute of scanning."
+            android:defaultValue="true" />
+    </PreferenceCategory>
 </PreferenceScreen>

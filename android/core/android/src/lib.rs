@@ -194,8 +194,9 @@ pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativePush
         let ts = unsafe { env.get_array_elements(&timestamps_ns, ReleaseMode::NoCopyBack) }.map_err(|e| e.to_string())?;
         let w = unsafe { env.get_array_elements(&rates, ReleaseMode::NoCopyBack) }.map_err(|e| e.to_string())?;
         let n = (count.max(0) as usize).min(ts.len()).min(w.len() / 3);
-        let samples = ts[..n].iter().zip(w.chunks_exact(3)).map(|(&t_ns, r)| GyroSample { t_ns, rate: [r[0], r[1], r[2]].map(f64::from) });
-        unsafe { engine(handle) }?.push_gyro(samples);
+        let samples: Vec<GyroSample> =
+            ts[..n].iter().zip(w.chunks_exact(3)).map(|(&t_ns, r)| GyroSample { t_ns, rate: [r[0], r[1], r[2]].map(f64::from) }).collect();
+        unsafe { engine(handle) }?.push_gyro(&samples);
         Ok(())
     })
 }

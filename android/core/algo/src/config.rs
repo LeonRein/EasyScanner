@@ -174,6 +174,11 @@ pub struct Config {
     pub calib_views: usize,
     pub plane_views: usize,
     pub max_cloud_points: usize,
+    /// Stream every scan session's raw observations into its
+    /// `recording.jsonl` (`recording::session`), to replay it offline.
+    pub record_sessions: bool,
+    /// A recording stops at this size (MiB).
+    pub recording_max_mb: u64,
 }
 
 impl Default for Config {
@@ -192,6 +197,8 @@ impl Default for Config {
             calib_views: 64,
             plane_views: 10,
             max_cloud_points: 6_000_000,
+            record_sessions: true,
+            recording_max_mb: 2048,
         }
     }
 }

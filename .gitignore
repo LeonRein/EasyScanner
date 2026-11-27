@@ -17,6 +17,11 @@ venv/
 # FreeCAD backups.
 *.FCBak
 
+# ── Rust build output outside android/ ───────────────────────────────────
+/protocol/*/target/
+/protocol/*/Cargo.lock
+/firmware/*/target/
+
 # ── Agent/session state ──────────────────────────────────────────────────
 .omc/
 .claude/
@@ -39,3 +44,5 @@ desktop.ini
 *.jks
 *.keystore
 keystore.properties
+# …except the shared debug key, which is public by design (app/build.gradle.kts)
+!android/debug.keystore

@@ -205,7 +205,7 @@ pub fn pose_error(est: &Pose, truth: &Pose) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench::scene::BoardDims;
+    use crate::recording::BoardDims;
 
     fn k() -> Intrinsics {
         Intrinsics { fx: 920.0, fy: 925.0, cx: 641.0, cy: 478.0, dist: [0.06, -0.12, 0.001, -0.0005, 0.02], width: 1280.0, height: 960.0 }

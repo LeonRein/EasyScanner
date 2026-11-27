@@ -9,8 +9,8 @@ name: Android build
 # different refs, so the concurrency group does not deduplicate them). A
 # branch without a PR can still be built via "Run workflow".
 #
-# Paths the app does not build from are ignored. If the app ever links
-# protocol/laser-link, remove "protocol/**" from both lists.
+# Paths the app does not build from are ignored. protocol/ stays included
+# because the app's Rust core is meant to share the laser-link crate.
 
 on:
   push:
@@ -20,7 +20,6 @@ on:
       - "charuco/**"
       - "docs/**"
       - "firmware/**"
-      - "protocol/**"
       - ".github/workflows/firmware.yml"
       - "**/*.md"
   pull_request:

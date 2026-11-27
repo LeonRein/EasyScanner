@@ -1,15 +1,30 @@
 name: Android build
 
 # Builds the APK (Kotlin app + Rust core against OpenCV's prefab), runs the
-# host tests, and uploads the APK so every push and pull request yields a
-# testable build.
+# host tests, and uploads the APK so every pull request and every commit on
+# main yields a testable build.
+#
+# Feature branches are built through their pull request only: a push trigger
+# on all branches would build every PR commit twice (push + pull_request run
+# different refs, so the concurrency group does not deduplicate them). A
+# branch without a PR can still be built via "Run workflow".
+#
+# Paths the app does not build from are ignored. If the app ever links
+# protocol/laser-link, remove "protocol/**" from both lists.
 
 on:
   push:
-    branches: ["**"]
-    paths-ignore: ["cad/**", "charuco/**", "**/*.md"]
+    branches: [main]
+    paths-ignore: &ignored
+      - "cad/**"
+      - "charuco/**"
+      - "docs/**"
+      - "firmware/**"
+      - "protocol/**"
+      - ".github/workflows/firmware.yml"
+      - "**/*.md"
   pull_request:
-    paths-ignore: ["cad/**", "charuco/**", "**/*.md"]
+    paths-ignore: *ignored
   workflow_dispatch:
 
 concurrency:

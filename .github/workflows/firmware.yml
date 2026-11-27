@@ -4,9 +4,11 @@ name: Firmware build
 # ESP32-S3 firmware with Espressif's Xtensa toolchain, so a broken firmware
 # is caught before anyone flashes it.
 
+# Like the Android build: feature branches run through their pull request
+# only, so a PR commit is not built twice.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
     paths: ["firmware/**", "protocol/**", ".github/workflows/firmware.yml"]
   pull_request:
     paths: ["firmware/**", "protocol/**", ".github/workflows/firmware.yml"]

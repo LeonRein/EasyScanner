@@ -462,16 +462,9 @@ impl LaserDetector {
                     if best == 0 {
                         continue;
                     }
-                    // windowed centroid around the row's peak
-                    let a = best_x.saturating_sub(win).max(sx0);
-                    let b = (best_x + win + 1).min(sx1);
-                    let (mut mass, mut moment) = (0u32, 0u64);
-                    for (xi, &rv) in row_out[a..b].iter().enumerate() {
-                        mass += rv as u32;
-                        moment += rv as u64 * (a + xi) as u64;
-                    }
-                    if mass as f32 > min_mass {
-                        *cen = (moment as f64 / mass as f64) as f32;
+                    let line = ScanLine { lo: sx0, hi: sx1, win, min_mass };
+                    if let Some(c) = line.centroid(|x| row_out[x], best_x) {
+                        *cen = c;
                     }
                 }
             });
@@ -511,17 +504,10 @@ impl LaserDetector {
             if self.col_val[x] == 0 {
                 continue;
             }
-            let r = self.col_row[x] as usize;
-            let a = r.saturating_sub(win).max(y0);
-            let b = (r + win + 1).min(y1);
-            let (mut mass, mut moment) = (0u32, 0u64);
-            for yy in a..b {
-                let rv = self.resp[yy * w + x] as u32;
-                mass += rv;
-                moment += rv as u64 * yy as u64;
-            }
-            if mass as f32 > min_mass {
-                self.col_pts.push([x as f32, (moment as f64 / mass as f64) as f32]);
+            let line = ScanLine { lo: y0, hi: y1, win, min_mass };
+            let resp = &self.resp;
+            if let Some(c) = line.centroid(|yy| resp[yy * w + x], self.col_row[x] as usize) {
+                self.col_pts.push([x as f32, c]);
             }
         }
         self.row_pts.clear();
@@ -548,6 +534,85 @@ impl LaserDetector {
         let step = if pts.len() > p.max_points { pts.len() / p.max_points + 1 } else { 1 };
         out.extend(pts.iter().step_by(step));
         true
+    }
+}
+
+/// One scan line (a row or a column) of the response map, for locating the
+/// stripe's centre across it.
+struct ScanLine {
+    /// The searched span, `lo..hi`.
+    lo: usize,
+    hi: usize,
+    /// Half-width of the centroid window.
+    win: usize,
+    /// Least summed response (above the floor) a centre is accepted with.
+    min_mass: f32,
+}
+
+impl ScanLine {
+    /// Re-centrings of the window before the estimate is taken as final.
+    const MAX_ITERATIONS: usize = 4;
+    /// The stripe's extent is where the response stays above this fraction
+    /// of its peak.
+    const EXTENT_FRACTION: u8 = 4;
+    /// Pixels of background kept on each side of the stripe's extent.
+    const MARGIN: usize = 2;
+
+    /// Sub-pixel centre of the stripe crossing this line, starting from the
+    /// response peak at `peak`: the centroid of the response above the local
+    /// floor, in a window that spans the whole stripe and follows the
+    /// estimate.
+    ///
+    /// Each refinement matters on real stripes. A stripe that clips the red
+    /// channel loses chroma in its core, so its response has two flanks and
+    /// the peak sits on one of them: a window of fixed width around the peak
+    /// is lopsided, and on a wide stripe it holds one flank only.
+    /// Response away from the stripe (a reddish surface, the laser's glow)
+    /// pulls an unfloored centroid toward the window's centre, i.e. toward
+    /// whole pixels.
+    fn centroid(&self, resp: impl Fn(usize) -> u8, peak: usize) -> Option<f32> {
+        let (a, b) = self.extent(&resp, peak);
+        let half = self.win.max((b - a).div_ceil(2) + Self::MARGIN);
+        let mut centre = (a + b - 1) / 2;
+        let mut estimate = None;
+        for _ in 0..Self::MAX_ITERATIONS {
+            let a = centre.saturating_sub(half).max(self.lo);
+            let b = (centre + half + 1).min(self.hi);
+            if b <= a {
+                break;
+            }
+            // the window's edges stand for the background under the stripe
+            let floor = resp(a).min(resp(b - 1)) as u32;
+            let (mut mass, mut moment) = (0u32, 0u64);
+            for i in a..b {
+                let rv = (resp(i) as u32).saturating_sub(floor);
+                mass += rv;
+                moment += rv as u64 * i as u64;
+            }
+            if mass as f32 <= self.min_mass {
+                break;
+            }
+            let c = moment as f64 / mass as f64;
+            estimate = Some(c as f32);
+            let next = c.round() as usize;
+            if next == centre {
+                break;
+            }
+            centre = next;
+        }
+        estimate
+    }
+
+    /// The contiguous run `a..b` around `peak` where the response stays
+    /// above a fraction of the peak's: both flanks of a clipped stripe. It
+    /// grows at most `4·win` to each side, so a large reddish area does not
+    /// become one huge window.
+    fn extent(&self, resp: &impl Fn(usize) -> u8, peak: usize) -> (usize, usize) {
+        let edge = resp(peak) / Self::EXTENT_FRACTION;
+        let reach = 4 * self.win;
+        let a = (peak.saturating_sub(reach).max(self.lo)..peak).rev().take_while(|&i| resp(i) > edge).last().unwrap_or(peak);
+        let b = (peak + 1..(peak + reach + 1).min(self.hi)).take_while(|&i| resp(i) > edge).last().map_or(peak + 1, |i| i + 1);
+        (a, b)
     }
 }
 
@@ -745,5 +810,61 @@ mod tests {
         // a stride whose size overflows usize is refused, not wrapped
         let huge = YuvLayout { y_stride: usize::MAX / 2, ..ok };
         assert!(matches!(YuvFrame::new(huge, &y, &uv, &uv), Err(FrameError::PlaneTooShort { need: None, .. })));
+    }
+
+    /// RMS error (px) of the detected centre of a slightly tilted, Gaussian
+    /// red stripe of `sigma` px on a grey surface, rendered at several
+    /// sub-pixel offsets. `gain` drives red past 255 (clipping); `bleed` is
+    /// the share of it that leaks into green and blue; `bg_red` tints the
+    /// surface red.
+    fn stripe_rms(gain: f64, bleed: f64, sigma: f64, bg_red: f64) -> f64 {
+        use crate::bench::sim::YuvImage;
+        let (w, h) = (1280usize, 64usize);
+        let mut det = LaserDetector::default();
+        let (mut sq, mut n) = (0.0, 0usize);
+        for k in 0..5 {
+            let centre = |u: f64| 32.0 + k as f64 * 0.2 + 0.013 + (u - 640.0) * 0.003;
+            let mut rgb = vec![0u8; w * h * 3];
+            for v in 0..h {
+                for u in 0..w {
+                    // 4x vertical supersampling
+                    let mut acc = [0.0; 3];
+                    for s in 0..4 {
+                        let d = v as f64 + (s as f64 + 0.5) / 4.0 - 0.5 - centre(u as f64);
+                        let g = gain * (-0.5 * (d / sigma).powi(2)).exp();
+                        let side = (140.0 + bleed * g).min(255.0);
+                        acc[0] += (140.0 + bg_red + g).min(255.0);
+                        acc[1] += side;
+                        acc[2] += side;
+                    }
+                    for (c, a) in acc.iter().enumerate() {
+                        rgb[(v * w + u) * 3 + c] = (a / 4.0).round() as u8;
+                    }
+                }
+            }
+            let img = YuvImage::from_rgb(&rgb, w, h);
+            let mut out = Vec::new();
+            assert!(det.detect(&img.frame().unwrap(), &Roi::full(w, h), &LaserParams::default(), &mut out));
+            for q in &out {
+                sq += (q[1] as f64 - centre(q[0] as f64)).powi(2);
+                n += 1;
+            }
+        }
+        (sq / n as f64).sqrt()
+    }
+
+    #[test]
+    fn a_clipped_stripe_keeps_its_centre() {
+        // the chroma response of a stripe clipping red has two flanks; a
+        // window fixed on the peak was off by ~0.3 px here
+        assert!(stripe_rms(600.0, 0.12, 2.0, 0.0) < 0.15);
+        // a wide clipped stripe: a fixed window held one flank only (~3.4 px)
+        assert!(stripe_rms(600.0, 0.12, 4.0, 0.0) < 0.5);
+    }
+
+    #[test]
+    fn a_reddish_surface_does_not_pull_the_centre_to_whole_pixels() {
+        // without the floor ~0.6 px
+        assert!(stripe_rms(150.0, 0.12, 1.5, 40.0) < 0.1);
     }
 }

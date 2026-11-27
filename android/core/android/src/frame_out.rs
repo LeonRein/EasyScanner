@@ -90,6 +90,15 @@ pub mod ev {
     pub const PHOTO_DUE: u32 = 8;
 }
 
+/// Values of `h::LASER_STATE`.
+pub mod laser_state {
+    /// stripe detection is switched off in the settings
+    pub const OFF: f64 = 0.0;
+    /// on, but no stripe in this frame
+    pub const NONE: f64 = 1.0;
+    pub const FOUND: f64 = 2.0;
+}
+
 /// Values of `h::PHOTO_STATE`.
 pub mod photo_state {
     pub const OFF: f64 = 0.0;

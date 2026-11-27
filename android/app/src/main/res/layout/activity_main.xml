@@ -124,14 +124,23 @@
                 android:text="@string/mode_scan" />
         </com.google.android.material.button.MaterialButtonToggleGroup>
 
-        <TextView
-            android:id="@+id/status"
+        <!-- scrolls: a step's text plus the core's messages can outgrow the
+             panel, above all at large font scales -->
+        <ScrollView
+            android:id="@+id/statusScroll"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:paddingTop="6dp"
-            android:textColor="#D8D4D4"
-            android:textSize="13sp" />
+            android:fadeScrollbars="false">
+
+            <TextView
+                android:id="@+id/status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="6dp"
+                android:textColor="#D8D4D4"
+                android:textSize="13sp" />
+        </ScrollView>
 
         <LinearLayout
             android:layout_width="match_parent"

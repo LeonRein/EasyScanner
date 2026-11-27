@@ -34,7 +34,7 @@ use serde::Deserialize;
 
 use crate::board::{BoardTracker, PoseResult, corner_bbox, distance};
 use crate::calib::{CalibState, LiveCalibrator, Outcome};
-use crate::frame_out::{FrameOut, ev, h, layer, photo_state};
+use crate::frame_out::{FrameOut, ev, h, laser_state, layer, photo_state};
 
 /// Commands from the app (`NativeCore.Cmd`).
 pub mod cmd {
@@ -402,7 +402,7 @@ impl Engine {
             if self.calib.capture(&self.tracker.corners, &self.tracker.ids, (w, hgt)) {
                 let (n, t) = (self.calib.count(), self.calib.target);
                 self.msgs.calib = if n < t {
-                    format!("collecting {n}/{t} — move the board")
+                    format!("collecting {n}/{t} — move the phone around the board")
                 } else {
                     format!("{n} views — last solve rejected, vary angles & retrying")
                 };
@@ -410,7 +410,7 @@ impl Engine {
             }
             if self.calib.maybe_solve(self.cfg.board, self.k_base) {
                 self.calib_state = CalibState::Solving;
-                self.msgs.calib = format!("solving over {} views… keep the board steady", self.calib.count());
+                self.msgs.calib = format!("solving over {} views… this takes a few seconds", self.calib.count());
                 self.events |= ev::MESSAGES;
             }
         }
@@ -455,7 +455,7 @@ impl Engine {
         {
             let n_lines = self.plane_cal.add(&s.cam_pts);
             let last = self.plane_cal.last_rms.map(|r| format!(" — last fit {r:.1}mm")).unwrap_or_default();
-            self.msgs.plane = format!("vary board tilt{last}");
+            self.msgs.plane = format!("vary the phone's tilt between sweeps{last}");
             self.events |= ev::MESSAGES;
             if self.plane_cal.ready() && n_lines != self.plane_solved_at {
                 self.plane_solved_at = n_lines;
@@ -650,11 +650,11 @@ impl Engine {
         o.set(
             h::LASER_STATE,
             if !self.cfg.laser.enabled {
-                0.0
+                laser_state::OFF
             } else if found {
-                2.0
+                laser_state::FOUND
             } else {
-                1.0
+                laser_state::NONE
             },
         );
         o.set(h::LASER_POINTS, self.laser_px.len() as f64);
@@ -754,7 +754,7 @@ impl Engine {
                 self.calib_state = CalibState::Collecting;
                 self.plane_active = false;
                 self.scan_on = false;
-                self.msgs.calib = "collecting views — move the board to varied angles".into();
+                self.msgs.calib = "collecting views — move the phone around the board at varied angles".into();
                 return self.msgs.calib.clone();
             }
             cmd::CALIB_STOP => {

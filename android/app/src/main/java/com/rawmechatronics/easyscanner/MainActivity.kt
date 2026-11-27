@@ -14,6 +14,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.TextureView
@@ -23,6 +24,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -78,7 +80,15 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private var scanOn = false
 
     /** The open photo session's directory (set on the UI thread, read on the still thread). */
+    /** Back while a scan session is open asks first instead of leaving it behind. */
+    private val leaveScanGuard = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() = confirmLeaveScan()
+    }
     @Volatile private var photoDir: File? = null
+        set(value) {
+            field = value
+            leaveScanGuard.isEnabled = value != null
+        }
     /**
      * The serial this side gave its photo session. The core echoes the serial
      * of the last session it opened, so "off" with OUR serial means the core
@@ -101,8 +111,19 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     // on a grant the activity resumes next, and onResume opens the camera
     private val askCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (!granted) status(getString(R.string.need_camera))
+        if (!granted) {
+            cameraDenied = true
+            explainCameraDenied()
+        }
     }
+
+    /**
+     * The user turned the camera permission down. The system prompt pauses and
+     * resumes the activity, so asking again from onResume would put it right
+     * back up; from here on only the explanation with a way to Settings shows.
+     */
+    private var cameraDenied = false
+    private var cameraDeniedDialog: AlertDialog? = null
 
     /** The camera was (re)opened for the current resume; reset by onPause. */
     private var cameraStarted = false
@@ -111,6 +132,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         super.onCreate(savedInstanceState)
         b = ActivityMainBinding.inflate(layoutInflater)
         setContentView(b.root)
+        onBackPressedDispatcher.addCallback(this, leaveScanGuard)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         mgr = getSystemService(CameraManager::class.java)
         processor = FrameProcessor(filesDir.absolutePath, this)
@@ -170,10 +192,15 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     override fun onResume() {
         super.onResume()
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            askCamera.launch(Manifest.permission.CAMERA)
-        } else {
-            startCamera()
+        when {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED -> {
+                // granted, possibly in Settings after a denial
+                cameraDenied = false
+                cameraDeniedDialog?.dismiss()
+                startCamera()
+            }
+            cameraDenied -> explainCameraDenied()
+            else -> askCamera.launch(Manifest.permission.CAMERA)
         }
     }
 
@@ -358,8 +385,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         sb.append("K: %s  fx %.0f cx %.0f cy %.0f\n".format(
             messages.optString("intrinsics", "?"), f(H.FX), f(H.CX), f(H.CY)))
         when (f(H.LASER_STATE).toInt()) {
-            0 -> sb.append("laser: off")
-            1 -> sb.append("laser: none (peak %.0f)".format(f(H.LASER_PEAK)))
+            FrameResult.Laser.OFF -> sb.append("laser: off")
+            FrameResult.Laser.NONE -> sb.append("laser: none (peak %.0f)".format(f(H.LASER_PEAK)))
             else -> {
                 sb.append("laser: %d pts  peak %.0f".format(f(H.LASER_POINTS).toInt(), f(H.LASER_PEAK)))
                 if (has(H.LASER_LENGTH)) sb.append("  on board %.0f mm @ %.0f deg".format(f(H.LASER_LENGTH), f(H.LASER_ANGLE)))
@@ -637,6 +664,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
         fun f(slot: Int) = r?.get(slot) ?: Float.NaN
         fun msg(key: String) = messages.optString(key, "").let { if (it.isEmpty()) "" else "\n$it" }
+        fun stall() = r?.let { stallHint(step, it, st) }?.let { "\n$it" } ?: ""
         val title: Int
         val body: String
         when (step) {
@@ -686,7 +714,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 val rms = f(H.CALIB_RMS)
                 body = getString(R.string.body_camera) + "\n\n" +
                     getString(R.string.camera_live, f(H.CALIB_COUNT).toInt(), f(H.CALIB_TARGET).toInt(),
-                        if (rms.isNaN()) "-" else "%.2f px".format(rms)) + msg("calib")
+                        if (rms.isNaN()) "-" else "%.2f px".format(rms)) + stall() + msg("calib")
                 acts = listOf(
                     Act(getString(if (calibActive) R.string.act_pause else R.string.act_start)) {
                         processor.command(if (calibActive) Cmd.CALIB_STOP else Cmd.CALIB_START)
@@ -701,7 +729,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 val stale = if (r?.flag(H.PLANE_STALE) == true && !planeActive) "\n" + getString(R.string.laser_stale) else ""
                 body = getString(R.string.body_laser) + stale + "\n\n" +
                     getString(R.string.laser_live, f(H.PLANE_LINES).toInt(), f(H.PLANE_TARGET).toInt(), f(H.PLANE_SPREAD),
-                        if (rms.isNaN()) "-" else "%.2f mm".format(rms)) + msg("plane")
+                        if (rms.isNaN()) "-" else "%.2f mm".format(rms)) + stall() + msg("plane")
                 acts = listOf(
                     Act(getString(if (planeActive) R.string.act_pause else R.string.act_start)) {
                         if (planeActive) processor.command(Cmd.PLANE_STOP) else {
@@ -724,7 +752,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 val intro = getString(R.string.body_scan) +
                     if (st.photos.withScan) " " + getString(R.string.body_scan_photos) else ""
                 body = intro + "\n\n" + getString(R.string.scan_live, pointsText(f(H.CLOUD_POINTS)), photos) +
-                    msg("scan") + msg("photos")
+                    stall() + msg("scan") + msg("photos")
                 acts = listOf(
                     Act(getString(if (scanOn) R.string.act_pause else if (open) R.string.act_resume else R.string.act_start)) {
                         toggleScan()
@@ -756,6 +784,39 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             btn.setIfChanged(a?.label ?: "")
             btn.isEnabled = a?.enabled == true
         }
+    }
+
+    /**
+     * Why the running step makes no progress on the latest frame, in plain
+     * words: the counters alone do not say that the board is out of view or
+     * that the laser colour setting does not match the laser. Null while the
+     * step is idle or progressing.
+     */
+    private fun stallHint(step: Step, r: FrameResult, st: AppSettings): String? {
+        val running = when (step) {
+            Step.CAMERA -> calibActive
+            Step.LASER -> planeActive
+            Step.SCAN -> scanOn
+            else -> false
+        }
+        if (!running) return null
+        if (!r.flag(H.DETECTED)) return getString(R.string.stall_no_board)
+        if (step == Step.CAMERA) return null
+        when (r[H.LASER_STATE].toInt()) {
+            FrameResult.Laser.OFF -> return getString(R.string.stall_laser_off)
+            FrameResult.Laser.NONE -> return getString(R.string.stall_no_laser, laserColorLabel(st.laserColor))
+        }
+        val gate = r[H.SCAN_GATE]
+        if (step == Step.SCAN && !gate.isNaN() && gate.toInt() != FrameResult.Gate.KEPT) {
+            return getString(R.string.stall_gate, FrameResult.Gate.label(gate.toInt()))
+        }
+        return null
+    }
+
+    /** The label Settings shows for a laser colour value. */
+    private fun laserColorLabel(value: String): String {
+        val i = resources.getStringArray(R.array.laser_color_values).indexOf(value)
+        return resources.getStringArray(R.array.laser_color_labels).getOrElse(i) { value }
     }
 
     private fun TextView.setIfChanged(s: String) {
@@ -848,6 +909,31 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         exporting = dir
         copyNote = getString(R.string.done_saving)
         wizard.finished()
+    }
+
+    /** Why nothing works without the camera, and the way to grant it in Settings. */
+    private fun explainCameraDenied() {
+        status(getString(R.string.need_camera))
+        if (cameraDeniedDialog?.isShowing == true) return
+        cameraDeniedDialog = AlertDialog.Builder(this)
+            .setTitle(R.string.camera_denied_title)
+            .setMessage(R.string.camera_denied_body)
+            .setPositiveButton(R.string.act_open_settings) { _, _ ->
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)))
+            }
+            .setNegativeButton(R.string.act_ask_again) { _, _ -> askCamera.launch(Manifest.permission.CAMERA) }
+            .show()
+    }
+
+    /** Back during a scan: finish it, discard it, or stay. */
+    private fun confirmLeaveScan() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.leave_scan_title)
+            .setMessage(R.string.leave_scan_body)
+            .setPositiveButton(R.string.act_finish) { _, _ -> finishScan() }
+            .setNeutralButton(R.string.act_discard) { _, _ -> discardScan() }
+            .setNegativeButton(R.string.act_keep_scanning, null)
+            .show()
     }
 
     private fun discardScan() {

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Launcher icon palette, shared by the adaptive icon layers. -->
+    <color name="ic_launcher_background">#0E1117</color>
+    <color name="ic_launcher_board_light">#E6E8F0</color>
+    <color name="ic_launcher_board_dark">#262B3A</color>
+    <color name="ic_launcher_laser">#FF3B30</color>
+    <color name="ic_launcher_laser_core">#FF6B5E</color>
+    <color name="ic_launcher_laser_hot">#FFD0CC</color>
+</resources>

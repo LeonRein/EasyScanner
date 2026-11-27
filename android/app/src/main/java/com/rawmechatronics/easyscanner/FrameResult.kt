@@ -115,7 +115,6 @@ class FrameResult(capacity: Int = 32 * 1024) {
         }
     }
 
-    /** Reasons in [H.SCAN_GATE], mirroring `scan_algo::gate::Reject`. */
     /** Values of [H.LASER_STATE], mirroring `frame_out::laser_state`. */
     object Laser {
         const val OFF = 0
@@ -123,6 +122,7 @@ class FrameResult(capacity: Int = 32 * 1024) {
         const val FOUND = 2
     }
 
+    /** Reasons in [H.SCAN_GATE], mirroring `scan_algo::gate::Reject`. */
     object Gate {
         const val KEPT = 0
         const val POSE_RMS = 1

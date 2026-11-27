@@ -1,0 +1,4 @@
+# The ESP32-S3 is an Xtensa chip: it needs Espressif's Rust toolchain
+# (install it with `cargo install espup && espup install`).
+[toolchain]
+channel = "esp"

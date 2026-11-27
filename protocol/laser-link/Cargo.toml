@@ -1,0 +1,12 @@
+[package]
+name = "laser-link"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The phone <-> laser switch protocol of EasyScanner: typed messages, postcard + CRC + COBS framing, and the device's session logic (no_std)"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+postcard = { version = "1", default-features = false }
+cobs = { version = "0.5", default-features = false }
+crc = "3"

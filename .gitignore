@@ -17,6 +17,11 @@ venv/
 # FreeCAD backups.
 *.FCBak
 
+# ── Rust build output outside android/ ───────────────────────────────────
+/protocol/*/target/
+/protocol/*/Cargo.lock
+/firmware/*/target/
+
 # ── Agent/session state ──────────────────────────────────────────────────
 .omc/
 .claude/

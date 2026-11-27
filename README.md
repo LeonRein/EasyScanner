@@ -168,7 +168,8 @@ EasyScanner/
 │   └── phone-clamp/ ← the phone clamp, a remix of a third-party model
 │       └── LICENSE  ← CC BY-NC-SA 4.0
 ├── charuco/         ← ChArUco board generator and ready PDFs (A4–A0)
-├── firmware/        ← ESP32-S3 laser switch, powered by the phone over USB-C
+├── firmware/        ← ESP32-S3 laser switch (Rust), powered by the phone over USB-C
+├── protocol/        ← laser-link: the phone ↔ laser switch protocol (no_std Rust)
 └── docs/            ← first-test checklist, accuracy benchmark, gyro fusion; images/ for this README
 ```
 

@@ -1,14 +1,15 @@
 name: Firmware build
 
-# Compiles the ESP32-S3 laser switch sketch, so a broken sketch is caught
-# before someone flashes it.
+# Tests the phone <-> laser switch protocol on the host and builds the
+# ESP32-S3 firmware with Espressif's Xtensa toolchain, so a broken firmware
+# is caught before anyone flashes it.
 
 on:
   push:
     branches: ["**"]
-    paths: ["firmware/**", ".github/workflows/firmware.yml"]
+    paths: ["firmware/**", "protocol/**", ".github/workflows/firmware.yml"]
   pull_request:
-    paths: ["firmware/**", ".github/workflows/firmware.yml"]
+    paths: ["firmware/**", "protocol/**", ".github/workflows/firmware.yml"]
   workflow_dispatch:
 
 concurrency:
@@ -18,18 +19,50 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  laser-switch:
-    name: laser-switch (ESP32-S3)
+  protocol:
+    name: laser-link protocol (host tests)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: protocol/laser-link
     steps:
       - uses: actions/checkout@v4
-      - uses: arduino/compile-sketches@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          fqbn: esp32:esp32:esp32s3:CDCOnBoot=cdc
-          platforms: |
-            - name: esp32:esp32
-              source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          sketch-paths: |
-            - firmware/laser-switch
-          enable-deltas-report: false
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: protocol/laser-link
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  laser-switch:
+    name: laser-switch firmware (ESP32-S3)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware/laser-switch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware/laser-switch
+      - run: cargo fmt -- --check
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: laser-switch-esp32s3
+          path: firmware/laser-switch/target/xtensa-esp32s3-none-elf/release/laser-switch
+          if-no-files-found: error
+          retention-days: 30

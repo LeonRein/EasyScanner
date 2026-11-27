@@ -56,6 +56,10 @@ object DebugHud {
                 else -> "none"
             }
             appendLine("plane %s  cloud %d pts %.1f MB".format(plane, f(H.CLOUD_POINTS).toInt(), f(H.CLOUD_MB)))
+            append("shape %s  views %d/%d".format(
+                surfaceStateLabel(f(H.SURFACE_STATE).toInt()), f(H.SURFACE_VIEWS).toInt(), f(H.SURFACE_VIEWS_MIN).toInt()))
+            if (has(H.SURFACE_PV_MM)) append("  pv %.1f s %.2f mm".format(f(H.SURFACE_PV_MM), f(H.SURFACE_SIGMA_MM)))
+            appendLine()
             if (r.flag(H.CALIB_ACTIVE)) {
                 appendLine("calib %d/%d  rms %s".format(
                     f(H.CALIB_COUNT).toInt(), f(H.CALIB_TARGET).toInt(),
@@ -88,6 +92,15 @@ object DebugHud {
         m.isNaN() -> "-"
         m.isInfinite() -> "∞"
         else -> "%.1fx".format(m)
+    }
+
+    /** The board shape state in the core's terms. */
+    fun surfaceStateLabel(state: Int) = when (state) {
+        FrameResult.Surface.UNMEASURED -> "flat"
+        FrameResult.Surface.MEASURING -> "measuring"
+        FrameResult.Surface.VERIFIED -> "verified"
+        FrameResult.Surface.REPLACED -> "re-measured"
+        else -> "?"
     }
 
     /** The photo keyframe state in the core's terms. */

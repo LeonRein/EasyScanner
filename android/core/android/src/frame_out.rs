@@ -78,7 +78,16 @@ pub mod h {
     pub const GYRO_STATE: usize = 58;
     /// 1 when this frame's corners and stripe were rolling-shutter corrected
     pub const RS_CORRECTED: usize = 59;
-    pub const LEN: usize = 60;
+    /// `scan_algo::surface_monitor::SurfaceState`: 0 unmeasured (flat),
+    /// 1 measuring, 2 verified, 3 replaced (the board was laid down anew)
+    pub const SURFACE_STATE: usize = 60;
+    /// the measured shape's peak-to-valley and largest height sigma (mm); NaN while unmeasured
+    pub const SURFACE_PV_MM: usize = 61;
+    pub const SURFACE_SIGMA_MM: usize = 62;
+    /// views collected toward the next shape fit, and the fewest a fit needs
+    pub const SURFACE_VIEWS: usize = 63;
+    pub const SURFACE_VIEWS_MIN: usize = 64;
+    pub const LEN: usize = 65;
 }
 
 /// One-shot event bits in `h::EVENTS`.

@@ -9,6 +9,7 @@ mod board;
 mod calib;
 mod engine;
 mod frame_out;
+mod surface;
 
 #[cfg(test)]
 mod e2e_tests;

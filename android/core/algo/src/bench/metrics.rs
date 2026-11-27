@@ -13,8 +13,10 @@ use crate::imu::MountSource;
 
 use super::pnp::{pose_error, solve_dense};
 use super::reconstruct::Reconstruction;
-use super::recording::Recording;
+use crate::recording::Recording;
+
 use super::scene::Shape;
+use super::truth::Truth;
 
 /// Summary of a signed error sample.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -183,7 +185,7 @@ pub struct Report {
 
 /// Everything measurable about a reconstruction; ground-truth metrics only
 /// when the recording carries a truth.
-pub fn evaluate(name: &str, rec: &Recording, recon: &Reconstruction) -> Report {
+pub fn evaluate(name: &str, rec: &Recording, truth: Option<&Truth>, recon: &Reconstruction) -> Report {
     let mut rep = Report {
         name: name.to_string(),
         frames: rec.frames.len(),
@@ -194,7 +196,7 @@ pub fn evaluate(name: &str, rec: &Recording, recon: &Reconstruction) -> Report {
     };
     let rms: Vec<f64> = recon.poses.iter().flatten().map(|p| p.reproj_rms).collect();
     rep.reproj_px = Stats::of(&rms);
-    let true_gyro = rec.truth.as_ref().and_then(|t| t.gyro);
+    let true_gyro = truth.and_then(|t| t.gyro);
     rep.gyro = recon.gyro_fit.map(|fit| {
         let c = fit.calib;
         GyroReport {
@@ -208,7 +210,7 @@ pub fn evaluate(name: &str, rec: &Recording, recon: &Reconstruction) -> Report {
             offset_err_ms: true_gyro.map(|t| (c.offset_ns - t.offset_ns) * 1e-6),
         }
     });
-    let Some(truth) = &rec.truth else { return rep };
+    let Some(truth) = truth else { return rep };
 
     let (mut rot, mut pos) = (Vec::new(), Vec::new());
     for (est, tp) in recon.poses.iter().zip(&truth.poses) {
@@ -222,7 +224,9 @@ pub fn evaluate(name: &str, rec: &Recording, recon: &Reconstruction) -> Report {
     rep.pose_pos_mm = Stats::of(&pos);
 
     let (tn, td) = (truth.laser_plane.n, truth.laser_plane.d);
-    let (un, ud) = (rec.header.laser_plane.n, rec.header.laser_plane.d);
+    // the plane the (first) setup used
+    let Some(used) = rec.setup_of(0).and_then(|s| s.laser_plane) else { return rep };
+    let (un, ud) = (used.n, used.d);
     rep.plane_angle_deg = Some(dot(tn, un).abs().min(1.0).acos().to_degrees());
     // the true sheet's point on the optical axis, measured against the used plane
     if tn[2].abs() > 1e-9 {

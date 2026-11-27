@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use opencv::core::{CV_8UC1, Mat};
-use scan_algo::bench::recording::{CornerRec, FrameRec, Header, PlaneRec, PoseRec, Recording};
 use scan_algo::cloud::PointCloud;
 use scan_algo::config::{self, Config, IntrinsicsFile, SavedPlane};
 use scan_algo::focus::laplacian_variance;
@@ -28,7 +27,8 @@ use scan_algo::laser::{LaserDetector, LaserParams, Roi, YuvFrame};
 use scan_algo::overlay;
 use scan_algo::photo_session::{Cylinder, PhotoSession, SessionInfo};
 use scan_algo::plane::{PlaneCalibrator, PlaneFit};
-use scan_algo::recorder::SessionRecorder;
+use scan_algo::recording::session::SessionRecorder;
+use scan_algo::recording::{CornerRec, FrameRec, Header, PlaneRec, PoseObs, ScanOutcome, Setup};
 use scan_algo::rolling::RowClock;
 use scan_algo::stripe::{self, BoardStripe};
 use scan_algo::volume::Volume;
@@ -294,6 +294,20 @@ impl Engine {
             (None, Some(g)) => g.into(),
             (None, None) => default_guess(),
         };
+        self.announce_setup();
+    }
+
+    /// The calibration frames are processed with, for the session's recording.
+    fn current_setup(&self) -> Setup {
+        Setup { intrinsics: self.k_base.into(), laser_plane: self.usable_plane().map(|(n, d)| PlaneRec { n, d }) }
+    }
+
+    /// Tell the recording the calibration may have changed.
+    fn announce_setup(&mut self) {
+        let setup = self.current_setup();
+        if let Some(r) = &mut self.recorder {
+            r.set_setup(setup);
+        }
     }
 
     fn volume(&self) -> Volume {
@@ -321,42 +335,34 @@ impl Engine {
         }
     }
 
-    /// The set-up a scanning frame is triangulated in, as a recording's header.
-    fn recording_header(&self, k: &Intrinsics, (n, d): (V3, f64)) -> Header {
-        Header {
-            version: Recording::VERSION,
-            source: format!("easyscanner, camera {}", self.cfg.camera.id),
-            board: self.cfg.board.into(),
-            volume: self.cfg.volume.into(),
-            intrinsics: (*k).into(),
-            laser_plane: PlaneRec { n, d },
-            cam_from_imu: self.cfg.camera.cam_from_imu,
-        }
-    }
-
-    /// Hand a scanning frame's raw observations to the session's recorder.
-    fn record_frame(&mut self, k: &Intrinsics, clock: &RowClock, pose: Option<&PoseResult>, found: bool) {
+    /// Hand a frame's raw observations, and what the scan made of it, to the
+    /// session's recorder.
+    fn record_frame(&mut self, f: &YuvFrame, clock: &RowClock, pose: Option<&PoseResult>, scan: ScanOutcome) {
         if self.recorder.is_none() {
             return;
         }
-        let Some(plane) = self.usable_plane() else { return };
-        let header = self.recording_header(k, plane);
+        let corners: Vec<CornerRec> = self
+            .tracker
+            .ids
+            .iter()
+            .zip(self.tracker.corners.iter())
+            .filter_map(|(id, q)| Some(CornerRec { id: u32::try_from(id).ok()?, u: q.x.into(), v: q.y.into() }))
+            .collect();
         let frame = FrameRec {
             ts_ns: clock.start_ns,
             readout_ns: clock.readout_ns,
             exposure_ns: clock.exposure_ns,
-            pose: pose.map(|p| PoseRec::from(p.pose)),
-            corners: self
-                .tracker
-                .ids
-                .iter()
-                .zip(self.tracker.corners.iter())
-                .filter_map(|(id, q)| Some(CornerRec { id: u32::try_from(id).ok()?, u: q.x.into(), v: q.y.into() }))
-                .collect(),
-            laser_px: if found { self.laser_px.clone() } else { Vec::new() },
+            width: f.width as u32,
+            height: f.height as u32,
+            pose: pose.map(|p| PoseObs { r: p.pose.r, t: p.pose.t, reproj_rms: p.reproj_rms, margin: p.margin }),
+            scan: Some(scan),
+            corners: corners.into(),
+            // a cleared stripe when none was found
+            laser_px: self.laser_px.as_slice().into(),
         };
+        let cfg = &self.cfg;
         if let Some(r) = &mut self.recorder {
-            r.frame(&header, &frame);
+            r.frame(|| recording_header(cfg), &frame);
         }
     }
 
@@ -543,9 +549,13 @@ impl Engine {
             self.cloud.sample(PREVIEW_POINTS, &mut self.preview);
         }
         let t_laser = t_laser0.elapsed();
-        if self.scan_on {
-            self.record_frame(&k, &clock, pose_res.as_ref(), found);
-        }
+        let scan = match (self.scan_on, scan_verdict) {
+            (false, _) => ScanOutcome::Paused,
+            (true, None) => ScanOutcome::NoPose,
+            (true, Some(Err(r))) => ScanOutcome::Rejected(r),
+            (true, Some(Ok(()))) => ScanOutcome::Kept,
+        };
+        self.record_frame(f, &clock, pose_res.as_ref(), scan);
 
         // ── photo keyframes: this frame's pose for the stills, then the trigger ──
         self.track.set_latest_stripe(if found { self.laser_px.len() } else { 0 }, self.pts_in.len());
@@ -636,6 +646,7 @@ impl Engine {
         let plane = SavedPlane { n: fit.n, d: fit.d, k: Some(self.k_base) };
         let saved = config::save_plane(&self.dir, &self.cfg.camera.id, &plane, fit.rms_mm, self.plane_cal.count());
         self.plane = Some(plane);
+        self.announce_setup();
         self.plane_active = false;
         self.plane_cal.reset();
         self.plane_solved_at = 0;
@@ -897,6 +908,7 @@ impl Engine {
             cmd::FORGET_PLANE => {
                 let _ = fs::remove_file(self.dir.join(config::PLANE_FILE));
                 self.plane = None;
+                self.announce_setup();
                 self.scan_on = false;
                 "laser plane cleared".to_string()
             }
@@ -1014,7 +1026,8 @@ impl Engine {
                 }
                 // whatever the cloud holds now is not in this session yet
                 self.cloud_unsaved = !self.cloud.is_empty();
-                self.recorder = self.cfg.record_sessions.then(|| SessionRecorder::new(s.dir()));
+                let max_bytes = self.cfg.recording_max_mb << 20;
+                self.recorder = self.cfg.record_sessions.then(|| SessionRecorder::new(s.dir(), max_bytes, self.current_setup()));
                 self.photos = Some(s);
                 self.photos_enabled = a.photos;
                 self.photo_serial = a.serial;
@@ -1049,12 +1062,19 @@ impl Engine {
                 Err(e) => format!("the cloud was NOT written: {e}"),
             }
         };
-        let recording = self.recorder.take().map(|r| format!(" | {}", r.finish())).unwrap_or_default();
+        let recording = self.recorder.take().map(SessionRecorder::finish);
+        let recorded = recording.as_ref().is_some_and(|o| o.frames > 0);
+        let recording = recording.map(|o| format!(" | {o}")).unwrap_or_default();
         let s = self.photos.take().expect("checked above");
         if s.count() == 0 && self.cloud.is_empty() {
-            // nothing taken: leave no session behind
-            remove_empty_session(&s.dir().join("photos"));
-            self.msgs.photos = format!("photos {why}: nothing taken");
+            if recorded {
+                // a scan that kept nothing is the one worth replaying
+                self.msgs.photos = format!("photos {why}: no photos, no points{recording}");
+            } else {
+                // nothing taken: leave no session behind
+                remove_empty_session(&s.dir().join("photos"));
+                self.msgs.photos = format!("photos {why}: nothing taken");
+            }
             return self.msgs.photos.clone();
         }
         self.msgs.photos = format!("photos {why}: {} in {} | {laser}{recording}", s.count(), s.dir().display());
@@ -1210,6 +1230,18 @@ fn remove_empty_session(photos: &Path) {
 }
 
 /// the desktop prototype's fallback when nothing better is known: f = 1500 at 1920x1080.
+/// What stays the same for a session's recording.
+fn recording_header(cfg: &Config) -> Header {
+    Header {
+        source: format!("easyscanner, camera {}", cfg.camera.id),
+        board: cfg.board.into(),
+        volume: cfg.volume.into(),
+        cam_from_imu: cfg.camera.cam_from_imu,
+        fusion: cfg.fusion,
+        scan_gate: cfg.scan_gate,
+    }
+}
+
 fn default_guess() -> Intrinsics {
     Intrinsics { fx: 1500.0, fy: 1500.0, cx: 960.0, cy: 540.0, dist: [0.0; 5], width: 1920.0, height: 1080.0 }
 }

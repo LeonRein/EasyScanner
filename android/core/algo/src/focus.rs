@@ -27,9 +27,7 @@ pub fn laplacian_variance(
         let row = yy * stride;
         for xx in (x0..x1).step_by(step) {
             let c = y[row + xx] as i64;
-            let l = y[row + xx - 1] as i64 + y[row + xx + 1] as i64 + y[row - stride + xx] as i64
-                + y[row + stride + xx] as i64
-                - 4 * c;
+            let l = y[row + xx - 1] as i64 + y[row + xx + 1] as i64 + y[row - stride + xx] as i64 + y[row + stride + xx] as i64 - 4 * c;
             n += 1;
             s += l;
             s2 += l * l;
@@ -54,10 +52,8 @@ mod tests {
             for y in 1..h - 1 {
                 for x in 1..w - 1 {
                     let i = y * w + x;
-                    let sum: u32 = [i - w - 1, i - w, i - w + 1, i - 1, i, i + 1, i + w - 1, i + w, i + w + 1]
-                        .iter()
-                        .map(|&j| src[j] as u32)
-                        .sum();
+                    let sum: u32 =
+                        [i - w - 1, i - w, i - w + 1, i - 1, i, i + 1, i + w - 1, i + w, i + w + 1].iter().map(|&j| src[j] as u32).sum();
                     soft[i] = (sum / 9) as u8;
                 }
             }

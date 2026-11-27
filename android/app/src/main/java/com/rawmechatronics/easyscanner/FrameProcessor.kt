@@ -32,6 +32,12 @@ class FrameProcessor(filesDir: String, private val listener: Listener) : ImageRe
     val handler = Handler(thread.looper)
     private val main = Handler(Looper.getMainLooper())
     val results = TripleBuffer { FrameResult() }
+
+    /** Gyro samples to fuse with each frame (null = none). */
+    @Volatile var gyro: GyroStream? = null
+    /** Rolling-shutter skew and exposure of the frames (null = unknown). */
+    @Volatile var timing: RowTimingSource? = null
+    private val gyroBatch = GyroStream.Batch()
     private var handle = 0L
     private var loggedW = 0
     private var loggedH = 0
@@ -82,13 +88,20 @@ class FrameProcessor(filesDir: String, private val listener: Listener) : ImageRe
                 Log.i(TAG, "frames ${img.width}x${img.height}: y stride ${p[0].rowStride}, " +
                     "uv stride ${p[1].rowStride} pixel stride ${p[1].pixelStride}")
             }
+            gyro?.let { g ->
+                g.drain(gyroBatch)
+                if (gyroBatch.count > 0) {
+                    NativeLib.nativePushGyro(handle, gyroBatch.timestampsNs, gyroBatch.rates, gyroBatch.count)
+                }
+            }
+            val rows = timing?.rowTiming(img.timestamp) ?: RowTiming.UNKNOWN
             val out = results.writeBuffer()
             val t0 = System.nanoTime()
             var n = NativeLib.nativeProcess(
                 handle,
                 p[0].buffer, p[0].rowStride,
                 p[1].buffer, p[2].buffer, p[1].rowStride, p[1].pixelStride,
-                img.width, img.height, img.timestamp, out.data,
+                img.width, img.height, img.timestamp, rows.readoutNs, rows.exposureNs, out.data,
             )
             out.procMs = (System.nanoTime() - t0) / 1e6
             if (n < 0) {

@@ -26,35 +26,47 @@ cargo test -p scan-algo bench                                        # the bench
 | Scene | The app's default board (8x8, 36 mm, black squares and marker bits for the stripe's contrast), a Ø50 mm ball and a 40x30x20 mm block on it |
 | Camera | 1280x960, f = 920 px, mild radial distortion |
 | Laser | Emitter 100 mm beside the camera, sheet crosses the optical axis at 350 mm, σ = 0.4 mm thick, 70° fan, shadows |
-| Motion | One orbit around the board in 20 s at 380 mm and 60° elevation, the aim swept ±40 mm sideways at 0.25 Hz, 0.3 mm tremor at 7 Hz (≈ 60–100 mm/s) |
+| Motion | One orbit around the board in 20 s at 380 mm and 60° elevation, the aim swept ±40 mm sideways at 0.25 Hz, the aim wobbling ±1° at 0.5 Hz, 0.3 mm / 0.1° tremor at 7 Hz (≈ 60–100 mm/s) |
 | Corners | Projected ChArUco corners, occluded by the objects, Gaussian noise |
 | Stripe | Either the exact sheet∩scene curve plus pixel noise (`analytic`), or a rendered YUV 4:2:0 frame (sensor noise, 2x2 supersampling near the stripe) that the app's own `LaserDetector` has to find (`render`) |
-| Rolling shutter | Every row (corners, stripe, render) exposed at its own time |
+| Rolling shutter | Every row (corners, stripe, render) exposed at its own time; optionally reported wrongly (skew off by ±10 %, timestamp at the end of the readout, exposure varying per frame) |
+| Gyroscope | 200 Hz, 0.07 °/s noise, 0.1 °/s residual bias, 4 ms clock offset, mounted like a back camera with its sensor landscape; the mount the platform defines is 0.5° off; optionally scale errors, a wandering bias and timestamp jitter |
 | Calibration errors | Wrong focal length / principal point / k1; laser plane tilted or shifted; or the app's `PlaneCalibrator` replayed on 120 simulated static board views with the same noise and the same wrong intrinsics |
 
-The reconstruction follows `engine.rs` `process()`: pose from the corners
-(a pure-Rust planar PnP with LM refinement instead of OpenCV's IPPE: same
-optimum, no flip ambiguity), `stripe::to_laser_plane`, `Volume::contains`.
+The reconstruction follows `engine.rs` `process()`: the gyro fusion and
+rolling-shutter correction (`fusion::PoseFusion`, see
+[`imu-fusion.md`](imu-fusion.md)), pose from the corners (a pure-Rust planar
+PnP with LM refinement instead of OpenCV's IPPE: same optimum, no flip
+ambiguity), `stripe::to_laser_plane`, `Volume::contains`. Poses are compared
+with the truth at each frame's middle row, the instant a corrected pose
+describes.
 
-## Error budget (seed 1, 600 frames)
+## Error budget (seed 1, 600 frames, `sweep`)
 
 Distances are the signed distance of every point to the true surface, in mm.
 
 | Scenario | Pose pos RMS | median | p95 | RMS | > 1 mm | Ball Δr |
 |---|---|---|---|---|---|---|
 | ideal | 0.000 | 0.000 | 0.000 | 0.000 | 0 % | 0.000 |
-| corner noise 0.2 px | 0.241 | 0.024 | 0.087 | 0.042 | 0 % | +0.004 |
-| stripe noise 0.3 px | 0.000 | 0.194 | 0.658 | 0.320 | 0.48 % | −0.003 |
-| stripe rendered + detector | 0.000 | 0.081 | 0.338 | 0.256 | 0.45 % | −0.032 |
-| rolling shutter 20 ms | 0.851 | 0.046 | 0.207 | 0.099 | 0 % | −0.046 |
-| focal length +0.5 % | 1.850 | 1.371 | 1.787 | 1.353 | 75 % | +0.694 |
-| focal +0.5 %, plane calibrated | 1.850 | 0.129 | 0.232 | 0.145 | 0 % | +0.050 |
-| k1 +0.01 | 0.513 | 0.288 | 0.379 | 0.283 | 0 % | +0.143 |
-| laser plane tilted 0.1° | 0.000 | 1.620 | 2.492 | 1.641 | 77 % | −0.811 |
-| laser plane shifted 0.5 mm | 0.000 | 1.347 | 1.752 | 1.328 | 74 % | +0.688 |
-| corner + stripe noise | 0.241 | 0.198 | 0.660 | 0.323 | 0.49 % | +0.001 |
-| … + plane calibrated in sim | 0.241 | 0.199 | 0.658 | 0.324 | 0.52 % | −0.009 |
-| realistic (all of the above, rendered) | 1.395 | 0.112 | 0.397 | 0.383 | 0.72 % | −0.034 |
+| corner noise 0.2 px | 0.240 | 0.026 | 0.084 | 0.042 | 0 % | −0.000 |
+| stripe noise 0.3 px | 0.000 | 0.194 | 0.658 | 0.324 | 0.65 % | +0.003 |
+| stripe rendered + detector | 0.000 | 0.079 | 0.308 | 0.262 | 0.34 % | −0.029 |
+| rolling shutter 20 ms, uncorrected | 1.796 | 0.099 | 0.299 | 0.158 | 0 % | +0.006 |
+| focal length +0.5 % | 1.849 | 1.392 | 1.793 | 1.362 | 74 % | +0.713 |
+| focal +0.5 %, plane calibrated | 1.849 | 0.128 | 0.234 | 0.147 | 0 % | +0.051 |
+| k1 +0.01 | 0.520 | 0.292 | 0.387 | 0.287 | 0 % | +0.146 |
+| laser plane tilted 0.1° | 0.000 | 1.647 | 2.480 | 1.654 | 77 % | −0.834 |
+| laser plane shifted 0.5 mm | 0.000 | 1.368 | 1.756 | 1.338 | 74 % | +0.707 |
+| corner + stripe noise | 0.240 | 0.195 | 0.668 | 0.326 | 0.65 % | +0.002 |
+| … + plane calibrated in sim | 0.240 | 0.196 | 0.666 | 0.326 | 0.66 % | −0.007 |
+| realistic, rolling shutter uncorrected | 2.070 | 0.149 | 0.488 | 0.334 | 0.61 % | +0.024 |
+| realistic (all of the above, rendered, gyro, corrected) | 1.261 | 0.099 | 0.381 | 0.288 | 0.43 % | +0.018 |
+| brisk (~190 mm/s), RS 20 ms, uncorrected | 3.879 | 0.275 | 0.818 | 0.414 | 1.85 % | −0.037 |
+| brisk, RS corrected from the poses | 1.844 | 0.213 | 0.731 | 0.353 | 1.12 % | +0.068 |
+| brisk, RS corrected with the gyro | 1.662 | 0.207 | 0.700 | 0.340 | 0.88 % | +0.066 |
+
+The `sweep` also runs the brisk scan with two-axis motion and with each
+timing and gyro disturbance; [`imu-fusion.md`](imu-fusion.md) lists them.
 
 What it says (for this geometry, synthetic data):
 
@@ -66,9 +78,10 @@ What it says (for this geometry, synthetic data):
   error is 0.08 mm but 0.45 % of the points are off by more than 1 mm (up to
   ~10 mm): stripe points at depth edges (ball/board silhouette). A per-point
   filter (neighbour consistency, stripe width) is the cheapest accuracy win.
-- **Rolling shutter is small at this speed** (0.1 mm RMS, −0.05 mm on the
-  ball radius) although the pose itself is off by 0.85 mm, because board and
-  stripe are distorted together. It grows with speed (try `sweep_hz`).
+- **Rolling shutter is small at this speed** (0.16 mm RMS) although the pose
+  itself is off by 1.8 mm, because board and stripe are distorted together.
+  It grows with speed, and the correction ([`imu-fusion.md`](imu-fusion.md))
+  cuts the pose error by 40–60 % and the realistic median by a third.
 - **A wrong camera calibration is mostly compensated by the laser-plane
   calibration** as long as the plane is calibrated with the same
   intrinsics: +0.5 % focal error costs 1.35 mm with the true plane, 0.15 mm

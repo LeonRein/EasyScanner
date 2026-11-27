@@ -3,6 +3,7 @@
 //! calibrated laser plane (the scan).
 
 use crate::geom::{Intrinsics, Pose, V3, dot, ray_plane};
+use crate::rolling::Correction;
 use crate::volume::Volume;
 
 /// The stripe reconstructed onto the board, with a robust straight-line fit —
@@ -27,14 +28,20 @@ pub struct BoardStripe {
 /// the volume footprint (grazing rays meet the infinite plane far away), and
 /// fit the line with a median-based outlier pass. `None` when fewer than two
 /// points survive.
-pub fn on_board(pixels: &[[f32; 2]], k: &Intrinsics, pose: &Pose, vol: &Volume) -> Option<BoardStripe> {
-    let n = pose.board_normal();
-    let d = dot(n, pose.t);
+///
+/// `pose` is the frame's pose at its reference instant. With a
+/// rolling-shutter `corr`ection each pixel is intersected with the board as
+/// its own row saw it, and its camera point stays in that row's frame —
+/// the frame the laser, rigid to the camera, is calibrated in.
+pub fn on_board(pixels: &[[f32; 2]], k: &Intrinsics, pose: &Pose, corr: Option<&Correction>, vol: &Volume) -> Option<BoardStripe> {
     let mut cam_pts = Vec::with_capacity(pixels.len());
     let mut board_pts = Vec::with_capacity(pixels.len());
-    for p in pixels {
-        if let Some(x) = ray_plane(k.ray(p[0] as f64, p[1] as f64), n, d) {
-            let b = pose.to_board(x);
+    for &[u, v] in pixels {
+        let (u, v) = (f64::from(u), f64::from(v));
+        let row_pose = corr.map_or(*pose, |c| c.pose_at_row(pose, v));
+        let n = row_pose.board_normal();
+        if let Some(x) = ray_plane(k.ray(u, v), n, dot(n, row_pose.t)) {
+            let b = row_pose.to_board(x);
             if vol.in_footprint(b) {
                 cam_pts.push(x);
                 board_pts.push(b);
@@ -133,10 +140,10 @@ mod tests {
                 k.project(pose.to_cam(p)).map(|q| [q[0] as f32, q[1] as f32])
             })
             .collect();
-        let s = on_board(&pixels, &k, &pose, &vol).unwrap();
+        let s = on_board(&pixels, &k, &pose, None, &vol).unwrap();
         let ang = (b[1] - a[1]).atan2(b[0] - a[0]).to_degrees();
         let da = (s.angle_deg - ang).rem_euclid(180.0);
-        assert!(da < 0.05 || da > 179.95, "angle {} vs {}", s.angle_deg, ang);
+        assert!(!(0.05..=179.95).contains(&da), "angle {} vs {}", s.angle_deg, ang);
         let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
         assert!((s.length_mm - len).abs() < 0.2, "length {} vs {len}", s.length_mm);
         assert!(s.plane_rms_mm < 1e-6);

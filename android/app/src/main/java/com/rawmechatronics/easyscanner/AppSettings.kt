@@ -101,7 +101,10 @@ data class AppSettings(
                 })
             }
             if (manualFocus && camera?.manualFocus == true) put("focus_diopters", focusDiopters.toDouble())
+            camera?.camFromImu?.let { m -> put("cam_from_imu", JSONArray(m.map { row -> JSONArray(row) })) }
         })
+        // gyro samples only line up with frames on a shared clock
+        put("fusion", JSONObject().apply { put("gyro", camera?.gyroClockShared == true) })
         put("keyframes", JSONObject().apply {
             // a trigger that is not selected is sent as 0 = off
             val interval = photos.trigger != "motion"

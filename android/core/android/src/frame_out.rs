@@ -74,7 +74,11 @@ pub mod h {
     /// posed frames with a stripe in the volume the gate kept / rejected since the scan started
     pub const GATE_KEPT: usize = 56;
     pub const GATE_REJECTED: usize = 57;
-    pub const LEN: usize = 58;
+    /// `scan_algo::fusion::GyroState`: 0 no samples, 1 calibrating, 2 calibrated
+    pub const GYRO_STATE: usize = 58;
+    /// 1 when this frame's corners and stripe were rolling-shutter corrected
+    pub const RS_CORRECTED: usize = 59;
+    pub const LEN: usize = 60;
 }
 
 /// One-shot event bits in `h::EVENTS`.

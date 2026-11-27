@@ -92,7 +92,27 @@ class FrameResult(capacity: Int = 32 * 1024) {
         const val SCAN_GATE = 55
         const val GATE_KEPT = 56
         const val GATE_REJECTED = 57
-        const val LEN = 58
+        /** A [Gyro] state. */
+        const val GYRO_STATE = 58
+        /** 1 when the frame was rolling-shutter corrected. */
+        const val RS_CORRECTED = 59
+        const val LEN = 60
+    }
+
+    /** States in [H.GYRO_STATE], mirroring `scan_algo::fusion::GyroState`. */
+    object Gyro {
+        const val ABSENT = 0
+        const val CALIBRATING = 1
+        const val PLATFORM_MOUNT = 2
+        const val FITTED_MOUNT = 3
+
+        fun label(code: Int) = when (code) {
+            ABSENT -> "off"
+            CALIBRATING -> "calibrating (turn the phone)"
+            PLATFORM_MOUNT -> "calibrated (platform mount)"
+            FITTED_MOUNT -> "calibrated (fitted mount)"
+            else -> "?"
+        }
     }
 
     /** Reasons in [H.SCAN_GATE], mirroring `scan_algo::gate::Reject`. */

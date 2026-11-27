@@ -2,23 +2,32 @@
 //! laser rigidly mounted next to the camera, and what one frame shows —
 //! ChArUco corner pixels and laser-stripe pixels — including corner noise,
 //! occlusion, rolling shutter and (optionally) a rendered YUV frame that the
-//! app's real [`LaserDetector`] has to find the stripe in.
+//! app's real [`LaserDetector`] has to find the stripe in — and the phone's
+//! gyroscope riding along.
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::geom::{Intrinsics, Pose, V3, add, cross, dot, mat_t_vec, mat_vec, normalize, scale, sub};
+use crate::geom::{
+    Intrinsics, M3, Pose, V3, add, cross, dot, mat_mul, mat_t_vec, mat_vec, normalize, rodrigues, rotation_vector, scale, sub, transpose,
+};
+use crate::imu::{GyroCalib, GyroSample};
 use crate::laser::{LaserDetector, LaserParams, Roi, YuvFrame};
 use crate::plane::Rng;
 
 use super::scene::Scene;
 
+const TWO53: f64 = (1u64 << 53) as f64;
+
+/// Uniform sample in `[0, 1)`.
+pub fn uniform(rng: &mut Rng) -> f64 {
+    (rng.next_u64() >> 11) as f64 / TWO53
+}
+
 /// Standard normal sample (Box–Muller).
 pub fn gauss(rng: &mut Rng) -> f64 {
-    const TWO53: f64 = (1u64 << 53) as f64;
     let u1 = ((rng.next_u64() >> 11) as f64 + 0.5) / TWO53;
-    let u2 = (rng.next_u64() >> 11) as f64 / TWO53;
-    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * uniform(rng)).cos()
 }
 
 /// Serializable pinhole + Brown–Conrady model (same fields as [`Intrinsics`]).
@@ -146,9 +155,16 @@ pub struct Trajectory {
     /// Amplitude of the sideways sweep of the aim point.
     pub sweep_mm: f64,
     pub sweep_hz: f64,
-    /// Amplitude of the camera-position tremor.
+    /// Amplitude of the camera-position tremor …
     pub tremor_mm: f64,
+    /// … and of its turning (deg): a hand shakes the phone about its grip.
+    pub tremor_deg: f64,
     pub tremor_hz: f64,
+    /// A hand never aims perfectly: the camera turns about its own axes by
+    /// up to this much …
+    pub wobble_deg: f64,
+    /// … this often.
+    pub wobble_hz: f64,
 }
 
 impl Default for Trajectory {
@@ -164,7 +180,10 @@ impl Default for Trajectory {
             sweep_mm: 40.0,
             sweep_hz: 0.25,
             tremor_mm: 0.3,
+            tremor_deg: 0.1,
             tremor_hz: 7.0,
+            wobble_deg: 1.0,
+            wobble_hz: 0.5,
         }
     }
 }
@@ -196,8 +215,125 @@ impl Trajectory {
         let w = tau * self.tremor_hz * t;
         let tremor = scale([w.sin(), (1.3 * w + 1.0).sin(), (0.7 * w + 2.0).sin()], self.tremor_mm);
         let cam = add(add(aim, scale(out, self.distance_mm)), tremor);
-        look_at(cam, aim, side)
+        let aimed = look_at(cam, aim, side);
+        let ww = tau * self.wobble_hz * t;
+        let wobble = scale([ww.sin(), (1.37 * ww + 1.0).sin(), 0.5 * (0.83 * ww + 2.0).sin()], self.wobble_deg.to_radians());
+        let shake = scale([(1.1 * w + 0.5).sin(), (0.9 * w + 2.5).sin(), 0.5 * (1.2 * w + 1.5).sin()], self.tremor_deg.to_radians());
+        let r = mat_mul(&rodrigues(add(wobble, shake)), &aimed.r);
+        Pose { r, t: scale(mat_vec(&r, cam), -1.0) }
     }
+}
+
+impl Trajectory {
+    /// The camera's angular rate at `t` (rad/s, camera frame), from the
+    /// rotation increment `R(t+h)·R(t−h)ᵀ = exp(−ω·2h)`.
+    pub fn rate(&self, t: f64) -> V3 {
+        const H: f64 = 1e-4;
+        let d = mat_mul(&self.pose(t + H).r, &transpose(&self.pose(t - H).r));
+        scale(rotation_vector(&d), -0.5 / H)
+    }
+}
+
+/// The phone's gyroscope as the app sees it after Android's own bias
+/// compensation: a sample stream in the IMU frame and clock, with white
+/// noise, a residual bias that may wander, scale errors and timestamp
+/// jitter.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GyroModel {
+    pub rate_hz: f64,
+    /// White noise per sample, σ (deg/s).
+    pub noise_dps: f64,
+    /// Residual bias at the start (deg/s), IMU frame.
+    pub bias_dps: V3,
+    /// Random walk of the bias (deg/s per √s).
+    pub bias_walk_dps: f64,
+    /// Relative scale error per IMU axis (0.01 = reads 1 % high).
+    pub scale_error: V3,
+    /// σ of the sample timestamps around the true sampling instant (ms).
+    pub jitter_ms: f64,
+    /// Gyro clock minus camera clock (ms).
+    pub offset_ms: f64,
+    /// IMU→camera rotation.
+    pub cam_from_imu: M3,
+    /// How far the mount the platform defines (from `SENSOR_ORIENTATION`)
+    /// is off the true one: the assembly tolerance (deg).
+    pub platform_mount_error_deg: f64,
+}
+
+impl Default for GyroModel {
+    /// A modern phone IMU (≈0.005 °/s/√Hz) at 200 Hz, a back camera of a
+    /// phone whose sensor is mounted landscape (x ← −y, y ← −x, z ← −z).
+    fn default() -> Self {
+        GyroModel {
+            rate_hz: 200.0,
+            noise_dps: 0.07,
+            bias_dps: [0.08, -0.05, 0.06],
+            bias_walk_dps: 0.0,
+            scale_error: [0.0; 3],
+            jitter_ms: 0.0,
+            offset_ms: 4.0,
+            cam_from_imu: [[0.0, -1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+            platform_mount_error_deg: 0.5,
+        }
+    }
+}
+
+impl GyroModel {
+    /// The default gyro, but with the imperfections a calibration that
+    /// assumes an ideal sensor does not model: 1 % scale errors, a bias
+    /// that wanders by 0.02°/s/√s, and 0.5 ms timestamp jitter.
+    pub fn imperfect() -> Self {
+        GyroModel { bias_walk_dps: 0.02, scale_error: [0.01, -0.008, 0.012], jitter_ms: 0.5, ..GyroModel::default() }
+    }
+
+    /// The true calibration.
+    pub fn calib(&self) -> GyroCalib {
+        GyroCalib { cam_from_imu: self.cam_from_imu, offset_ns: self.offset_ms * 1e6 }
+    }
+
+    /// The IMU→camera rotation the platform defines.
+    pub fn platform_mount(&self) -> M3 {
+        let e = self.platform_mount_error_deg.to_radians();
+        mat_mul(&rodrigues(scale([0.6, -0.8, 0.0], e)), &self.cam_from_imu)
+    }
+
+    /// Samples over `[0, until_s]` of camera time along `traj`.
+    pub fn sample(&self, traj: &Trajectory, until_s: f64, rng: &mut Rng) -> Vec<GyroSample> {
+        let imu_from_cam = transpose(&self.cam_from_imu);
+        let sigma = self.noise_dps.to_radians();
+        let dt = 1.0 / self.rate_hz;
+        let walk = self.bias_walk_dps.to_radians() * dt.sqrt();
+        let mut bias = self.bias_dps.map(f64::to_radians);
+        let n = (until_s * self.rate_hz).ceil() as usize;
+        (0..=n)
+            .map(|k| {
+                let t_cam = k as f64 * dt;
+                let true_rate = mat_vec(&imu_from_cam, traj.rate(t_cam));
+                let scaled: V3 = std::array::from_fn(|i| true_rate[i] * (1.0 + self.scale_error[i]));
+                let noise = [gauss(rng), gauss(rng), gauss(rng)].map(|g| sigma * g);
+                bias = add(bias, [gauss(rng), gauss(rng), gauss(rng)].map(|g| walk * g));
+                let stamp = t_cam + self.jitter_ms * 1e-3 * gauss(rng);
+                GyroSample { t_ns: (stamp * 1e9 + self.offset_ms * 1e6).round() as i64, rate: add(add(scaled, bias), noise) }
+            })
+            .collect()
+    }
+}
+
+/// How the frame timing the camera reports differs from the truth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TimingError {
+    /// Relative error of the reported rolling-shutter skew (0.1 = reports
+    /// 10 % more than the true readout).
+    pub readout_rel: f64,
+    /// The reported timestamp lies this much after the true start of the
+    /// first row's exposure (ms); a phone that stamps the end of the
+    /// readout has the readout here.
+    pub timestamp_shift_ms: f64,
+    /// Per frame, the exposure is drawn uniformly from this range (ms) and
+    /// reported correctly; `[0, 0]` for none.
+    pub exposure_ms: [f64; 2],
 }
 
 /// How stripe pixels are produced.
@@ -262,8 +398,26 @@ pub struct Camera<'a> {
 const MAX_STRIPE_PX: usize = 400;
 
 impl<'a> Camera<'a> {
-    pub fn new(scene: &'a Scene, k: Intrinsics, mount: LaserMount, stripe: StripeModel, corner_noise_px: f64, readout_s: f64, seed: u64) -> Self {
-        Camera { scene, k, mount, stripe, corner_noise_px, readout_s, rng: Rng::new(seed), detector: LaserDetector::default(), rays: Vec::new() }
+    pub fn new(
+        scene: &'a Scene,
+        k: Intrinsics,
+        mount: LaserMount,
+        stripe: StripeModel,
+        corner_noise_px: f64,
+        readout_s: f64,
+        seed: u64,
+    ) -> Self {
+        Camera {
+            scene,
+            k,
+            mount,
+            stripe,
+            corner_noise_px,
+            readout_s,
+            rng: Rng::new(seed),
+            detector: LaserDetector::default(),
+            rays: Vec::new(),
+        }
     }
 
     fn row_time(&self, t0: f64, v: f64) -> f64 {
@@ -326,9 +480,15 @@ impl<'a> Camera<'a> {
             for _ in 0..if self.readout_s > 0.0 { 4 } else { 1 } {
                 let pose = traj(self.row_time(t0, v));
                 let (o, d) = (pose.to_board(l), mat_t_vec(&pose.r, dir));
-                let Some((s, _)) = self.scene.trace(o, d) else { hit = None; break };
+                let Some((s, _)) = self.scene.trace(o, d) else {
+                    hit = None;
+                    break;
+                };
                 let x = add(o, scale(d, s));
-                let Some(q) = self.k.project(pose.to_cam(x)) else { hit = None; break };
+                let Some(q) = self.k.project(pose.to_cam(x)) else {
+                    hit = None;
+                    break;
+                };
                 v = q[1];
                 hit = self.scene.visible(pose.camera_position(), x).then_some(q);
                 if hit.is_none() {
@@ -492,6 +652,21 @@ mod tests {
     }
 
     #[test]
+    fn trajectory_rate_integrates_to_its_rotation() {
+        let traj = Trajectory::default();
+        let (t0, t1) = (3.0, 3.2);
+        let mut d = crate::geom::IDENTITY;
+        let steps = 2000;
+        for i in 0..steps {
+            let dt = (t1 - t0) / steps as f64;
+            let t = t0 + (i as f64 + 0.5) * dt;
+            d = mat_mul(&crate::geom::rodrigues(scale(traj.rate(t), -dt)), &d);
+        }
+        let truth = mat_mul(&traj.pose(t1).r, &transpose(&traj.pose(t0).r));
+        assert!(crate::geom::rotation_distance(&d, &truth).to_degrees() < 1e-3);
+    }
+
+    #[test]
     fn rendered_stripe_matches_the_analytic_one() {
         let scene = Scene { board: BoardDims::default(), shapes: vec![Shape::ball_on_board(144.0, 144.0, 25.0)] };
         let k: Intrinsics = CameraModel::default().into();
@@ -503,12 +678,8 @@ mod tests {
         let r = ren.observe(&traj, 1.0).laser_px;
         assert!(a.len() > 100 && r.len() > 100, "analytic {} rendered {}", a.len(), r.len());
         // every detected point lies near the true stripe curve
-        let mut dists: Vec<f64> = r
-            .iter()
-            .map(|p| {
-                a.iter().map(|q| ((p[0] - q[0]) as f64).hypot((p[1] - q[1]) as f64)).fold(f64::INFINITY, f64::min)
-            })
-            .collect();
+        let mut dists: Vec<f64> =
+            r.iter().map(|p| a.iter().map(|q| ((p[0] - q[0]) as f64).hypot((p[1] - q[1]) as f64)).fold(f64::INFINITY, f64::min)).collect();
         dists.sort_by(f64::total_cmp);
         let med = dists[dists.len() / 2];
         assert!(med < 1.0, "median distance to the true stripe {med:.2} px");

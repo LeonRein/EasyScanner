@@ -5,8 +5,9 @@
 use std::fs;
 use std::path::Path;
 
+use crate::fusion::FusionCfg;
 use crate::gate::ScanGateCfg;
-use crate::geom::{Intrinsics, V3, normalize};
+use crate::geom::{Intrinsics, M3, V3, normalize};
 use crate::keyframe::KeyframeCfg;
 use crate::laser::LaserColor;
 use crate::plane::PlaneFitCfg;
@@ -148,6 +149,10 @@ pub struct CameraCfg {
     pub guess: Option<IntrinsicsJson>,
     /// Locked lens focus (diopters); `None` while autofocus runs.
     pub focus_diopters: Option<f64>,
+    /// IMU→camera rotation (row-major) as the platform defines it: Android's
+    /// sensor axes and Camera2's `SENSOR_ORIENTATION`. The gyro calibration
+    /// starts from it and refines it once the camera turns about two axes.
+    pub cam_from_imu: Option<M3>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -164,6 +169,8 @@ pub struct Config {
     pub scan_gate: ScanGateCfg,
     /// When a laser-plane fit is good enough to save.
     pub plane_fit: PlaneFitCfg,
+    /// Gyroscope fusion and rolling-shutter correction.
+    pub fusion: FusionCfg,
     pub calib_views: usize,
     pub plane_views: usize,
     pub max_cloud_points: usize,
@@ -181,6 +188,7 @@ impl Default for Config {
             keyframes: KeyframeCfg::default(),
             scan_gate: ScanGateCfg::default(),
             plane_fit: PlaneFitCfg::default(),
+            fusion: FusionCfg::default(),
             calib_views: 64,
             plane_views: 10,
             max_cloud_points: 6_000_000,
@@ -215,15 +223,7 @@ impl IntrinsicsFile {
         for (d, s) in dist.iter_mut().zip(&self.dist) {
             *d = *s;
         }
-        Intrinsics {
-            fx: self.fx,
-            fy: self.fy,
-            cx: self.cx,
-            cy: self.cy,
-            dist,
-            width: self.width as f64,
-            height: self.height as f64,
-        }
+        Intrinsics { fx: self.fx, fy: self.fy, cx: self.cx, cy: self.cy, dist, width: self.width as f64, height: self.height as f64 }
     }
 }
 
@@ -345,8 +345,7 @@ mod tests {
         assert_eq!(cfg.laser.laser_color(), LaserColor::Green);
         assert_eq!(cfg.calib_views, 64);
         assert_eq!(cfg.scan_gate, ScanGateCfg::default());
-        let cfg: Config =
-            serde_json::from_str(r#"{"scan_gate":{"max_speed_mm_s":60},"plane_fit":{"max_rms_mm":0.8}}"#).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{"scan_gate":{"max_speed_mm_s":60},"plane_fit":{"max_rms_mm":0.8}}"#).unwrap();
         assert_eq!(cfg.scan_gate.max_speed_mm_s, 60.0);
         assert_eq!(cfg.scan_gate.min_corners, ScanGateCfg::default().min_corners);
         assert_eq!(cfg.plane_fit.max_rms_mm, 0.8);
@@ -364,8 +363,7 @@ mod tests {
         assert!(!back.fits(&Intrinsics { cx: 0.0, ..k }), "a re-calibrated camera makes the plane stale");
         assert!(load_plane(&dir, "1").is_none());
         // the desktop prototype's file has no model: present, but not usable
-        fs::write(dir.join(PLANE_FILE), r#"{"n":[0,0.8,-0.6],"d":-120,"rms_mm":0.7,"n_points":10,"frame":"opencv_camera_mm"}"#)
-            .unwrap();
+        fs::write(dir.join(PLANE_FILE), r#"{"n":[0,0.8,-0.6],"d":-120,"rms_mm":0.7,"n_points":10,"frame":"opencv_camera_mm"}"#).unwrap();
         assert!(!load_plane(&dir, "0").unwrap().fits(&k));
         fs::remove_dir_all(&dir).unwrap();
     }

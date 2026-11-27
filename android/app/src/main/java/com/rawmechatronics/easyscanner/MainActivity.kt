@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.SurfaceTexture
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
@@ -60,6 +61,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private lateinit var mgr: CameraManager
     private lateinit var processor: FrameProcessor
     private lateinit var camera: CameraController
+    private lateinit var gyro: GyroStream
     private val main = Handler(Looper.getMainLooper())
 
     @Volatile private var info: CameraInfo? = null
@@ -119,6 +121,9 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             onStill = ::onStill,
             onStillFailed = { msg, fatal -> main.post { onStillFailed(msg, fatal) } },
         )
+        gyro = GyroStream(getSystemService(SensorManager::class.java))
+        processor.gyro = gyro
+        processor.timing = camera
         b.overlay.source = processor.results
         settings = AppSettings.load(this)
 
@@ -178,6 +183,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         // in case the process does not come back
         if (photoDir != null) processor.command(Cmd.CHECKPOINT)
         camera.close()
+        gyro.stop()
         cameraStarted = false
         super.onPause()
     }
@@ -210,6 +216,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         b.overlay.sensorOrientation = inf.sensorOrientation
 
         processor.configure(st.nativeConfig(inf))
+        if (inf.gyroClockShared) gyro.start() else gyro.stop()
         val sizes = inf.analysisSizes
         governor = if (st.autoResolution) {
             ResolutionGovernor(sizes.map { FrameSize(it.width, it.height) }, st.targetFps, 0)
@@ -322,6 +329,13 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     // ── HUD / buttons ────────────────────────────────────────────────────────
 
+    /** IPPE's branch margin: "-" without one, "∞" for a single branch. */
+    private fun marginLabel(m: Float) = when {
+        m.isNaN() -> "-"
+        m.isInfinite() -> "∞"
+        else -> "%.1fx".format(m)
+    }
+
     private fun renderHud() {
         val r = processor.results.latest() ?: return
         fun f(slot: Int) = r[slot]
@@ -333,7 +347,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         if (r.flag(H.DETECTED)) {
             sb.append("board %d pts  rms %.2f px  margin %s  focus %s\n".format(
                 f(H.N_CORNERS).toInt(), f(H.REPROJ_RMS),
-                if (has(H.POSE_MARGIN)) "%.1fx".format(f(H.POSE_MARGIN)) else "-",
+                marginLabel(f(H.POSE_MARGIN)),
                 if (has(H.FOCUS_PCT)) "%.0f%%".format(f(H.FOCUS_PCT)) else "-"))
             sb.append("cam X %.1f  Y %.1f  Z %.1f mm  d %.0f\n".format(
                 f(H.CAM_X), f(H.CAM_Y), f(H.CAM_Z), f(H.DISTANCE)))
@@ -364,6 +378,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             val rejected = f(H.GATE_REJECTED).toInt()
             sb.append("\nframes kept %d / rejected %d".format(kept, rejected))
             if (has(H.SCAN_GATE)) sb.append("  now: %s".format(FrameResult.Gate.label(f(H.SCAN_GATE).toInt())))
+            sb.append("\ngyro: %s".format(FrameResult.Gyro.label(f(H.GYRO_STATE).toInt())))
+            if (r.flag(H.RS_CORRECTED)) sb.append("  rolling shutter corrected")
         }
         val photoState = f(H.PHOTO_STATE).toInt()
         if (photoState != Photo.OFF) {

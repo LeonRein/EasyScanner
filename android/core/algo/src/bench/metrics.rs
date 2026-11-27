@@ -7,11 +7,13 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::geom::{V3, dot, norm, sub};
+use crate::geom::{V3, dot, norm, rotation_distance, sub};
+
+use crate::imu::MountSource;
 
 use super::pnp::{pose_error, solve_dense};
-use super::recording::Recording;
 use super::reconstruct::Reconstruction;
+use super::recording::Recording;
 use super::scene::Shape;
 
 /// Summary of a signed error sample.
@@ -137,6 +139,21 @@ pub struct SphereReport {
     pub center_err_mm: Option<f64>,
 }
 
+/// The gyro self-calibration at the end of the reconstruction.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct GyroReport {
+    /// First frame the calibration was in use.
+    pub from_frame: Option<usize>,
+    /// Its fit residual (deg).
+    pub residual_deg: f64,
+    /// The standard error of the mount if it was fitted, `None` if it is the
+    /// platform's (deg).
+    pub mount_sigma_deg: Option<f64>,
+    /// Errors against the simulated gyro (synthetic recordings only).
+    pub rotation_err_deg: Option<f64>,
+    pub offset_err_ms: Option<f64>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Report {
     pub name: String,
@@ -145,7 +162,11 @@ pub struct Report {
     pub points: usize,
     /// Reprojection RMS of the solved poses (px).
     pub reproj_px: Option<Stats>,
-    /// Pose error against the truth at the frame timestamp.
+    /// Frames whose observations were rolling-shutter corrected.
+    pub corrected_frames: usize,
+    /// `None` when the recording has no gyro or it never calibrated.
+    pub gyro: Option<GyroReport>,
+    /// Pose error against the truth at the frame's reference instant.
     pub pose_rot_deg: Option<Stats>,
     pub pose_pos_mm: Option<Stats>,
     /// Angle between the used and the true laser plane.
@@ -168,10 +189,25 @@ pub fn evaluate(name: &str, rec: &Recording, recon: &Reconstruction) -> Report {
         frames: rec.frames.len(),
         frames_posed: recon.poses.iter().filter(|p| p.is_some()).count(),
         points: recon.points.len(),
+        corrected_frames: recon.corrected_frames,
         ..Report::default()
     };
     let rms: Vec<f64> = recon.poses.iter().flatten().map(|p| p.reproj_rms).collect();
     rep.reproj_px = Stats::of(&rms);
+    let true_gyro = rec.truth.as_ref().and_then(|t| t.gyro);
+    rep.gyro = recon.gyro_fit.map(|fit| {
+        let c = fit.calib;
+        GyroReport {
+            from_frame: recon.gyro_from_frame,
+            residual_deg: fit.residual_deg,
+            mount_sigma_deg: match fit.mount {
+                MountSource::Platform => None,
+                MountSource::Fitted { sigma_deg } => Some(sigma_deg),
+            },
+            rotation_err_deg: true_gyro.map(|t| rotation_distance(&c.cam_from_imu, &t.cam_from_imu).to_degrees()),
+            offset_err_ms: true_gyro.map(|t| (c.offset_ns - t.offset_ns) * 1e-6),
+        }
+    });
     let Some(truth) = &rec.truth else { return rep };
 
     let (mut rot, mut pos) = (Vec::new(), Vec::new());
@@ -279,7 +315,14 @@ pub fn read_ply(path: &Path) -> io::Result<Vec<V3>> {
     };
     let sizes: Vec<usize> = props.iter().map(|(t, _)| size(t)).collect::<io::Result<_>>()?;
     let stride: usize = sizes.iter().sum();
-    let offs: Vec<usize> = sizes.iter().scan(0, |a, s| { let o = *a; *a += s; Some(o) }).collect();
+    let offs: Vec<usize> = sizes
+        .iter()
+        .scan(0, |a, s| {
+            let o = *a;
+            *a += s;
+            Some(o)
+        })
+        .collect();
     let get = |rec: &[u8], i: usize| -> f64 {
         let o = offs[i];
         match props[i].0.as_str() {
@@ -298,8 +341,8 @@ pub fn read_ply(path: &Path) -> io::Result<Vec<V3>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plane::Rng;
     use crate::bench::sim::gauss;
+    use crate::plane::Rng;
 
     #[test]
     fn sphere_fit_recovers_a_noisy_cap_with_outliers() {

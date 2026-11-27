@@ -157,12 +157,21 @@ phone, and needs no extra step:
   once the views cover directions at least 30° apart, the recent views are
   fitted again (off the frame thread) and compared with the shape in use.
   The same within the fits' uncertainty: verified. Clearly different: the
-  views are dropped, and a second fit from fresh views decides. It replaces
-  the shape (the board was laid down anew) or confirms the old one.
+  views are dropped, and a second fit from fresh views decides. If it agrees
+  with the doubting fit, it replaces the shape (the board was laid down anew:
+  the open scan ends). If it agrees with the old shape, it confirms it.
+  Otherwise it becomes the new doubt.
+- Views are steady frames with enough corners and an unambiguous pose. Their
+  reprojection error is not checked, because it is computed with the shape in
+  use, which is the thing a moved board makes wrong.
+- A changed shape drops the laser lines collected so far for the plane
+  calibration, since they met the old shape.
 - There is no check at app start: a saved shape is used right away and
   verified by the first steady frames.
 
-The shape is saved per board spec in `board_surface.json`, recorded in
+The shape is saved with the board spec it was measured on in
+`board_surface.json`. A board with another spec starts flat and overwrites
+it. The shape is also recorded in
 `recording.jsonl` setups, and shown in the header (`SURFACE_STATE`,
 `SURFACE_PV_MM`, `SURFACE_SIGMA_MM`, `SURFACE_VIEWS`); `FORGET_SURFACE`
 drops it. `board_surface.enabled: false` goes back to a flat board.

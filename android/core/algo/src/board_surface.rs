@@ -27,6 +27,9 @@ use crate::linalg::{invert, solve_dense};
 
 /// Highest total degree of the height polynomial a surface may have.
 pub const MAX_DEGREE: u8 = 6;
+/// Lowest degree a measured surface has: below it there are no terms (the
+/// constant and the tilt are the pose's).
+pub const MIN_DEGREE: u8 = 2;
 
 /// Height of the board over its plane, `z = h(x, y)` in the board frame
 /// (OpenCV's: the camera looks along +Z, so a bump toward the camera is
@@ -35,7 +38,8 @@ pub const MAX_DEGREE: u8 = 6;
 #[serde(try_from = "SurfaceFile", into = "SurfaceFile")]
 pub struct BoardSurface {
     /// Board centre and half-diagonal (mm): `(x, y)` are normalised by them
-    /// so the coefficients are mm at the board's corners.
+    /// to `(u, v)`, with `u² + v² = 1` at the board's corners, so every
+    /// coefficient is in mm.
     centre: [f64; 2],
     half_diagonal: f64,
     degree: u8,
@@ -92,9 +96,9 @@ impl BoardSurface {
     }
 
     /// A flat start for a `width`×`height` mm board with terms up to `degree`
-    /// (clamped to [`MAX_DEGREE`]).
+    /// (clamped to [`MIN_DEGREE`]..=[`MAX_DEGREE`]).
     pub fn for_board(width_mm: f64, height_mm: f64, degree: u8) -> Self {
-        let degree = degree.min(MAX_DEGREE);
+        let degree = degree.clamp(MIN_DEGREE, MAX_DEGREE);
         BoardSurface {
             centre: [0.5 * width_mm, 0.5 * height_mm],
             half_diagonal: (0.5 * width_mm.hypot(height_mm)).max(1.0),

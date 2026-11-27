@@ -20,7 +20,7 @@ use jni::JNIEnv;
 use jni::objects::{JByteBuffer, JClass, JFloatArray, JLongArray, JString, ReleaseMode};
 use jni::sys::{jint, jlong, jstring};
 use scan_algo::imu::GyroSample;
-use scan_algo::laser::YuvFrame;
+use scan_algo::laser::{YuvFrame, YuvLayout};
 use scan_algo::rolling::RowClock;
 
 use engine::Engine;
@@ -58,7 +58,7 @@ fn new_string(env: &mut JNIEnv, s: &str) -> Result<jstring, String> {
     env.new_string(s).map(|j| j.into_raw()).map_err(|e| e.to_string())
 }
 
-fn buffer<'b>(env: &mut JNIEnv, buf: &JByteBuffer) -> Result<&'b [u8], String> {
+fn buffer<'b>(env: &mut JNIEnv, buf: &'b JByteBuffer) -> Result<&'b [u8], String> {
     let ptr = env.get_direct_buffer_address(buf).map_err(|e| e.to_string())?;
     let len = env.get_direct_buffer_capacity(buf).map_err(|e| e.to_string())?;
     // SAFETY: a direct buffer's memory stays valid while the Java caller holds
@@ -153,18 +153,21 @@ pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeProc
     out: JFloatArray<'l>,
 ) -> jint {
     guard(&mut env, 0, |env| {
-        let (w, h) = (width as usize, height as usize);
-        let (ys, uvs, ps) = (y_stride as usize, uv_stride as usize, uv_pixel_stride as usize);
-        if w < 16 || h < 16 || ys < w || ps == 0 {
-            return Err(format!("bad frame geometry {w}x{h} stride {ys} ps {ps}"));
-        }
-        let (yb, ub, vb) = (buffer(env, &y)?, buffer(env, &u)?, buffer(env, &v)?);
-        let uv_need = (h / 2 - 1) * uvs + (w / 2 - 1) * ps + 1;
-        if yb.len() < (h - 1) * ys + w || ub.len() < uv_need || vb.len() < uv_need {
-            return Err("image planes smaller than their geometry".into());
-        }
-        let frame = YuvFrame { width: w, height: h, y: yb, y_stride: ys, u: ub, v: vb, uv_stride: uvs, uv_pixel_stride: ps };
-        let clock = RowClock { start_ns: timestamp_ns, readout_ns: readout_ns.max(0), exposure_ns: exposure_ns.max(0), height: h as f64 };
+        let dim = |name: &str, v: jint| usize::try_from(v).map_err(|_| format!("negative frame {name} {v}"));
+        let layout = YuvLayout {
+            width: dim("width", width)?,
+            height: dim("height", height)?,
+            y_stride: dim("row stride", y_stride)?,
+            uv_stride: dim("chroma row stride", uv_stride)?,
+            uv_pixel_stride: dim("chroma pixel stride", uv_pixel_stride)?,
+        };
+        let frame = YuvFrame::new(layout, buffer(env, &y)?, buffer(env, &u)?, buffer(env, &v)?).map_err(|e| e.to_string())?;
+        let clock = RowClock {
+            start_ns: timestamp_ns,
+            readout_ns: readout_ns.max(0),
+            exposure_ns: exposure_ns.max(0),
+            height: layout.height as f64,
+        };
         let data = unsafe { engine(handle) }?.process(&frame, clock).map_err(|e| e.to_string())?;
         let cap = env.get_array_length(&out).map_err(|e| e.to_string())? as usize;
         if data.len() > cap {

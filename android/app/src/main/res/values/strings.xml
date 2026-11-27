@@ -24,7 +24,7 @@
     <string name="act_photos_off">Photos ▶</string>
 
     <string name="hint_view">Point the phone at the ChArUco board: the overlay shows the pose and its error.</string>
-    <string name="hint_camera">Calibrate the camera: Start, then move and tilt the board slowly through the frame until SAVED.</string>
+    <string name="hint_camera">Calibrate the camera: Start, then move and tilt the phone slowly around the board, so the board visits every part of the frame, until SAVED.</string>
     <string name="hint_laser">Calibrate the laser plane: Start, then sweep the stripe across the board at varied tilts.</string>
     <string name="hint_scan">Scan: Start, sweep the laser over the object; Export writes a Z-up PLY over the board (mm) to Download/EasyScanner and offers to share it. Photos takes posed full-resolution keyframes into an orbiter-native session (long press: one now); stopping it adds laser.ply.</string>
     <string name="share_scan">Share scan</string>
@@ -33,6 +33,10 @@
     <string name="photos_unavailable">This camera offers no photo size with the analysis aspect.</string>
 
     <string name="need_camera">Camera permission is required.</string>
+    <string name="camera_denied_title">Camera access needed</string>
+    <string name="camera_denied_body">The scanner sees the board and the laser through the camera, so it cannot work without it. Allow the camera in the app\'s settings (Permissions › Camera), then come back.</string>
+    <string name="act_open_settings">Open settings</string>
+    <string name="act_ask_again">Ask again</string>
     <string name="no_camera">No back camera found.</string>
 
     <!-- guided steps -->
@@ -83,8 +87,17 @@
     <string name="act_finish">Finish</string>
     <string name="act_discard">Discard</string>
     <string name="act_photo_now">Photo now</string>
+    <string name="leave_scan_title">Leave this scan?</string>
+    <string name="leave_scan_body">The scan is still open. Finish saves it to Download/EasyScanner; Discard deletes it.</string>
+    <string name="act_keep_scanning">Keep scanning</string>
     <string name="discard_title">Discard this scan?</string>
     <string name="discard_body">Its points and photos are deleted from the phone.</string>
+
+    <!-- why a running step makes no progress, from the latest frame -->
+    <string name="stall_no_board">⚠ Board not found: keep the whole board in the picture.</string>
+    <string name="stall_laser_off">⚠ Laser detection is off (Settings › Laser).</string>
+    <string name="stall_no_laser">⚠ No laser stripe seen. Is the laser on, and does Settings › Laser colour (%1$s) match it?</string>
+    <string name="stall_gate">⚠ Frames not kept: %1$s.</string>
 
     <string name="title_done">Saved</string>
     <string name="done_saving">Saving to Download/EasyScanner…</string>

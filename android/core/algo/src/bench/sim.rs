@@ -12,7 +12,7 @@ use crate::geom::{
     Intrinsics, M3, Pose, V3, add, cross, dot, mat_mul, mat_t_vec, mat_vec, normalize, rodrigues, rotation_vector, scale, sub, transpose,
 };
 use crate::imu::{GyroCalib, GyroSample};
-use crate::laser::{LaserDetector, LaserParams, Roi, YuvFrame};
+use crate::laser::{FrameError, LaserDetector, LaserParams, Roi, YuvFrame, YuvLayout};
 use crate::plane::Rng;
 
 use super::scene::Scene;
@@ -428,7 +428,13 @@ impl<'a> Camera<'a> {
             StripeModel::Render { .. } => {
                 let img = self.render(traj, t0);
                 let mut px = Vec::new();
-                self.detector.detect(&img.frame(), &Roi::full(img.width, img.height), &LaserParams::default(), &mut px);
+                match img.frame() {
+                    Ok(frame) => {
+                        self.detector.detect(&frame, &Roi::full(img.width, img.height), &LaserParams::default(), &mut px);
+                    }
+                    // a camera model the renderer cannot produce a frame for sees no stripe
+                    Err(e) => log::warn!("rendered frame unusable: {e}"),
+                }
                 px
             }
         };
@@ -558,7 +564,7 @@ pub struct YuvImage {
 
 impl YuvImage {
     /// JFIF conversion with 2x2-averaged chroma, like a camera ISP (the same
-    /// as `examples/laser_parity.rs`).
+    /// one `examples/laser_parity.rs` feeds the detector).
     pub fn from_rgb(rgb: &[u8], w: usize, h: usize) -> YuvImage {
         let mut y = vec![0u8; w * h];
         let (cw, ch) = (w / 2, h / 2);
@@ -578,17 +584,8 @@ impl YuvImage {
         YuvImage { width: w, height: h, y, u: uf.iter().map(q).collect(), v: vf.iter().map(q).collect() }
     }
 
-    pub fn frame(&self) -> YuvFrame<'_> {
-        YuvFrame {
-            width: self.width,
-            height: self.height,
-            y: &self.y,
-            y_stride: self.width,
-            u: &self.u,
-            v: &self.v,
-            uv_stride: self.width / 2,
-            uv_pixel_stride: 1,
-        }
+    pub fn frame(&self) -> Result<YuvFrame<'_>, FrameError> {
+        YuvFrame::new(YuvLayout::packed_planar(self.width, self.height), &self.y, &self.u, &self.v)
     }
 }
 

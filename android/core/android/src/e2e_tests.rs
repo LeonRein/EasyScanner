@@ -16,7 +16,7 @@ use opencv::prelude::*;
 use scan_algo::config::{self, BoardSpec};
 use scan_algo::gate::Reject;
 use scan_algo::geom::{Intrinsics, M3, Pose, V3, dot, mat_mul, mat_vec, normalize, rodrigues, sub};
-use scan_algo::laser::YuvFrame;
+use scan_algo::laser::{YuvFrame, YuvLayout};
 use scan_algo::rolling::RowClock;
 
 use crate::board::make_board;
@@ -161,16 +161,7 @@ impl Yuv {
     }
 
     fn frame(&self) -> YuvFrame<'_> {
-        YuvFrame {
-            width: self.w,
-            height: self.h,
-            y: &self.y,
-            y_stride: self.w,
-            u: &self.u,
-            v: &self.v,
-            uv_stride: self.w / 2,
-            uv_pixel_stride: 1,
-        }
+        YuvFrame::new(YuvLayout::packed_planar(self.w, self.h), &self.y, &self.u, &self.v).unwrap()
     }
 }
 
@@ -185,7 +176,7 @@ fn step(e: &mut Engine, yuv: &Yuv) -> Vec<f32> {
 
 fn step_at(e: &mut Engine, yuv: &Yuv, ts_ns: i64) -> Vec<f32> {
     // a global shutter: the tests' images are rendered for one instant
-    step_clocked(e, yuv, RowClock { start_ns: ts_ns, readout_ns: 0, exposure_ns: 0, height: yuv.frame().height as f64 })
+    step_clocked(e, yuv, RowClock { start_ns: ts_ns, readout_ns: 0, exposure_ns: 0, height: yuv.frame().height() as f64 })
 }
 
 fn step_clocked(e: &mut Engine, yuv: &Yuv, clock: RowClock) -> Vec<f32> {

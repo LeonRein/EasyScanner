@@ -10,11 +10,11 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use opencv::core::{CV_8UC1, Mat};
+use scan_algo::atomic_file::write_atomic;
 use scan_algo::cloud::PointCloud;
 use scan_algo::config::{self, Config, IntrinsicsFile, SavedPlane};
 use scan_algo::focus::laplacian_variance;
@@ -36,7 +36,7 @@ use serde::Deserialize;
 
 use crate::board::{BoardTracker, PoseResult, corner_bbox, distance};
 use crate::calib::{CalibState, LiveCalibrator, Outcome};
-use crate::frame_out::{FrameOut, ev, h, layer, photo_state};
+use crate::frame_out::{FrameOut, ev, h, laser_state, layer, photo_state};
 
 /// Commands from the app (`NativeCore.Cmd`).
 pub mod cmd {
@@ -248,6 +248,12 @@ impl Engine {
             self.plane_cal.reset();
             self.close_photos("board changed");
         }
+        if cfg.camera.id != self.cfg.camera.id || cfg.camera.focus_diopters != self.cfg.camera.focus_diopters {
+            // views and lines (and a solve in flight) were taken through the
+            // old camera or focus; they must not end up in the new one's files
+            self.calib.reset();
+            self.plane_cal.reset();
+        }
         if cfg.camera.id != self.cfg.camera.id {
             self.close_photos("camera changed");
             // another camera sits at another angle to the gyro
@@ -264,11 +270,18 @@ impl Engine {
         self.reload_calibrations();
         // a model, not bits: a K just solved and the same K read back from its file differ in the last digits
         if !self.k_base.same_model(&k_before) {
-            // the session's photos and poses are in the old camera model
-            self.close_photos("camera model changed");
+            self.camera_model_changed("camera model changed");
         }
         self.events |= ev::MESSAGES;
         Ok(())
+    }
+
+    /// `k_base` now holds another camera model: the session's photos and
+    /// poses, and the laser lines collected so far, are in the old one.
+    fn camera_model_changed(&mut self, why: &str) {
+        self.close_photos(why);
+        self.plane_cal.reset();
+        self.plane_solved_at = 0;
     }
 
     /// The laser plane, when it was fitted with the current camera model.
@@ -352,8 +365,8 @@ impl Engine {
             ts_ns: clock.start_ns,
             readout_ns: clock.readout_ns,
             exposure_ns: clock.exposure_ns,
-            width: f.width as u32,
-            height: f.height as u32,
+            width: f.width() as u32,
+            height: f.height() as u32,
             pose: pose.map(|p| PoseObs { r: p.pose.r, t: p.pose.t, reproj_rms: p.reproj_rms, margin: p.margin }),
             scan: Some(scan),
             corners: corners.into(),
@@ -372,7 +385,7 @@ impl Engine {
     pub fn process(&mut self, f: &YuvFrame, clock: RowClock) -> opencv::Result<&[f32]> {
         let t0 = Instant::now();
         let ts_ns = clock.start_ns;
-        let (w, hgt) = (f.width as u32, f.height as u32);
+        let (w, hgt) = (f.width() as u32, f.height() as u32);
         if self.last_wh != (w, hgt) {
             // sharpness is not comparable across resolutions
             self.focus_max = 1e-6;
@@ -383,15 +396,21 @@ impl Engine {
 
         let k = self.k_base.for_frame(w, hgt);
         // the luma plane IS the grey image ArUco wants — wrapped, not copied
-        let gray = unsafe { Mat::new_rows_cols_with_data_unsafe(hgt as i32, w as i32, CV_8UC1, f.y.as_ptr() as *mut _, f.y_stride) }?;
+        // SAFETY: `YuvFrame::new` checked that the luma plane covers `hgt`
+        // rows of `y_stride` bytes (the last one `w` long) and that both sides
+        // fit in an i32; OpenCV only reads through this header, and `gray`
+        // does not outlive `f`.
+        let gray = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(hgt as i32, w as i32, CV_8UC1, f.luma().as_ptr().cast_mut().cast(), f.y_stride())
+        }?;
         let n_corners = self.tracker.detect(&gray)?;
         let correction = self.fusion.correction(&clock);
         let expected = self.fusion.expected_rotation(&clock);
         let pose_res = self.tracker.solve_pose(&k, expected.as_ref(), correction.as_ref())?;
         let t_board = t0.elapsed();
 
-        let sharpness =
-            corner_bbox(&self.tracker.corners).and_then(|bb| laplacian_variance(f.y, f.y_stride, (f.width, f.height), bb, 40_000));
+        let sharpness = corner_bbox(&self.tracker.corners)
+            .and_then(|bb| laplacian_variance(f.luma(), f.y_stride(), (f.width(), f.height()), bb, 40_000));
         let focus_pct = sharpness.map(|s| {
             self.focus_max = self.focus_max.max(s);
             100.0 * s / self.focus_max
@@ -436,7 +455,7 @@ impl Engine {
             if self.calib.capture(&self.tracker.corners, &self.tracker.ids, (w, hgt)) {
                 let (n, t) = (self.calib.count(), self.calib.target);
                 self.msgs.calib = if n < t {
-                    format!("collecting {n}/{t} — move the board")
+                    format!("collecting {n}/{t} — move the phone around the board")
                 } else {
                     format!("{n} views — last solve rejected, vary angles & retrying")
                 };
@@ -444,7 +463,7 @@ impl Engine {
             }
             if self.calib.maybe_solve(self.cfg.board, self.k_base) {
                 self.calib_state = CalibState::Solving;
-                self.msgs.calib = format!("solving over {} views… keep the board steady", self.calib.count());
+                self.msgs.calib = format!("solving over {} views… this takes a few seconds", self.calib.count());
                 self.events |= ev::MESSAGES;
             }
         }
@@ -458,20 +477,20 @@ impl Engine {
         let mut roi_frac = f64::NAN;
         let mut board_stripe: Option<BoardStripe> = None;
         if self.cfg.laser.enabled {
-            if self.full_roi.spans.len() != f.height || self.full_roi.spans.first().map(|s| s.1) != Some(w) {
-                self.full_roi = Roi::full(f.width, f.height);
+            if self.full_roi.spans.len() != f.height() || self.full_roi.spans.first().map(|s| s.1) != Some(w) {
+                self.full_roi = Roi::full(f.width(), f.height());
             }
             let volume_roi;
             let roi = match pose {
                 Some(p) => {
-                    volume_roi = vol.roi(&p, &k, f.width, f.height);
+                    volume_roi = vol.roi(&p, &k, f.width(), f.height());
                     volume_roi.as_ref()
                 }
                 None if self.cfg.laser.without_board => Some(&self.full_roi),
                 None => None,
             };
             if let Some(roi) = roi {
-                roi_frac = roi.area() as f64 / (f.width * f.height) as f64;
+                roi_frac = roi.area() as f64 / (f.width() * f.height()) as f64;
                 found = self.laser.detect(f, roi, &params, &mut self.laser_px);
             }
             if let (true, Some(p)) = (found, pose) {
@@ -489,7 +508,7 @@ impl Engine {
         {
             let n_lines = self.plane_cal.add(&s.cam_pts);
             let last = self.plane_cal.last_rms.map(|r| format!(" — last fit {r:.1}mm")).unwrap_or_default();
-            self.msgs.plane = format!("vary board tilt{last}");
+            self.msgs.plane = format!("vary the phone's tilt between sweeps{last}");
             self.events |= ev::MESSAGES;
             if self.plane_cal.ready() && n_lines != self.plane_solved_at {
                 self.plane_solved_at = n_lines;
@@ -527,7 +546,7 @@ impl Engine {
                     inside[i] = true;
                     if scan_on {
                         let (u, v) = (px[i][0].round() as usize, px[i][1].round() as usize);
-                        cloud.push(b, f.rgb_at(u.min(f.width - 1), v.min(f.height - 1)));
+                        cloud.push(b, f.rgb_at(u, v));
                         pushed = true;
                     }
                 }
@@ -616,8 +635,8 @@ impl Engine {
                     rms_px: Some(rms),
                 };
                 let saved = config::save_intrinsics(&self.dir, &file);
-                self.close_photos("camera re-calibrated");
                 self.k_base = k;
+                self.camera_model_changed("camera re-calibrated");
                 self.k_file = Some(file);
                 self.calib_active = false;
                 self.calib.reset();
@@ -692,11 +711,11 @@ impl Engine {
         o.set(
             h::LASER_STATE,
             if !self.cfg.laser.enabled {
-                0.0
+                laser_state::OFF
             } else if found {
-                2.0
+                laser_state::FOUND
             } else {
-                1.0
+                laser_state::NONE
             },
         );
         o.set(h::LASER_POINTS, self.laser_px.len() as f64);
@@ -796,7 +815,7 @@ impl Engine {
                 self.calib_state = CalibState::Collecting;
                 self.plane_active = false;
                 self.scan_on = false;
-                self.msgs.calib = "collecting views — move the board to varied angles".into();
+                self.msgs.calib = "collecting views — move the phone around the board at varied angles".into();
                 return self.msgs.calib.clone();
             }
             cmd::CALIB_STOP => {
@@ -900,9 +919,13 @@ impl Engine {
                 self.msgs.photos.clone()
             }
             cmd::FORGET_INTRINSICS => {
-                self.close_photos("intrinsics reset");
+                // a solve in flight would write the file straight back
+                self.calib.reset();
+                self.calib_active = false;
+                self.calib_state = CalibState::Idle;
                 let _ = fs::remove_file(self.dir.join(config::INTRINSICS_FILE));
                 self.reload_calibrations();
+                self.camera_model_changed("intrinsics reset");
                 "intrinsics reset to the camera estimate".to_string()
             }
             cmd::FORGET_PLANE => {
@@ -936,15 +959,10 @@ impl Engine {
     /// The cloud as a Z-up PLY over the board, through a temporary file so a
     /// reader never finds half of one.
     fn write_scan_ply(&self, path: &Path) -> std::io::Result<usize> {
-        let tmp = path.with_extension("ply.tmp");
-        let mut w = BufWriter::new(fs::File::create(&tmp)?);
         // Z up over the board: OpenCV's board +Z points away from the camera, so
         // in the board frame objects sit at -Z and viewers show them upside down
-        let n = self.cloud.write_ply_in(&mut w, &FaceOutFrame::cornered(self.cfg.board.height_mm()))?;
-        w.flush()?;
-        drop(w);
-        fs::rename(&tmp, path)?;
-        Ok(n)
+        let frame = FaceOutFrame::cornered(self.cfg.board.height_mm());
+        write_atomic(path, |w| self.cloud.write_ply_in(w, &frame))
     }
 
     /// Write the cloud into the open session (`laser.ply` for orbiter-recon,

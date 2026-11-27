@@ -53,26 +53,158 @@ impl Default for LaserParams {
     }
 }
 
-/// A borrowed YUV_420_888 image as Camera2's `Image` exposes it: a full-size
-/// luma plane and two half-size chroma planes with a shared row stride and a
-/// pixel stride of 1 (planar) or 2 (semi-planar NV12/NV21).
-#[derive(Clone, Copy)]
-pub struct YuvFrame<'a> {
+/// The geometry of a YUV_420_888 image as Camera2's `Image` exposes it: a
+/// full-size luma plane and two half-size chroma planes with a shared row
+/// stride and a pixel stride of 1 (planar) or 2 (semi-planar NV12/NV21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YuvLayout {
     pub width: usize,
     pub height: usize,
-    pub y: &'a [u8],
     pub y_stride: usize,
-    pub u: &'a [u8],
-    pub v: &'a [u8],
     pub uv_stride: usize,
     pub uv_pixel_stride: usize,
 }
 
-impl YuvFrame<'_> {
-    /// Full-range BT.601 (JFIF) RGB of one pixel.
+impl YuvLayout {
+    /// Smallest frame the detector and the board tracker work on.
+    pub const MIN_SIDE: usize = 16;
+
+    /// Tightly packed planar I420: no row padding, chroma pixel stride 1.
+    pub fn packed_planar(width: usize, height: usize) -> Self {
+        Self { width, height, y_stride: width, uv_stride: width / 2, uv_pixel_stride: 1 }
+    }
+
+    /// Bytes the luma plane must hold: the last row needs only `width`.
+    fn y_len(&self) -> Option<usize> {
+        (self.height - 1).checked_mul(self.y_stride)?.checked_add(self.width)
+    }
+
+    /// Bytes each chroma plane must hold. A semi-planar plane may stop one
+    /// byte short of a full row, so the last sample is the bound.
+    fn uv_len(&self) -> Option<usize> {
+        let last_row = (self.height / 2 - 1).checked_mul(self.uv_stride)?;
+        let last_col = (self.width / 2 - 1).checked_mul(self.uv_pixel_stride)?;
+        last_row.checked_add(last_col)?.checked_add(1)
+    }
+
+    fn check(&self) -> Result<(), FrameError> {
+        let bad = |why| Err(FrameError::Geometry { layout: *self, why });
+        if self.width < Self::MIN_SIDE || self.height < Self::MIN_SIDE {
+            return bad("smaller than 16 px");
+        }
+        if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
+            return bad("odd size (4:2:0 chroma needs even sides)");
+        }
+        if i32::try_from(self.width).is_err() || i32::try_from(self.height).is_err() {
+            return bad("too large");
+        }
+        if self.y_stride < self.width {
+            return bad("luma stride shorter than a row");
+        }
+        if !(1..=2).contains(&self.uv_pixel_stride) {
+            return bad("chroma pixel stride is not 1 or 2");
+        }
+        if self.uv_stride < (self.width / 2 - 1) * self.uv_pixel_stride + 1 {
+            return bad("chroma stride shorter than a row");
+        }
+        Ok(())
+    }
+}
+
+/// Which plane of a [`YuvFrame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plane {
+    Y,
+    U,
+    V,
+}
+
+/// Why a [`YuvFrame`] could not be built.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The layout itself is unusable.
+    Geometry { layout: YuvLayout, why: &'static str },
+    /// A plane holds fewer bytes than the layout addresses (`need` is `None`
+    /// when that size does not even fit in `usize`).
+    PlaneTooShort { plane: Plane, len: usize, need: Option<usize> },
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Geometry { layout: l, why } => write!(
+                f,
+                "bad frame geometry {}x{} (stride {}, chroma stride {}, pixel stride {}): {why}",
+                l.width, l.height, l.y_stride, l.uv_stride, l.uv_pixel_stride
+            ),
+            FrameError::PlaneTooShort { plane, len, need: Some(need) } => {
+                write!(f, "{plane:?} plane holds {len} bytes, its geometry needs {need}")
+            }
+            FrameError::PlaneTooShort { plane, len, need: None } => {
+                write!(f, "{plane:?} plane holds {len} bytes, its geometry overflows")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// A borrowed YUV_420_888 image whose planes are known to cover its
+/// [`YuvLayout`]: every pixel `(x, y)` with `x < width`, `y < height` can be
+/// read from all three planes. [`YuvFrame::new`] is the only way to build
+/// one, so code reading the planes (including OpenCV through a raw pointer)
+/// may rely on it.
+#[derive(Clone, Copy)]
+pub struct YuvFrame<'a> {
+    layout: YuvLayout,
+    y: &'a [u8],
+    u: &'a [u8],
+    v: &'a [u8],
+}
+
+impl<'a> YuvFrame<'a> {
+    /// Check the layout and that each plane is long enough for it.
+    pub fn new(layout: YuvLayout, y: &'a [u8], u: &'a [u8], v: &'a [u8]) -> Result<Self, FrameError> {
+        layout.check()?;
+        let fits = |plane, buf: &[u8], need: Option<usize>| match need {
+            Some(n) if buf.len() >= n => Ok(()),
+            _ => Err(FrameError::PlaneTooShort { plane, len: buf.len(), need }),
+        };
+        fits(Plane::Y, y, layout.y_len())?;
+        fits(Plane::U, u, layout.uv_len())?;
+        fits(Plane::V, v, layout.uv_len())?;
+        Ok(Self { layout, y, u, v })
+    }
+
+    pub fn layout(&self) -> &YuvLayout {
+        &self.layout
+    }
+
+    pub fn width(&self) -> usize {
+        self.layout.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.layout.height
+    }
+
+    /// The luma plane: `height` rows `y_stride` bytes apart, the last one
+    /// possibly cut right after `width` bytes.
+    pub fn luma(&self) -> &'a [u8] {
+        self.y
+    }
+
+    pub fn y_stride(&self) -> usize {
+        self.layout.y_stride
+    }
+
+    /// Full-range BT.601 (JFIF) RGB of one pixel. Coordinates past the
+    /// frame's edge read its border pixel.
     pub fn rgb_at(&self, x: usize, y: usize) -> [u8; 3] {
-        let yv = self.y[y * self.y_stride + x] as i32;
-        let ci = (y >> 1) * self.uv_stride + (x >> 1) * self.uv_pixel_stride;
+        let l = &self.layout;
+        let (x, y) = (x.min(l.width - 1), y.min(l.height - 1));
+        let yv = self.y[y * l.y_stride + x] as i32;
+        let ci = (y >> 1) * l.uv_stride + (x >> 1) * l.uv_pixel_stride;
         let (ar, ag, ab) = chroma_offsets(self.u[ci], self.v[ci]);
         [(yv + ar).clamp(0, 255) as u8, (yv + ag).clamp(0, 255) as u8, (yv + ab).clamp(0, 255) as u8]
     }
@@ -242,7 +374,7 @@ impl LaserDetector {
     }
 
     fn detect_color(&mut self, f: &YuvFrame, roi: &Roi, p: &LaserParams, color: LaserColor, out: &mut Vec<[f32; 2]>) -> bool {
-        let (w, h) = (f.width, f.height);
+        let (w, h) = (f.width(), f.height());
         let tol = Tolerances::for_frame(w, h, p);
         let y0 = roi.y0.min(h);
         let y1 = roi.y1().min(h);
@@ -282,7 +414,7 @@ impl LaserDetector {
                 band.u4.resize(cw, 0);
                 band.v4.resize(cw, 0);
                 let by0 = y0 + bi * band_rows;
-                let ps = f.uv_pixel_stride;
+                let ps = f.layout.uv_pixel_stride;
                 for (ri, (row_out, cen)) in resp_band.chunks_mut(w).zip(cen_band.iter_mut()).enumerate() {
                     let y = by0 + ri;
                     let (sx0, sx1) = roi.spans[y - roi.y0];
@@ -292,12 +424,12 @@ impl LaserDetector {
                     if sx1 <= sx0 {
                         continue;
                     }
-                    let y_row = &f.y[y * f.y_stride..y * f.y_stride + w];
+                    let y_row = &f.y[y * f.layout.y_stride..y * f.layout.y_stride + w];
                     // vertical half of the triangle filter: 3/4 own chroma row,
                     // 1/4 the neighbour on this luma row's side
                     let cy = (y >> 1).min(ch - 1);
                     let cyn = if y & 1 == 0 { cy.saturating_sub(1) } else { (cy + 1).min(ch - 1) };
-                    let (r0, r1) = (cy * f.uv_stride, cyn * f.uv_stride);
+                    let (r0, r1) = (cy * f.layout.uv_stride, cyn * f.layout.uv_stride);
                     let c0 = (sx0 >> 1).saturating_sub(1);
                     let c1 = (((sx1 - 1) >> 1) + 1).min(cw - 1);
                     for cx in c0..=c1 {
@@ -330,16 +462,9 @@ impl LaserDetector {
                     if best == 0 {
                         continue;
                     }
-                    // windowed centroid around the row's peak
-                    let a = best_x.saturating_sub(win).max(sx0);
-                    let b = (best_x + win + 1).min(sx1);
-                    let (mut mass, mut moment) = (0u32, 0u64);
-                    for (xi, &rv) in row_out[a..b].iter().enumerate() {
-                        mass += rv as u32;
-                        moment += rv as u64 * (a + xi) as u64;
-                    }
-                    if mass as f32 > min_mass {
-                        *cen = (moment as f64 / mass as f64) as f32;
+                    let line = ScanLine { lo: sx0, hi: sx1, win, min_mass };
+                    if let Some(c) = line.centroid(|x| row_out[x], best_x) {
+                        *cen = c;
                     }
                 }
             });
@@ -379,17 +504,10 @@ impl LaserDetector {
             if self.col_val[x] == 0 {
                 continue;
             }
-            let r = self.col_row[x] as usize;
-            let a = r.saturating_sub(win).max(y0);
-            let b = (r + win + 1).min(y1);
-            let (mut mass, mut moment) = (0u32, 0u64);
-            for yy in a..b {
-                let rv = self.resp[yy * w + x] as u32;
-                mass += rv;
-                moment += rv as u64 * yy as u64;
-            }
-            if mass as f32 > min_mass {
-                self.col_pts.push([x as f32, (moment as f64 / mass as f64) as f32]);
+            let line = ScanLine { lo: y0, hi: y1, win, min_mass };
+            let resp = &self.resp;
+            if let Some(c) = line.centroid(|yy| resp[yy * w + x], self.col_row[x] as usize) {
+                self.col_pts.push([x as f32, c]);
             }
         }
         self.row_pts.clear();
@@ -416,6 +534,85 @@ impl LaserDetector {
         let step = if pts.len() > p.max_points { pts.len() / p.max_points + 1 } else { 1 };
         out.extend(pts.iter().step_by(step));
         true
+    }
+}
+
+/// One scan line (a row or a column) of the response map, for locating the
+/// stripe's centre across it.
+struct ScanLine {
+    /// The searched span, `lo..hi`.
+    lo: usize,
+    hi: usize,
+    /// Half-width of the centroid window.
+    win: usize,
+    /// Least summed response (above the floor) a centre is accepted with.
+    min_mass: f32,
+}
+
+impl ScanLine {
+    /// Re-centrings of the window before the estimate is taken as final.
+    const MAX_ITERATIONS: usize = 4;
+    /// The stripe's extent is where the response stays above this fraction
+    /// of its peak.
+    const EXTENT_FRACTION: u8 = 4;
+    /// Pixels of background kept on each side of the stripe's extent.
+    const MARGIN: usize = 2;
+
+    /// Sub-pixel centre of the stripe crossing this line, starting from the
+    /// response peak at `peak`: the centroid of the response above the local
+    /// floor, in a window that spans the whole stripe and follows the
+    /// estimate.
+    ///
+    /// Each refinement matters on real stripes. A stripe that clips the red
+    /// channel loses chroma in its core, so its response has two flanks and
+    /// the peak sits on one of them: a window of fixed width around the peak
+    /// is lopsided, and on a wide stripe it holds one flank only.
+    /// Response away from the stripe (a reddish surface, the laser's glow)
+    /// pulls an unfloored centroid toward the window's centre, i.e. toward
+    /// whole pixels.
+    fn centroid(&self, resp: impl Fn(usize) -> u8, peak: usize) -> Option<f32> {
+        let (a, b) = self.extent(&resp, peak);
+        let half = self.win.max((b - a).div_ceil(2) + Self::MARGIN);
+        let mut centre = (a + b - 1) / 2;
+        let mut estimate = None;
+        for _ in 0..Self::MAX_ITERATIONS {
+            let a = centre.saturating_sub(half).max(self.lo);
+            let b = (centre + half + 1).min(self.hi);
+            if b <= a {
+                break;
+            }
+            // the window's edges stand for the background under the stripe
+            let floor = resp(a).min(resp(b - 1)) as u32;
+            let (mut mass, mut moment) = (0u32, 0u64);
+            for i in a..b {
+                let rv = (resp(i) as u32).saturating_sub(floor);
+                mass += rv;
+                moment += rv as u64 * i as u64;
+            }
+            if mass as f32 <= self.min_mass {
+                break;
+            }
+            let c = moment as f64 / mass as f64;
+            estimate = Some(c as f32);
+            let next = c.round() as usize;
+            if next == centre {
+                break;
+            }
+            centre = next;
+        }
+        estimate
+    }
+
+    /// The contiguous run `a..b` around `peak` where the response stays
+    /// above a fraction of the peak's: both flanks of a clipped stripe. It
+    /// grows at most `4·win` to each side, so a large reddish area does not
+    /// become one huge window.
+    fn extent(&self, resp: &impl Fn(usize) -> u8, peak: usize) -> (usize, usize) {
+        let edge = resp(peak) / Self::EXTENT_FRACTION;
+        let reach = 4 * self.win;
+        let a = (peak.saturating_sub(reach).max(self.lo)..peak).rev().take_while(|&i| resp(i) > edge).last().unwrap_or(peak);
+        let b = (peak + 1..(peak + reach + 1).min(self.hi)).take_while(|&i| resp(i) > edge).last().map_or(peak + 1, |i| i + 1);
+        (a, b)
     }
 }
 
@@ -485,16 +682,7 @@ mod tests {
         }
 
         fn frame(&self) -> YuvFrame<'_> {
-            YuvFrame {
-                width: self.w,
-                height: self.h,
-                y: &self.y,
-                y_stride: self.w,
-                u: &self.u,
-                v: &self.v,
-                uv_stride: self.w / 2,
-                uv_pixel_stride: 1,
-            }
+            YuvFrame::new(YuvLayout::packed_planar(self.w, self.h), &self.y, &self.u, &self.v).unwrap()
         }
     }
 
@@ -579,12 +767,104 @@ mod tests {
             uv.push(*u);
             uv.push(*v);
         }
-        let nv12 = YuvFrame { width: 256, height: 128, y: &img.y, y_stride: 256, u: &uv, v: &uv[1..], uv_stride: 256, uv_pixel_stride: 2 };
+        let layout = YuvLayout { width: 256, height: 128, y_stride: 256, uv_stride: 256, uv_pixel_stride: 2 };
+        let nv12 = YuvFrame::new(layout, &img.y, &uv, &uv[1..]).unwrap();
         let mut det = LaserDetector::default();
         let (mut a, mut b) = (Vec::new(), Vec::new());
         assert!(det.detect(&img.frame(), &Roi::full(256, 128), &LaserParams::default(), &mut a));
         assert!(det.detect(&nv12, &Roi::full(256, 128), &LaserParams::default(), &mut b));
         assert_eq!(a, b);
         assert_eq!(img.frame().rgb_at(10, 10), nv12.rgb_at(10, 10));
+    }
+
+    #[test]
+    fn frame_accepts_exact_camera_layouts() {
+        let (y, uv) = (vec![0u8; 64 * 32], vec![0u8; 64 * 16]);
+        // semi-planar: the V plane starts one byte in and stops one byte short
+        let nv12 = YuvLayout { width: 64, height: 32, y_stride: 64, uv_stride: 64, uv_pixel_stride: 2 };
+        assert!(YuvFrame::new(nv12, &y, &uv[..uv.len() - 1], &uv[1..]).is_ok());
+        // padded rows: the last one ends right after its pixels
+        let padded = YuvLayout { width: 64, height: 32, y_stride: 80, uv_stride: 40, uv_pixel_stride: 1 };
+        let (y, uv) = (vec![0u8; 31 * 80 + 64], vec![0u8; 15 * 40 + 32]);
+        let f = YuvFrame::new(padded, &y, &uv, &uv).unwrap();
+        assert_eq!(f.rgb_at(1000, 1000), f.rgb_at(63, 31));
+    }
+
+    #[test]
+    fn frame_rejects_bad_geometry_and_short_planes() {
+        let ok = YuvLayout::packed_planar(64, 32);
+        let (y, uv) = (vec![0u8; 64 * 32], vec![0u8; 32 * 16]);
+        let geometry = |l: YuvLayout| matches!(YuvFrame::new(l, &y, &uv, &uv), Err(FrameError::Geometry { .. }));
+        assert!(geometry(YuvLayout { width: 8, ..ok }));
+        assert!(geometry(YuvLayout { height: 31, ..ok }));
+        assert!(geometry(YuvLayout { y_stride: 63, ..ok }));
+        assert!(geometry(YuvLayout { uv_pixel_stride: 0, ..ok }));
+        assert!(geometry(YuvLayout { uv_pixel_stride: 3, ..ok }));
+        assert!(geometry(YuvLayout { uv_stride: 31, ..ok }));
+        assert!(geometry(YuvLayout { width: 1 << 40, ..ok }));
+
+        let short = YuvFrame::new(ok, &y[1..], &uv, &uv);
+        assert!(matches!(short, Err(FrameError::PlaneTooShort { plane: Plane::Y, .. })));
+        let short = YuvFrame::new(ok, &y, &uv, &uv[1..]);
+        assert!(matches!(short, Err(FrameError::PlaneTooShort { plane: Plane::V, .. })));
+        // a stride whose size overflows usize is refused, not wrapped
+        let huge = YuvLayout { y_stride: usize::MAX / 2, ..ok };
+        assert!(matches!(YuvFrame::new(huge, &y, &uv, &uv), Err(FrameError::PlaneTooShort { need: None, .. })));
+    }
+
+    /// RMS error (px) of the detected centre of a slightly tilted, Gaussian
+    /// red stripe of `sigma` px on a grey surface, rendered at several
+    /// sub-pixel offsets. `gain` drives red past 255 (clipping); `bleed` is
+    /// the share of it that leaks into green and blue; `bg_red` tints the
+    /// surface red.
+    fn stripe_rms(gain: f64, bleed: f64, sigma: f64, bg_red: f64) -> f64 {
+        use crate::bench::sim::YuvImage;
+        let (w, h) = (1280usize, 64usize);
+        let mut det = LaserDetector::default();
+        let (mut sq, mut n) = (0.0, 0usize);
+        for k in 0..5 {
+            let centre = |u: f64| 32.0 + k as f64 * 0.2 + 0.013 + (u - 640.0) * 0.003;
+            let mut rgb = vec![0u8; w * h * 3];
+            for v in 0..h {
+                for u in 0..w {
+                    // 4x vertical supersampling
+                    let mut acc = [0.0; 3];
+                    for s in 0..4 {
+                        let d = v as f64 + (s as f64 + 0.5) / 4.0 - 0.5 - centre(u as f64);
+                        let g = gain * (-0.5 * (d / sigma).powi(2)).exp();
+                        let side = (140.0 + bleed * g).min(255.0);
+                        acc[0] += (140.0 + bg_red + g).min(255.0);
+                        acc[1] += side;
+                        acc[2] += side;
+                    }
+                    for (c, a) in acc.iter().enumerate() {
+                        rgb[(v * w + u) * 3 + c] = (a / 4.0).round() as u8;
+                    }
+                }
+            }
+            let img = YuvImage::from_rgb(&rgb, w, h);
+            let mut out = Vec::new();
+            assert!(det.detect(&img.frame().unwrap(), &Roi::full(w, h), &LaserParams::default(), &mut out));
+            for q in &out {
+                sq += (q[1] as f64 - centre(q[0] as f64)).powi(2);
+                n += 1;
+            }
+        }
+        (sq / n as f64).sqrt()
+    }
+
+    #[test]
+    fn a_clipped_stripe_keeps_its_centre() {
+        // the chroma response of a stripe clipping red has two flanks; a
+        // window fixed on the peak was off by ~0.3 px here
+        assert!(stripe_rms(600.0, 0.12, 2.0, 0.0) < 0.15);
+        // a wide clipped stripe: a fixed window held one flank only (~3.4 px)
+        assert!(stripe_rms(600.0, 0.12, 4.0, 0.0) < 0.5);
+    }
+
+    #[test]
+    fn a_reddish_surface_does_not_pull_the_centre_to_whole_pixels() {
+        // without the floor ~0.6 px
+        assert!(stripe_rms(150.0, 0.12, 1.5, 40.0) < 0.1);
     }
 }

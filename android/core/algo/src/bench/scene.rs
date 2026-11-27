@@ -11,9 +11,15 @@ use crate::geom::{V3, add, dot, norm, scale, sub};
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Shape {
-    Sphere { center: V3, radius: f64 },
+    Sphere {
+        center: V3,
+        radius: f64,
+    },
     /// Axis-aligned box between two corners.
-    Cuboid { min: V3, max: V3 },
+    Cuboid {
+        min: V3,
+        max: V3,
+    },
 }
 
 impl Shape {
@@ -203,11 +209,7 @@ impl Scene {
 
     /// Signed distance of `p` to the nearest solid's surface, and that solid.
     pub fn nearest_shape(&self, p: V3) -> Option<(f64, usize)> {
-        self.shapes
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.signed_distance(p), i))
-            .min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))
+        self.shapes.iter().enumerate().map(|(i, s)| (s.signed_distance(p), i)).min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))
     }
 }
 

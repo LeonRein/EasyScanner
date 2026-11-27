@@ -49,15 +49,7 @@ pub struct LaserParams {
 
 impl Default for LaserParams {
     fn default() -> Self {
-        Self {
-            color: LaserColor::Red,
-            thresh: 12,
-            min_sat: 40,
-            min_mass: 50.0,
-            min_points: 10,
-            max_points: 400,
-            frac: 0.4,
-        }
+        Self { color: LaserColor::Red, thresh: 12, min_sat: 40, min_mass: 50.0, min_points: 10, max_points: 400, frac: 0.4 }
     }
 }
 
@@ -82,11 +74,7 @@ impl YuvFrame<'_> {
         let yv = self.y[y * self.y_stride + x] as i32;
         let ci = (y >> 1) * self.uv_stride + (x >> 1) * self.uv_pixel_stride;
         let (ar, ag, ab) = chroma_offsets(self.u[ci], self.v[ci]);
-        [
-            (yv + ar).clamp(0, 255) as u8,
-            (yv + ag).clamp(0, 255) as u8,
-            (yv + ab).clamp(0, 255) as u8,
-        ]
+        [(yv + ar).clamp(0, 255) as u8, (yv + ag).clamp(0, 255) as u8, (yv + ab).clamp(0, 255) as u8]
     }
 }
 
@@ -253,14 +241,7 @@ impl LaserDetector {
         self.detect_color(f, roi, p, p.color, out)
     }
 
-    fn detect_color(
-        &mut self,
-        f: &YuvFrame,
-        roi: &Roi,
-        p: &LaserParams,
-        color: LaserColor,
-        out: &mut Vec<[f32; 2]>,
-    ) -> bool {
+    fn detect_color(&mut self, f: &YuvFrame, roi: &Roi, p: &LaserParams, color: LaserColor, out: &mut Vec<[f32; 2]>) -> bool {
         let (w, h) = (f.width, f.height);
         let tol = Tolerances::for_frame(w, h, p);
         let y0 = roi.y0.min(h);
@@ -332,13 +313,7 @@ impl LaserDetector {
                         let v16 = 3 * band.v4[cx] as i32 + band.v4[nx] as i32;
                         let (ar, ag, ab) = chroma_offsets_16(u16, v16);
                         let yv = y_row[x] as i32;
-                        let v = response(
-                            (yv + ar).clamp(0, 255),
-                            (yv + ag).clamp(0, 255),
-                            (yv + ab).clamp(0, 255),
-                            color,
-                            min_sat,
-                        );
+                        let v = response((yv + ar).clamp(0, 255), (yv + ag).clamp(0, 255), (yv + ab).clamp(0, 255), color, min_sat);
                         if v != 0 {
                             row_out[x] = v;
                             band.hist[v as usize] += 1;
@@ -556,10 +531,7 @@ mod tests {
         let mut out = Vec::new();
         assert!(det.detect(&img.frame(), &Roi::full(640, 480), &LaserParams::default(), &mut out));
         assert!(out.len() >= 300, "only {} points", out.len());
-        let worst = out
-            .iter()
-            .map(|p| (p[1] as f64 - (200.3 + 0.05 * p[0] as f64)).abs())
-            .fold(0.0, f64::max);
+        let worst = out.iter().map(|p| (p[1] as f64 - (200.3 + 0.05 * p[0] as f64)).abs()).fold(0.0, f64::max);
         assert!(worst < 0.6, "worst centre error {worst} px");
     }
 
@@ -580,9 +552,7 @@ mod tests {
     #[test]
     fn scattered_specks_are_rejected() {
         // isolated red dots on a regular lattice never form a chain
-        let img = TestImage::new(400, 300, |x, y| {
-            if x % 37 == 0 && y % 41 == 0 { [255, 0, 0] } else { [80, 80, 80] }
-        });
+        let img = TestImage::new(400, 300, |x, y| if x % 37 == 0 && y % 41 == 0 { [255, 0, 0] } else { [80, 80, 80] });
         let mut det = LaserDetector::default();
         let mut out = Vec::new();
         assert!(!det.detect(&img.frame(), &Roi::full(400, 300), &LaserParams::default(), &mut out));
@@ -609,16 +579,7 @@ mod tests {
             uv.push(*u);
             uv.push(*v);
         }
-        let nv12 = YuvFrame {
-            width: 256,
-            height: 128,
-            y: &img.y,
-            y_stride: 256,
-            u: &uv,
-            v: &uv[1..],
-            uv_stride: 256,
-            uv_pixel_stride: 2,
-        };
+        let nv12 = YuvFrame { width: 256, height: 128, y: &img.y, y_stride: 256, u: &uv, v: &uv[1..], uv_stride: 256, uv_pixel_stride: 2 };
         let mut det = LaserDetector::default();
         let (mut a, mut b) = (Vec::new(), Vec::new());
         assert!(det.detect(&img.frame(), &Roi::full(256, 128), &LaserParams::default(), &mut a));

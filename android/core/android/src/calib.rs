@@ -6,9 +6,9 @@
 
 use std::thread::JoinHandle;
 
+use opencv::calib3d;
 use opencv::core::{self, Mat, Point2f, Point3f, Size, TermCriteria, Vector};
 use opencv::prelude::*;
-use opencv::calib3d;
 use scan_algo::config::{BoardSpec, intrinsics_plausible};
 use scan_algo::geom::Intrinsics;
 
@@ -148,10 +148,7 @@ fn solve(
         }
     }
     if obj_all.len() < min_views {
-        return Ok(Outcome::Rejected {
-            rms: f64::INFINITY,
-            reason: format!("only {} usable views of {min_views}", obj_all.len()),
-        });
+        return Ok(Outcome::Rejected { rms: f64::INFINITY, reason: format!("only {} usable views of {min_views}", obj_all.len()) });
     }
 
     // Seed with the camera's own estimate when it is sane, else the classic

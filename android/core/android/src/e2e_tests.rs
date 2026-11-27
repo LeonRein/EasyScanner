@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use opencv::core::{self, Mat, Scalar, Size};
-use opencv::prelude::*;
 use opencv::imgproc;
+use opencv::prelude::*;
 use scan_algo::config::{self, BoardSpec};
 use scan_algo::gate::Reject;
 use scan_algo::geom::{Intrinsics, M3, Pose, V3, dot, mat_mul, mat_vec, normalize, rodrigues, sub};
@@ -47,10 +47,7 @@ fn spec() -> BoardSpec {
 /// about the view axis.
 fn pose(dist: f64, ax: f64, ay: f64, spin: f64, off: [f64; 2]) -> Pose {
     let c = [spec().width_mm() / 2.0, spec().height_mm() / 2.0, 0.0];
-    let r: M3 = mat_mul(
-        &rodrigues([0.0, 0.0, spin]),
-        &mat_mul(&rodrigues([ax, 0.0, 0.0]), &rodrigues([0.0, ay, 0.0])),
-    );
+    let r: M3 = mat_mul(&rodrigues([0.0, 0.0, spin]), &mat_mul(&rodrigues([ax, 0.0, 0.0]), &rodrigues([0.0, ay, 0.0])));
     let t = sub([off[0], off[1], dist], mat_vec(&r, c));
     Pose { r, t }
 }
@@ -83,11 +80,8 @@ impl Renderer {
         let (w, hh) = (k.width as usize, k.height as usize);
         let s = BOARD_PX as f64 / spec().width_mm();
         let kk: M3 = [[k.fx, 0.0, k.cx], [0.0, k.fy, k.cy], [0.0, 0.0, 1.0]];
-        let rt: M3 = [
-            [pose.r[0][0], pose.r[0][1], pose.t[0]],
-            [pose.r[1][0], pose.r[1][1], pose.t[1]],
-            [pose.r[2][0], pose.r[2][1], pose.t[2]],
-        ];
+        let rt: M3 =
+            [[pose.r[0][0], pose.r[0][1], pose.t[0]], [pose.r[1][0], pose.r[1][1], pose.t[1]], [pose.r[2][0], pose.r[2][1], pose.t[2]]];
         let hb = mat_mul(&kk, &rt); // board mm → frame px
         let m = mat_mul(&hb, &[[1.0 / s, 0.0, 0.0], [0.0, 1.0 / s, 0.0], [0.0, 0.0, 1.0]]);
         let m_mat = Mat::from_slice_2d(&m).unwrap();
@@ -246,7 +240,11 @@ fn pose_matches_the_rendered_board() {
         let err = scan_algo::geom::norm(sub(got, truth));
         eprintln!(
             "view {i}: {} corners, cam err {err:.2} mm, rms {:.3} px, margin {:.1}, {:.1} ms (board {:.1})",
-            out[h::N_CORNERS], out[h::REPROJ_RMS], out[h::POSE_MARGIN], out[h::T_TOTAL_MS], out[h::T_BOARD_MS]
+            out[h::N_CORNERS],
+            out[h::REPROJ_RMS],
+            out[h::POSE_MARGIN],
+            out[h::T_TOTAL_MS],
+            out[h::T_BOARD_MS]
         );
         assert!(err < 1.5, "view {i}: camera position off by {err:.2} mm ({got:?} vs {truth:?})");
         assert!(out[h::REPROJ_RMS] < 0.5);
@@ -264,10 +262,7 @@ fn laser_plane_calibration_recovers_the_plane_and_scan_classifies() {
     for (i, p) in viewpoints(40).iter().enumerate() {
         let yuv = r.render(&k, p, Some((n_true, d_true)));
         let out = step(&mut e, &yuv);
-        eprintln!(
-            "view {i}: laser {} pts, lines {}, spread {:.2}",
-            out[h::LASER_POINTS], out[h::PLANE_LINES], out[h::PLANE_SPREAD]
-        );
+        eprintln!("view {i}: laser {} pts, lines {}, spread {:.2}", out[h::LASER_POINTS], out[h::PLANE_LINES], out[h::PLANE_SPREAD]);
         if out[h::EVENTS] as u32 & ev::PLANE_SAVED != 0 {
             saved = true;
             break;
@@ -323,7 +318,15 @@ fn live_calibration_converges_from_a_wrong_guess() {
     }
     assert!(saved, "calibration never saved: {}", e.messages());
     let f = config::load_intrinsics(&dir, "test").unwrap();
-    eprintln!("calibrated fx {:.2} fy {:.2} cx {:.2} cy {:.2} rms {:?} in {:.1}s", f.fx, f.fy, f.cx, f.cy, f.rms_px, start.elapsed().as_secs_f64());
+    eprintln!(
+        "calibrated fx {:.2} fy {:.2} cx {:.2} cy {:.2} rms {:?} in {:.1}s",
+        f.fx,
+        f.fy,
+        f.cx,
+        f.cy,
+        f.rms_px,
+        start.elapsed().as_secs_f64()
+    );
     assert!((f.fx / k.fx - 1.0).abs() < 0.005, "fx {}", f.fx);
     assert!((f.fy / k.fy - 1.0).abs() < 0.005, "fy {}", f.fy);
     assert!((f.cx - k.cx).abs() < 3.0 && (f.cy - k.cy).abs() < 3.0);
@@ -397,11 +400,8 @@ fn photo_keyframes_carry_the_pose_of_their_exposure() {
     let msg = e.command(cmd::PHOTOS_STOP, "");
     assert!(msg.contains("2 in") && msg.contains("no laser cloud"), "{msg}");
 
-    let rows: Vec<serde_json::Value> = std::fs::read_to_string(session.join("photos.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let rows: Vec<serde_json::Value> =
+        std::fs::read_to_string(session.join("photos.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["pose_source"], "easyscanner:frame");
     assert_eq!(rows[1]["pose_source"], "easyscanner:interpolated");
@@ -521,10 +521,12 @@ fn gyro_and_row_timing_reach_the_pose() {
     for i in 0..12 {
         let ts = start + i * FRAME_NS;
         // a phone lying still: 200 Hz of zero rate up to the frame's end
-        let samples = std::iter::from_fn(|| (gyro_t <= ts + FRAME_NS).then(|| {
-            gyro_t += 5_000_000;
-            GyroSample { t_ns: gyro_t, rate: [0.0; 3] }
-        }));
+        let samples = std::iter::from_fn(|| {
+            (gyro_t <= ts + FRAME_NS).then(|| {
+                gyro_t += 5_000_000;
+                GyroSample { t_ns: gyro_t, rate: [0.0; 3] }
+            })
+        });
         e.push_gyro(samples.collect::<Vec<_>>());
         out = step_clocked(&mut e, &yuv, RowClock { start_ns: ts, readout_ns: 20_000_000, exposure_ns: 2_000_000, height: H as f64 });
         assert_eq!(out[h::DETECTED], 1.0, "frame {i}");

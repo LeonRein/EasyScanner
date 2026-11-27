@@ -45,10 +45,14 @@ pub fn board_grid(k: &Intrinsics, pose: &Pose, nx: usize, ny: usize, sq: f64, ou
     for j in 0..=ny {
         for i in 0..=nx {
             let p = [i as f64 * sq, j as f64 * sq, 0.0];
-            if i < nx && let Some(s) = segment(k, pose, p, [p[0] + sq, p[1], 0.0]) {
+            if i < nx
+                && let Some(s) = segment(k, pose, p, [p[0] + sq, p[1], 0.0])
+            {
                 out.push(s);
             }
-            if j < ny && let Some(s) = segment(k, pose, p, [p[0], p[1] + sq, 0.0]) {
+            if j < ny
+                && let Some(s) = segment(k, pose, p, [p[0], p[1] + sq, 0.0])
+            {
                 out.push(s);
             }
         }
@@ -69,11 +73,7 @@ pub fn board_outline(k: &Intrinsics, pose: &Pose, nx: usize, ny: usize, sq: f64,
 /// the camera (up out of the table) so it never points into the floor.
 pub fn axes(k: &Intrinsics, pose: &Pose, len: f64) -> [Option<[f32; 4]>; 3] {
     let o = [0.0; 3];
-    [
-        segment(k, pose, o, [len, 0.0, 0.0]),
-        segment(k, pose, o, [0.0, len, 0.0]),
-        segment(k, pose, o, [0.0, 0.0, pose.up_sign() * len]),
-    ]
+    [segment(k, pose, o, [len, 0.0, 0.0]), segment(k, pose, o, [0.0, len, 0.0]), segment(k, pose, o, [0.0, 0.0, pose.up_sign() * len])]
 }
 
 /// The working-volume wireframe, each edge split in `pieces`.
@@ -89,7 +89,9 @@ pub fn volume_edges(k: &Intrinsics, pose: &Pose, vol: &Volume, pieces: usize, ou
 pub fn project_points(k: &Intrinsics, pose: &Pose, pts: &[[f32; 3]], out: &mut Vec<[f32; 2]>) {
     for p in pts {
         let c = pose.to_cam([p[0] as f64, p[1] as f64, p[2] as f64]);
-        if c[2] > 1.0 && let Some(q) = k.project(c) {
+        if c[2] > 1.0
+            && let Some(q) = k.project(c)
+        {
             out.push([q[0] as f32, q[1] as f32]);
         }
     }

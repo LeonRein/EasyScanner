@@ -20,9 +20,18 @@ pub struct Volume {
 impl Volume {
     /// The 12 cube edges as pairs of [`Volume::corners`] indices.
     pub const EDGES: [(usize, usize); 12] = [
-        (0, 1), (2, 3), (4, 5), (6, 7), // vertical (z)
-        (0, 2), (1, 3), (4, 6), (5, 7), // along y
-        (0, 4), (1, 5), (2, 6), (3, 7), // along x
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7), // vertical (z)
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7), // along y
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7), // along x
     ];
 
     /// In-plane bounds `(x0, x1, y0, y1)`, board mm.

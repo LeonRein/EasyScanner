@@ -561,7 +561,7 @@ impl Engine {
         let classified = !self.plane_active && plane.is_some() && pose.is_some() && found;
         if let (true, Some((n, d)), Some(p)) = (classified, plane, pose) {
             let mut inside = vec![false; self.laser_px.len()];
-            let mut pushed = false;
+            let (mut pushed, mut full) = (false, false);
             // a frame that fails the gate is classified and shown, never kept
             let keep = self.scan_on && scan_verdict == Some(Ok(()));
             let (cloud, px, scan_on) = (&mut self.cloud, &self.laser_px, keep);
@@ -573,12 +573,21 @@ impl Engine {
                     inside[i] = true;
                     if scan_on {
                         let (u, v) = (px[i][0].round() as usize, px[i][1].round() as usize);
-                        cloud.push(b, f.rgb_at(u, v));
-                        pushed = true;
+                        if cloud.push(b, f.rgb_at(u, v)) {
+                            pushed = true;
+                        } else {
+                            full = true;
+                        }
                     }
                 }
             });
             self.cloud_unsaved |= pushed;
+            if full {
+                // stop rather than drop points unnoticed; the UI sees SCAN_ON fall
+                self.scan_on = false;
+                self.events |= ev::MESSAGES;
+                self.msgs.scan = format!("scan stopped: the point cloud is full ({} points) — export or clear it", self.cloud.len());
+            }
             if self.scan_on
                 && inside.iter().any(|&i| i)
                 && let Some(v) = scan_verdict

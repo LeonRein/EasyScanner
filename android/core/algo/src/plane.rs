@@ -2,7 +2,33 @@
 //! frame, mm) across board orientations and fit the plane `n·X = d` the
 //! rigidly mounted line laser sweeps. Port of the desktop prototype's `laser_plane.py`.
 
+use serde::Deserialize;
+
 use crate::geom::{M3, V3, add, cross, dot, mean_scatter, norm, scale, sub, sym3_eigen};
+
+/// When a laser-plane fit is good enough to save.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct PlaneFitCfg {
+    /// RANSAC inlier band (mm): a point farther from the candidate plane is
+    /// an outlier. The refit's RMS can never exceed this, so it also bounds
+    /// what `max_rms_mm` can see.
+    pub ransac_tol_mm: f64,
+    /// Inlier RMS above this (mm) rejects the fit.
+    pub max_rms_mm: f64,
+    /// Fewer than this share of the points inside the band rejects the fit:
+    /// many outliers mean bad poses or a wrong stripe, not a plane.
+    pub min_inlier_frac: f64,
+}
+
+impl Default for PlaneFitCfg {
+    fn default() -> Self {
+        // The old gate (RMS ≤ 6 mm over a 3 mm band, ≥ 40 % inliers) could
+        // never fail on RMS. The desktop prototype's real fit came out at
+        // 0.76 mm; 1.2 mm leaves headroom for a slightly noisier phone.
+        PlaneFitCfg { ransac_tol_mm: 2.5, max_rms_mm: 1.2, min_inlier_frac: 0.6 }
+    }
+}
 
 /// Small, fast, seedable PRNG (xorshift64*) for RANSAC sampling.
 #[derive(Clone, Debug)]
@@ -85,6 +111,7 @@ pub fn fit_plane_ransac(pts: &[V3], tol_mm: f64, iters: usize, rng: &mut Rng) ->
 #[derive(Clone, Debug)]
 pub struct PlaneCalibrator {
     pub min_lines: usize,
+    pub fit: PlaneFitCfg,
     pub max_points: usize,
     pub line_min_pts: usize,
     pub dup_angle_deg: f64,
@@ -95,6 +122,8 @@ pub struct PlaneCalibrator {
     sum: V3,
     sum_sq: M3,
     pub last_rms: Option<f64>,
+    /// Inlier share of the last fit.
+    pub last_inlier_frac: Option<f64>,
     rng: Rng,
 }
 
@@ -102,6 +131,7 @@ impl PlaneCalibrator {
     pub fn new(min_lines: usize) -> Self {
         PlaneCalibrator {
             min_lines,
+            fit: PlaneFitCfg::default(),
             max_points: 20_000,
             line_min_pts: 8,
             dup_angle_deg: 4.0,
@@ -111,6 +141,7 @@ impl PlaneCalibrator {
             sum: [0.0; 3],
             sum_sq: [[0.0; 3]; 3],
             last_rms: None,
+            last_inlier_frac: None,
             rng: Rng::new(0x9E37_79B9_7F4A_7C15),
         }
     }
@@ -155,6 +186,7 @@ impl PlaneCalibrator {
         self.sum = [0.0; 3];
         self.sum_sq = [[0.0; 3]; 3];
         self.last_rms = None;
+        self.last_inlier_frac = None;
     }
 
     pub fn n_lines(&self) -> usize {
@@ -189,7 +221,7 @@ impl PlaneCalibrator {
     }
 
     /// Fit + validate. `force` accepts the best fit even when it fails the
-    /// quality gate (residual ≤ 6 mm, ≥ 40 % inliers).
+    /// quality gate ([`PlaneFitCfg`]: inlier RMS and inlier share).
     pub fn solve(&mut self, force: bool) -> Option<PlaneFit> {
         if self.n_lines() < 3 {
             return None;
@@ -205,12 +237,18 @@ impl PlaneCalibrator {
         } else {
             self.pts.clone()
         };
-        let fit = fit_plane_ransac(&sample, 3.0, 250, &mut self.rng)?;
+        let fit = fit_plane_ransac(&sample, self.fit.ransac_tol_mm, 250, &mut self.rng)?;
         self.last_rms = Some(fit.rms_mm);
-        if !force && (fit.rms_mm > 6.0 || (fit.inliers as f64) < 0.4 * sample.len() as f64) {
+        self.last_inlier_frac = Some(fit.inliers as f64 / sample.len() as f64);
+        if !force && !self.acceptable(&fit, sample.len()) {
             return None;
         }
         Some(fit)
+    }
+
+    /// The fit passes the quality gate.
+    pub fn acceptable(&self, fit: &PlaneFit, n_points: usize) -> bool {
+        fit.rms_mm <= self.fit.max_rms_mm && (fit.inliers as f64) >= self.fit.min_inlier_frac * n_points as f64
     }
 }
 
@@ -266,6 +304,47 @@ mod tests {
         assert!(cal.ready());
         let fit = cal.solve(false).unwrap();
         assert!(dot(fit.n, n).abs() > 0.999);
+    }
+
+    /// Lines on the plane with Gaussian-ish depth noise of about `sigma` mm.
+    fn noisy_calibrator(sigma: f64, outliers: usize) -> PlaneCalibrator {
+        let n = normalize([0.8, -0.2, -0.5]).unwrap();
+        let mut rng = Rng::new(11);
+        let mut cal = PlaneCalibrator::new(5);
+        for k in 0..8 {
+            let mut line = plane_line(n, -160.0, [1.0, k as f64 * 0.4, 0.2], k as f64 * 18.0, &mut rng);
+            for p in &mut line {
+                // sum of 4 uniforms ≈ normal, std = sigma
+                let g: f64 = (0..4).map(|_| rng.below(1_000_000) as f64 / 1e6 - 0.5).sum::<f64>() * (3.0f64).sqrt();
+                *p = add(*p, scale(n, g * sigma));
+            }
+            cal.add(&line);
+        }
+        for i in 0..outliers {
+            let f = i as f64;
+            cal.pts.push([f * 3.0 % 200.0 - 100.0, (f * 7.0) % 150.0 - 75.0, 400.0 + (f * 13.0) % 200.0]);
+        }
+        cal
+    }
+
+    #[test]
+    fn plane_gate_accepts_a_clean_fit_and_rejects_noise_and_outliers() {
+        let mut clean = noisy_calibrator(0.3, 0);
+        assert!(clean.solve(false).is_some(), "rms {:?}", clean.last_rms);
+
+        // ~2 mm depth noise: a fit that the old 6 mm gate let through
+        let mut noisy = noisy_calibrator(2.0, 0);
+        assert!(noisy.solve(false).is_none(), "rms {:?}", noisy.last_rms);
+        assert!(noisy.last_rms.unwrap() > PlaneFitCfg::default().max_rms_mm);
+        let old = PlaneFitCfg { ransac_tol_mm: 3.0, max_rms_mm: 6.0, min_inlier_frac: 0.4 };
+        noisy.fit = old;
+        assert!(noisy.solve(false).is_some(), "the old thresholds accepted it");
+        assert!(noisy_calibrator(2.0, 0).solve(true).is_some(), "force still saves");
+
+        // half the points off the plane
+        let mut cal = noisy_calibrator(0.3, 480);
+        assert!(cal.solve(false).is_none());
+        assert!(cal.last_inlier_frac.unwrap() < 0.6, "{:?}", cal.last_inlier_frac);
     }
 
     #[test]

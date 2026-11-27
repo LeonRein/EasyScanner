@@ -14,6 +14,7 @@ use opencv::core::{self, Mat, Scalar, Size};
 use opencv::prelude::*;
 use opencv::imgproc;
 use scan_algo::config::{self, BoardSpec};
+use scan_algo::gate::Reject;
 use scan_algo::geom::{Intrinsics, M3, Pose, V3, dot, mat_mul, mat_vec, normalize, rodrigues, sub};
 use scan_algo::laser::YuvFrame;
 
@@ -455,4 +456,48 @@ fn opencv_exceptions_become_errors() {
     // cv::Exception would terminate the process instead of returning Err
     let m = Mat::new_rows_cols_with_default(10, 10, core::CV_8UC1, Scalar::all(0.0)).unwrap();
     assert!(Mat::roi(&m, core::Rect::new(5, 5, 20, 20)).is_err());
+}
+
+#[test]
+fn scan_gate_keeps_steady_frames_and_rejects_fast_motion() {
+    let k = truth_k();
+    let (n_true, d_true) = truth_plane();
+    let (mut e, dir) = engine("gate", k);
+    let plane = config::SavedPlane { n: n_true, d: d_true, k: Some(k) };
+    config::save_plane(&dir, "test", &plane, 0.3, 1000).unwrap();
+    e.configure(&format!(
+        r#"{{"camera":{{"id":"test","guess":{{"fx":{},"fy":{},"cx":{},"cy":{},"dist":[0,0,0,0,0],"width":{},"height":{}}}}}}}"#,
+        k.fx, k.fy, k.cx, k.cy, k.width, k.height
+    ))
+    .unwrap();
+    assert!(!e.command(cmd::SCAN_START, "").contains("first"), "{}", e.messages());
+    let r = Renderer::new();
+
+    // the board just came into view: no speed yet, the frame waits
+    let still = r.render(&k, &pose(500.0, 0.3, -0.25, 0.1, [0.0, 0.0]), Some((n_true, d_true)));
+    let out = step(&mut e, &still);
+    assert_eq!(out[h::DETECTED], 1.0);
+    assert_eq!(out[h::SCAN_GATE] as i32, Reject::Settling as i32);
+    // held still for a few frames: kept
+    let mut out = out;
+    for _ in 0..8 {
+        out = step(&mut e, &still);
+    }
+    assert!(out[h::CAM_SPEED] < 5.0, "speed {}", out[h::CAM_SPEED]);
+    assert_eq!(out[h::SCAN_GATE], 0.0, "a steady, well-posed frame is kept");
+
+    // a 6 cm jump between frames 33 ms apart: far beyond any hand sweep
+    let jumped = r.render(&k, &pose(500.0, 0.3, -0.25, 0.1, [60.0, 0.0]), Some((n_true, d_true)));
+    let out = step(&mut e, &jumped);
+    assert!(out[h::CAM_SPEED] > 120.0, "speed {}", out[h::CAM_SPEED]);
+    assert_eq!(out[h::SCAN_GATE] as i32, Reject::Moving as i32);
+
+    // switched off, the same frame passes
+    e.configure(&format!(
+        r#"{{"scan_gate":{{"enabled":false}},"camera":{{"id":"test","guess":{{"fx":{},"fy":{},"cx":{},"cy":{},"dist":[0,0,0,0,0],"width":{},"height":{}}}}}}}"#,
+        k.fx, k.fy, k.cx, k.cy, k.width, k.height
+    ))
+    .unwrap();
+    let out = step(&mut e, &still);
+    assert_eq!(out[h::SCAN_GATE], 0.0);
 }

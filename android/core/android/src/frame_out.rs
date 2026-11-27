@@ -67,7 +67,14 @@ pub mod h {
     /// a laser plane is saved but was fitted with another camera model
     pub const PLANE_STALE: usize = 53;
     pub const N_MARKERS: usize = 54;
-    pub const LEN: usize = 55;
+    /// this frame's scan-gate verdict: 0 kept, else `scan_algo::gate::Reject`
+    /// (1 pose RMS, 2 few corners, 3 ambiguous pose, 4 moving, 5 settling);
+    /// NaN without a board pose
+    pub const SCAN_GATE: usize = 55;
+    /// posed frames with a stripe in the volume the gate kept / rejected since the scan started
+    pub const GATE_KEPT: usize = 56;
+    pub const GATE_REJECTED: usize = 57;
+    pub const LEN: usize = 58;
 }
 
 /// One-shot event bits in `h::EVENTS`.

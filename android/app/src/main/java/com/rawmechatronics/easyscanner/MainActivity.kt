@@ -359,6 +359,12 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             else -> "none"
         }
         sb.append("plane: %s  cloud %d pts %.1f MB".format(plane, f(H.CLOUD_POINTS).toInt(), f(H.CLOUD_MB)))
+        if (r.flag(H.SCAN_ON)) {
+            val kept = f(H.GATE_KEPT).toInt()
+            val rejected = f(H.GATE_REJECTED).toInt()
+            sb.append("\nframes kept %d / rejected %d".format(kept, rejected))
+            if (has(H.SCAN_GATE)) sb.append("  now: %s".format(FrameResult.Gate.label(f(H.SCAN_GATE).toInt())))
+        }
         val photoState = f(H.PHOTO_STATE).toInt()
         if (photoState != Photo.OFF) {
             sb.append("\nphotos %d  %s".format(f(H.PHOTO_COUNT).toInt(), photoStateLabel(photoState)))

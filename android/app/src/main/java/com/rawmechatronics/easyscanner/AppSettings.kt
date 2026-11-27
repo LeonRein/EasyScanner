@@ -36,6 +36,8 @@ data class AppSettings(
     val recordSessions: Boolean,
     /** The four tool modes instead of the guided steps. */
     val expertMode: Boolean,
+    /** The core's numbers over the camera picture. */
+    val debugOverlay: Boolean,
     /** [board] as last confirmed in the guided Board step, or null. */
     val boardConfirmed: String?,
 ) {
@@ -123,6 +125,9 @@ data class AppSettings(
     }.toString()
 
     companion object {
+        /** Preference key of [debugOverlay], which the scanner screen also toggles. */
+        const val KEY_DEBUG_OVERLAY = "debug_overlay"
+
         fun load(ctx: Context): AppSettings {
             val p = PreferenceManager.getDefaultSharedPreferences(ctx)
             fun str(k: String, d: String) = p.getString(k, d) ?: d
@@ -175,6 +180,7 @@ data class AppSettings(
                 ),
                 recordSessions = p.getBoolean("record_sessions", true),
                 expertMode = p.getBoolean("expert_mode", false),
+                debugOverlay = p.getBoolean(KEY_DEBUG_OVERLAY, false),
                 boardConfirmed = p.getString("board_confirmed", null),
             )
         }

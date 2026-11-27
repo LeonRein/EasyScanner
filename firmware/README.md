@@ -18,18 +18,20 @@ The module's gate pull-down keeps the laser off while the ESP32 boots.
 The firmware is written in Rust (`esp-hal`) and speaks
 [`laser-link`](../protocol/laser-link/src/lib.rs) over the chip's built-in
 USB Serial/JTAG port, which the phone sees as a CDC-ACM serial port:
-typed postcard messages with a CRC-16 in COBS frames, a version handshake,
-request ids and typed errors. The behaviour is `laser_link::Device`, tested
-on the host:
+typed postcard messages with a CRC-16 in COBS frames, a version handshake
+(major must match; minor versions add commands, and a command the firmware
+does not know is answered with `UnknownCommand`), request ids and typed
+errors. The behaviour is `laser_link::Device`, tested on the host:
 
 | State | Laser | Leaves it |
 |---|---|---|
-| *Standalone* (after power-up) | **on**: a scan needs nothing but the cable | `Hello` with the same protocol version |
-| *Session* | as the app sets it | no request for 1 s (watchdog) |
+| *Standalone* (after power-up) | **on**: a scan needs nothing but the cable | `Hello` with the same major protocol version |
+| *Session* | as the app sets it | no request for 1 s (watchdog; the app sends one at least every 330 ms) |
 | *Lost* | **off**: an app that crashed leaves no laser shining | a new `Hello` |
 
-The app does not open a session yet, so for now the laser is simply on
-whenever the scanner is plugged in.
+If the firmware ever panics, it switches the laser off and halts until the
+board is unplugged. The app does not open a session yet, so for now the
+laser is simply on whenever the scanner is plugged in.
 
 ### Flashing
 
@@ -47,7 +49,7 @@ Building it yourself needs Espressif's Xtensa Rust toolchain:
 ```sh
 cargo install espup && espup install                 # then source ~/export-esp.sh
 cd firmware/laser-switch
-cargo run --release                                  # builds, flashes and opens the monitor
+cargo run --release                                  # builds and flashes
 ```
 
 If the board is not found, hold BOOT while plugging it in, flash, then

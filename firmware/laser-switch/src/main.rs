@@ -5,19 +5,22 @@
 //! `laser-link` (`protocol/laser-link`) over its built-in USB Serial/JTAG
 //! port, a CDC-ACM serial port to the phone. What the switch does lives in
 //! [`laser_link::Device`]; this file only moves bytes, keeps the time and
-//! sets the pin.
+//! sets the pin. Nothing else writes to the port: no logging, so the host
+//! only ever reads frames.
 
 #![no_std]
 #![no_main]
 
-use esp_backtrace as _;
+use core::panic::PanicInfo;
+
 use esp_hal::Blocking;
 use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::peripherals::GPIO1;
 use esp_hal::time::Instant;
 use esp_hal::usb::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagTx};
 use laser_link::device::Millis;
 use laser_link::frame::MAX_FRAME;
-use laser_link::{Device, DeviceConfig, Event, FirmwareVersion, FrameDecoder, FromDevice, Laser, Request, encode};
+use laser_link::{Device, DeviceConfig, Event, FirmwareVersion, FrameDecoder, FromDevice, Laser, encode};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -31,25 +34,41 @@ const TX_TIMEOUT_MS: Millis = 20;
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let mut device = Device::new(DeviceConfig { firmware: FIRMWARE_VERSION, watchdog_ms: WATCHDOG_MS });
-    // GPIO 1 → the MOSFET module's signal input; starts in the device's state (on)
+    // the MOSFET module's signal input; starts in the device's state (on)
     let mut laser = Output::new(peripherals.GPIO1, level(device.laser()), OutputConfig::default());
     let (mut rx, mut tx) = UsbSerialJtag::new(peripherals.USB_DEVICE).split();
     let mut decoder = FrameDecoder::new();
 
     loop {
-        while let Ok(byte) = rx.read_byte() {
-            let reply = match decoder.push::<Request>(byte) {
-                None => continue,
-                Some(Ok(request)) => device.handle(request, now_ms()),
-                Some(Err(e)) => FromDevice::Event(Event::FrameRejected(e)),
+        if let Ok(byte) = rx.read_byte() {
+            let reply = match decoder.push_payload(byte) {
+                None => None,
+                Some(Ok(payload)) => Some(device.receive(payload, now_ms())),
+                Some(Err(e)) => Some(FromDevice::Event(Event::FrameRejected(e))),
             };
-            laser.set_level(level(device.laser()));
-            send(&mut tx, &reply);
+            if let Some(reply) = reply {
+                laser.set_level(level(device.laser()));
+                send(&mut tx, &reply);
+            }
         }
+        // after every byte, so a stream of bytes cannot hold off the watchdog
         if let Some(event) = device.poll(now_ms()) {
             laser.set_level(level(device.laser()));
             send(&mut tx, &FromDevice::Event(event));
         }
+    }
+}
+
+/// A bug in the firmware: switch the laser off and stop. The board stays
+/// halted until it is unplugged, rather than restarting into
+/// [`laser_link::Link::Standalone`] with the laser on.
+#[panic_handler]
+fn panic(_: &PanicInfo) -> ! {
+    // SAFETY: `main` never runs again, so this is the only user of the pin from here on.
+    let pin = unsafe { GPIO1::steal() };
+    let _off = Output::new(pin, Level::Low, OutputConfig::default());
+    loop {
+        core::hint::spin_loop();
     }
 }
 

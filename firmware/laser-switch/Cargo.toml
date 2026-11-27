@@ -8,8 +8,6 @@ description = "EasyScanner's laser switch: an ESP32-S3 on the scanner, powered a
 [dependencies]
 laser-link = { path = "../../protocol/laser-link" }
 esp-hal = { version = "1.2", features = ["esp32s3", "unstable"] }
-esp-backtrace = { version = "0.20", features = ["esp32s3", "panic-handler", "println"] }
-esp-println = { version = "0.18", features = ["esp32s3"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32s3"] }
 nb = "1.1"
 

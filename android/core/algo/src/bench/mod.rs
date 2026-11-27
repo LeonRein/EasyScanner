@@ -11,8 +11,8 @@
 //!    reported frame timing, the phone's gyroscope (noise, bias, scale,
 //!    jitter, clock offset, mount), a wrong camera calibration, and the
 //!    app's laser-plane calibration replayed on simulated board stripes.
-//! 2. The result is a [`recording::Recording`] — the same format a real phone
-//!    session can be saved in — with the ground truth attached.
+//! 2. The result is a [`crate::recording::Recording`] — the same format a real phone
+//!    session is saved in — with the ground truth beside it ([`truth`]).
 //! 3. [`reconstruct`] turns a recording into a cloud with the engine's steps
 //!    (gyro fusion and rolling-shutter correction, pose from the corners,
 //!    stripe ∩ laser plane, working-volume test).
@@ -28,25 +28,27 @@
 pub mod metrics;
 pub mod pnp;
 pub mod reconstruct;
-pub mod recording;
 pub mod scene;
 pub mod sim;
+pub mod truth;
 
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::fusion::FusionCfg;
+use crate::gate::ScanGateCfg;
 use crate::geom::{Intrinsics, Pose, V3, dot, mat_vec, rodrigues};
 use crate::plane::Rng;
 use crate::plane::{PlaneCalibrator, PlaneFit};
+use crate::recording::{BoardDims, CameraModel, CornerRec, FrameRec, Header, PlaneRec, Recording, Setup, VolumeDims};
 use crate::stripe;
 
 use metrics::Report;
-use reconstruct::{PoseFrom, Reconstruction};
-use recording::{CornerRec, FrameRec, PlaneRec, Recording, Truth, VolumeDims};
-use scene::{BoardDims, Scene, Shape};
-use sim::{Camera, CameraModel, GyroModel, IntrinsicsError, LaserMount, StripeModel, TimingError, Trajectory, look_at, uniform};
+use reconstruct::{Reconstruction, ReplayCfg};
+use scene::{Scene, Shape};
+use sim::{Camera, GyroModel, IntrinsicsError, LaserMount, StripeModel, TimingError, Trajectory, look_at, uniform};
+use truth::{Synthetic, Truth};
 
 /// Which laser plane the reconstruction uses.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -256,7 +258,7 @@ pub fn calibrate_plane(cfg: &BenchCfg, frames: usize, min_lines: usize) -> Resul
 }
 
 /// Simulate the scan described by `cfg` into a recording with its truth.
-pub fn simulate(cfg: &BenchCfg) -> Result<Recording, String> {
+pub fn simulate(cfg: &BenchCfg) -> Result<Synthetic, String> {
     let scene = Scene { board: cfg.board, shapes: cfg.shapes.clone() };
     let (tn, td) = cfg.laser.plane();
     let used = match cfg.plane {
@@ -287,9 +289,12 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Recording, String> {
             ts_ns: ns(t - 0.5 * exposure_s + cfg.timing.timestamp_shift_ms * 1e-3),
             readout_ns: ns(readout_s * (1.0 + cfg.timing.readout_rel)),
             exposure_ns: ns(exposure_s),
+            width: cfg.camera.width as u32,
+            height: cfg.camera.height as u32,
             pose: None,
+            scan: None,
             corners: obs.corners.iter().map(|&(id, q)| CornerRec { id, u: q[0], v: q[1] }).collect(),
-            laser_px: obs.laser_px,
+            laser_px: obs.laser_px.into(),
         });
         // the true middle row, whatever the reported timing says
         poses.push(traj(t + 0.5 * readout_s).into());
@@ -298,28 +303,25 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Recording, String> {
         let end = cfg.trajectory.duration_s + readout_s + 0.1;
         g.sample(&cfg.trajectory, end, &mut Rng::new(cfg.seed ^ 0x6E70))
     });
-    Ok(Recording {
-        version: Recording::VERSION,
-        source: format!("synthetic: {}", cfg.name),
-        board: cfg.board,
-        volume: cfg.volume,
-        intrinsics: cfg.intrinsics_error.apply(cfg.camera),
-        laser_plane: used,
+    let recording = Recording {
+        header: Header {
+            source: format!("synthetic: {}", cfg.name),
+            board: cfg.board,
+            volume: cfg.volume,
+            cam_from_imu: cfg.gyro.map(|g| g.platform_mount()),
+            fusion: cfg.fusion,
+            scan_gate: ScanGateCfg::default(),
+        },
+        setups: vec![(0, Setup { intrinsics: cfg.intrinsics_error.apply(cfg.camera), laser_plane: Some(used) })],
         frames,
-        cam_from_imu: cfg.gyro.map(|g| g.platform_mount()),
         gyro,
-        truth: Some(Truth {
-            scene,
-            intrinsics: cfg.camera,
-            laser_plane: PlaneRec { n: tn, d: td },
-            poses,
-            gyro: cfg.gyro.map(|g| g.calib()),
-        }),
-    })
+    };
+    let truth = Truth { scene, intrinsics: cfg.camera, laser_plane: PlaneRec { n: tn, d: td }, poses, gyro: cfg.gyro.map(|g| g.calib()) };
+    Ok(Synthetic { recording, truth })
 }
 
 pub struct Outcome {
-    pub recording: Recording,
+    pub synthetic: Synthetic,
     pub reconstruction: Reconstruction,
     pub report: Report,
 }
@@ -327,16 +329,19 @@ pub struct Outcome {
 /// Simulate, reconstruct and score one scenario.
 pub fn run(cfg: &BenchCfg) -> Result<Outcome, String> {
     let t0 = Instant::now();
-    let recording = simulate(cfg)?;
-    let reconstruction = reconstruct::reconstruct(&recording, PoseFrom::Auto, &cfg.fusion);
-    let mut report = metrics::evaluate(&cfg.name, &recording, &reconstruction);
+    let synthetic = simulate(cfg)?;
+    let replay = ReplayCfg { fusion: cfg.fusion, ..ReplayCfg::default() };
+    let reconstruction = reconstruct::reconstruct(&synthetic.recording, &replay);
+    let mut report = metrics::evaluate(&cfg.name, &synthetic.recording, Some(&synthetic.truth), &reconstruction);
     report.runtime_s = t0.elapsed().as_secs_f64();
-    Ok(Outcome { recording, reconstruction, report })
+    Ok(Outcome { synthetic, reconstruction, report })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recording::PoseObs;
+    use reconstruct::PoseFrom;
 
     fn short(mut c: BenchCfg) -> BenchCfg {
         c.trajectory.duration_s = 4.0;
@@ -438,19 +443,38 @@ mod tests {
     }
 
     #[test]
-    fn recording_round_trips_through_json() {
-        let mut cfg = short(BenchCfg::default());
+    fn recorded_device_poses_are_trusted_and_drive_the_rolling_shutter_correction() {
+        let cfg = short(BenchCfg { rolling_shutter_ms: 20.0, gyro: Some(GyroModel::default()), ..BenchCfg::default() });
+        let Synthetic { mut recording, truth } = simulate(&cfg).unwrap();
+        // what a phone records: its (here: the true) pose with the fit it was trusted on
+        for (f, p) in recording.frames.iter_mut().zip(&truth.poses) {
+            f.pose = Some(PoseObs { r: p.r, t: p.t, reproj_rms: 0.3, margin: Some(10.0) });
+        }
+        let replay = ReplayCfg { pose_from: PoseFrom::Recorded, ..ReplayCfg::as_recorded(&recording) };
+        let r = reconstruct::reconstruct(&recording, &replay);
+        assert!(r.corrected_frames > recording.frames.len() / 2, "{} of {}", r.corrected_frames, recording.frames.len());
+        assert!(r.gyro_fit.is_some(), "the gyro calibrates against the recorded poses");
+    }
+
+    #[test]
+    fn a_synthetic_recording_and_its_truth_round_trip() {
+        let mut cfg = short(BenchCfg { gyro: Some(GyroModel::default()), ..BenchCfg::default() });
         cfg.trajectory.duration_s = 0.2;
-        let rec = simulate(&cfg).unwrap();
-        let json = serde_json::to_string(&rec).unwrap();
-        let back: Recording = serde_json::from_str(&json).unwrap();
+        let syn = simulate(&cfg).unwrap();
+        let path = std::env::temp_dir().join(format!("easyscanner-synthetic-{}.jsonl", std::process::id()));
+        syn.save(&path).unwrap();
+        let rec = Recording::load(&path).unwrap();
+        let truth = Truth::load_for(&path).unwrap().expect("saved next to it");
+        let _ = std::fs::remove_file(truth::truth_path(&path));
+        let _ = std::fs::remove_file(&path);
         // serde_json may round the last bit of a float: compare the content
-        assert_eq!(rec.frames.len(), back.frames.len());
-        assert_eq!(rec.truth.as_ref().unwrap().scene, back.truth.as_ref().unwrap().scene);
-        for (a, b) in rec.frames.iter().zip(&back.frames) {
-            assert_eq!(a.corners.len(), b.corners.len());
+        assert_eq!(rec.header, syn.recording.header);
+        assert_eq!(rec.frames.len(), syn.recording.frames.len());
+        assert_eq!(rec.gyro.len(), syn.recording.gyro.len());
+        assert_eq!(truth.scene, syn.truth.scene);
+        for (a, b) in syn.recording.frames.iter().zip(&rec.frames) {
             assert_eq!(a.laser_px, b.laser_px);
-            for (p, q) in a.corners.iter().zip(&b.corners) {
+            for (p, q) in a.corners.iter().zip(b.corners.iter()) {
                 assert!(p.id == q.id && (p.u - q.u).abs() < 1e-9 && (p.v - q.v).abs() < 1e-9);
             }
         }

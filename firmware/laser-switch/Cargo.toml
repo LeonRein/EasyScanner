@@ -1,0 +1,22 @@
+[package]
+name = "laser-switch"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "EasyScanner's laser switch: an ESP32-S3 on the scanner, powered and controlled by the phone over USB"
+
+[dependencies]
+laser-link = { path = "../../protocol/laser-link" }
+esp-hal = { version = "1.2", features = ["esp32s3", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.6", features = ["esp32s3"] }
+nb = "1.1"
+
+[profile.dev]
+# the firmware is small; an unoptimised build is needlessly slow
+opt-level = "s"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = 2

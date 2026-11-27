@@ -518,7 +518,7 @@ fn gyro_and_row_timing_reach_the_pose() {
                 GyroSample { t_ns: gyro_t, rate: [0.0; 3] }
             })
         });
-        e.push_gyro(samples.collect::<Vec<_>>());
+        e.push_gyro(&samples.collect::<Vec<_>>());
         out = step_clocked(&mut e, &yuv, RowClock { start_ns: ts, readout_ns: 20_000_000, exposure_ns: 2_000_000, height: H as f64 });
         assert_eq!(out[h::DETECTED], 1.0, "frame {i}");
     }

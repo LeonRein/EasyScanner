@@ -16,6 +16,7 @@ use crate::laser::{FrameError, LaserDetector, LaserParams, Roi, YuvFrame, YuvLay
 use crate::plane::Rng;
 
 use super::scene::Scene;
+use crate::recording::CameraModel;
 
 const TWO53: f64 = (1u64 << 53) as f64;
 
@@ -28,38 +29,6 @@ pub fn uniform(rng: &mut Rng) -> f64 {
 pub fn gauss(rng: &mut Rng) -> f64 {
     let u1 = ((rng.next_u64() >> 11) as f64 + 0.5) / TWO53;
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * uniform(rng)).cos()
-}
-
-/// Serializable pinhole + Brown–Conrady model (same fields as [`Intrinsics`]).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CameraModel {
-    pub fx: f64,
-    pub fy: f64,
-    pub cx: f64,
-    pub cy: f64,
-    #[serde(default)]
-    pub dist: [f64; 5],
-    pub width: f64,
-    pub height: f64,
-}
-
-impl Default for CameraModel {
-    /// A 4:3 phone main camera streamed at 1280x960 (~70° horizontal FOV).
-    fn default() -> Self {
-        CameraModel { fx: 920.0, fy: 920.0, cx: 639.5, cy: 479.5, dist: [0.05, -0.1, 0.0, 0.0, 0.0], width: 1280.0, height: 960.0 }
-    }
-}
-
-impl From<CameraModel> for Intrinsics {
-    fn from(c: CameraModel) -> Self {
-        Intrinsics { fx: c.fx, fy: c.fy, cx: c.cx, cy: c.cy, dist: c.dist, width: c.width, height: c.height }
-    }
-}
-
-impl From<Intrinsics> for CameraModel {
-    fn from(k: Intrinsics) -> Self {
-        CameraModel { fx: k.fx, fy: k.fy, cx: k.cx, cy: k.cy, dist: k.dist, width: k.width, height: k.height }
-    }
 }
 
 /// How far the camera calibration the pipeline uses is off from the truth.
@@ -623,7 +592,8 @@ impl YuvImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench::scene::{BoardDims, Shape};
+    use crate::bench::scene::Shape;
+    use crate::recording::BoardDims;
 
     #[test]
     fn mount_plane_contains_origin_and_crossing() {

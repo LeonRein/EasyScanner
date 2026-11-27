@@ -13,8 +13,8 @@ cd android/core
 cargo run --release -p scan-algo --bin scan_bench -- sweep          # error budget, ~2 min
 cargo run --release -p scan-algo --bin scan_bench -- sweep --fast   # analytic stripe only, ~20 s
 cargo run --release -p scan-algo --bin scan_bench -- config --realistic > my.json   # edit, then:
-cargo run --release -p scan-algo --bin scan_bench -- run --config my.json --save rec.json --ply cloud.ply
-cargo run --release -p scan-algo --bin scan_bench -- eval rec.json
+cargo run --release -p scan-algo --bin scan_bench -- run --config my.json --save rec.jsonl --ply cloud.ply
+cargo run --release -p scan-algo --bin scan_bench -- eval rec.jsonl
 cargo run --release -p scan-algo --bin scan_bench -- eval-ply scan.ply --radius 25
 cargo test -p scan-algo bench                                        # the benchmark's own tests
 ```
@@ -94,11 +94,36 @@ What it says (for this geometry, synthetic data):
 
 ## Real recordings
 
-`bench::recording::Recording` (JSON) holds per frame the corner pixels and/or
-the device pose and the stripe pixels, plus the intrinsics and laser plane
-the pipeline uses. The simulator writes it with a `truth` attached; a real
-session saved in the same shape (corners and stripe pixels from
-`engine.rs`, follow-up work) runs through the same `reconstruct` and
-`evaluate`, then without ground-truth metrics but with the sphere fit. Until
-then, a real scan of a reference ball exported as PLY can be scored with
-`eval-ply --radius <mm>`.
+`recording::Recording` (in `android/core/algo/src/recording/`) holds per
+frame the corner pixels, the device's pose and its quality, what the scan
+gate decided, the stripe pixels and the row timing, plus the gyro samples
+and the camera model and laser plane each frame was processed with. It is
+stored as JSON lines, one object per line tagged by `kind` (`header`,
+`setup`, `frame`, `gyro`); the module docs give the format and its
+compatibility rules (a `version` in the header, unknown kinds skipped, a
+file cut off mid-line reads up to its last whole line).
+
+The phone streams one per scan session: `recording.jsonl` next to
+`scan.ply` (Settings → Diagnostics → Save raw scan data, on by default;
+about 20–40 MB per minute of scanning, capped at 2 GB). It starts with the
+first frame, carries the gyro samples of the second before it, and writes a
+new `setup` line whenever the calibration is reloaded, so the replay uses
+the setup each frame was processed with. A synthetic recording keeps its
+ground truth in a sidecar, `<recording>.truth.json`, which `eval` picks up
+by itself.
+
+```sh
+cargo run --release -p scan-algo --bin scan_bench -- eval recording.jsonl --ply replay.ply
+cargo run --release -p scan-algo --bin scan_bench -- eval recording.jsonl --pose corners   # this build's PnP, not the phone's poses
+cargo run --release -p scan-algo --bin scan_bench -- eval recording.jsonl --frames all     # every posed frame, not only the ones the phone kept
+```
+
+The replay uses the fusion and scan-gate settings recorded in the header.
+One limitation: the gyro batches are written in the order they reached the
+core, not interleaved with the frames by timestamp; the replay compensates
+by assuming the gyro samples of a frame arrive 40 ms after its last row.
+
+A real recording has no ground truth, so `eval` reports what the pipeline
+saw (posed frames, points, reprojection error, the gyro calibration); a scan
+of a reference ball is scored with `eval-ply scan.ply --radius <mm>`, or on
+the replayed cloud.

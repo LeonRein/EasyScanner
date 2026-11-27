@@ -208,8 +208,9 @@ with the platform mount, 3 with a fitted mount) and 59 (`RS_CORRECTED`).
 
 - Real recordings: the benchmark's hand model is a guess. The real readout
   (Pixel 10 Pro main camera), the tremor spectrum and the gyro noise decide
-  how much each part is worth. Recording real sessions (`bench::recording`,
-  format version 2) is the next step.
+  how much each part is worth. Every scan session now records its
+  `recording.jsonl` (see [accuracy-benchmark.md](accuracy-benchmark.md)); tuning
+  on those is the next step.
 - The scan gate's speed limits (120 mm/s, 25°/s) are unchanged. The
   correction would allow faster sweeps; raise them once real scans confirm it.
 - The capture result of a frame often arrives after its image; its row

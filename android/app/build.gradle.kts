@@ -38,6 +38,19 @@ android {
         ndk { abiFilters += rustAbis }
     }
 
+    signingConfigs {
+        // One debug key for every machine and CI run (android/debug.keystore),
+        // so a newer build installs over an older one instead of needing an
+        // uninstall, which would wipe the calibrations and scans in the app's
+        // storage. A debug key cannot publish anything; it is not a secret.
+        getByName("debug") {
+            storeFile = rootProject.file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false

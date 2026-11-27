@@ -4,10 +4,15 @@
 //! scan_bench sweep [--fast] [--seconds S] [--json]
 //!     every scenario of the error budget, one table
 //! scan_bench run [--config cfg.json] [--realistic] [--fast] [--seconds S]
-//!                [--save rec.json] [--ply out.ply] [--json]
+//!                [--save rec.jsonl] [--ply out.ply] [--json]
 //!     one scenario; --save keeps the recording, --ply the cloud
-//! scan_bench eval rec.json [--json]
-//!     reconstruct and score a saved recording (synthetic or, later, real)
+//! scan_bench eval rec.jsonl [--pose auto|recorded|corners] [--frames kept|all]
+//!                [--ply out.ply] [--json]
+//!     replay and score a recording: synthetic (its truth is read from
+//!     rec.jsonl.truth.json), or a phone session's recording.jsonl with the
+//!     settings it was recorded with; --pose picks the device's poses or this
+//!     build's PnP on the recorded corners, --frames the frames the device
+//!     kept or every posed one
 //! scan_bench eval-ply scan.ply [--radius R]
 //!     sphere fit of a scanned reference ball (radius error if R is given)
 //! scan_bench config [--realistic]
@@ -21,12 +26,12 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use scan_algo::bench::metrics::{self, Report, Stats};
-use scan_algo::bench::reconstruct::{self, PoseFrom};
-use scan_algo::bench::recording::Recording;
+use scan_algo::bench::reconstruct::{self, FrameSelection, PoseFrom, ReplayCfg};
 use scan_algo::bench::sim::StripeModel;
+use scan_algo::bench::truth::Truth;
 use scan_algo::bench::{self, BenchCfg};
 use scan_algo::cloud::PointCloud;
-use scan_algo::fusion::FusionCfg;
+use scan_algo::recording::Recording;
 
 struct Args {
     rest: Vec<String>,
@@ -168,7 +173,7 @@ fn main() -> ExitCode {
             adjust(&mut cfg, fast, seconds);
             let out = bench::run(&cfg)?;
             if let Some(p) = a.value("--save") {
-                out.recording.save(Path::new(&p)).map_err(|e| format!("{p}: {e}"))?;
+                out.synthetic.save(Path::new(&p)).map_err(|e| format!("{p}: {e}"))?;
             }
             if let Some(p) = a.value("--ply") {
                 save_ply(&out.reconstruction.points, &p).map_err(|e| format!("{p}: {e}"))?;
@@ -177,10 +182,28 @@ fn main() -> ExitCode {
             Ok(())
         }
         "eval" => {
+            let pose_from = match a.value("--pose").as_deref() {
+                None | Some("auto") => PoseFrom::Auto,
+                Some("recorded") => PoseFrom::Recorded,
+                Some("corners") => PoseFrom::Corners,
+                Some(other) => return Err(format!("--pose {other}: expected auto, recorded or corners")),
+            };
+            let frames = match a.value("--frames").as_deref() {
+                None | Some("kept") => FrameSelection::Kept,
+                Some("all") => FrameSelection::All,
+                Some(other) => return Err(format!("--frames {other}: expected kept or all")),
+            };
+            let ply = a.value("--ply");
             let p = a.rest.first().ok_or("eval needs a recording")?.clone();
-            let rec = Recording::load(Path::new(&p)).map_err(|e| format!("{p}: {e}"))?;
-            let recon = reconstruct::reconstruct(&rec, PoseFrom::Auto, &FusionCfg::default());
-            print_reports(&[metrics::evaluate(&rec.source, &rec, &recon)], json);
+            let path = Path::new(&p);
+            let rec = Recording::load(path).map_err(|e| format!("{p}: {e}"))?;
+            let truth = Truth::load_for(path).map_err(|e| format!("{p}: truth: {e}"))?;
+            let replay = ReplayCfg { pose_from, frames, ..ReplayCfg::as_recorded(&rec) };
+            let recon = reconstruct::reconstruct(&rec, &replay);
+            if let Some(out) = ply {
+                save_ply(&recon.points, &out).map_err(|e| format!("{out}: {e}"))?;
+            }
+            print_reports(&[metrics::evaluate(&rec.header.source, &rec, truth.as_ref(), &recon)], json);
             Ok(())
         }
         "eval-ply" => {

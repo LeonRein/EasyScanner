@@ -32,6 +32,8 @@ data class AppSettings(
     val roiTracking: Boolean,
     val draw: Draw,
     val photos: Photos,
+    /** Stream each scan session's raw observations into its `recording.jsonl`. */
+    val recordSessions: Boolean,
     /** The four tool modes instead of the guided steps. */
     val expertMode: Boolean,
     /** [board] as last confirmed in the guided Board step, or null. */
@@ -117,6 +119,7 @@ data class AppSettings(
         })
         put("calib_views", calibViews)
         put("plane_views", planeViews)
+        put("record_sessions", recordSessions)
     }.toString()
 
     companion object {
@@ -170,6 +173,7 @@ data class AppSettings(
                     maxTurnDegS = dbl("photo_max_turn", 8.0),
                     withScan = p.getBoolean("photos_with_scan", true),
                 ),
+                recordSessions = p.getBoolean("record_sessions", true),
                 expertMode = p.getBoolean("expert_mode", false),
                 boardConfirmed = p.getString("board_confirmed", null),
             )

@@ -1,0 +1,68 @@
+name: Firmware build
+
+# Tests the phone <-> laser switch protocol on the host and builds the
+# ESP32-S3 firmware with Espressif's Xtensa toolchain, so a broken firmware
+# is caught before anyone flashes it.
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["firmware/**", "protocol/**", ".github/workflows/firmware.yml"]
+  pull_request:
+    paths: ["firmware/**", "protocol/**", ".github/workflows/firmware.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  protocol:
+    name: laser-link protocol (host tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: protocol/laser-link
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: protocol/laser-link
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  laser-switch:
+    name: laser-switch firmware (ESP32-S3)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware/laser-switch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware/laser-switch
+      - run: cargo fmt -- --check
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: laser-switch-esp32s3
+          path: firmware/laser-switch/target/xtensa-esp32s3-none-elf/release/laser-switch
+          if-no-files-found: error
+          retention-days: 30

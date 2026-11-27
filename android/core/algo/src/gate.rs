@@ -4,11 +4,11 @@
 //! corners, an ambiguous planar solution, or a camera moving fast enough to
 //! blur and shear the image — is shown, but not kept.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Thresholds for the scan's per-frame gate. Every check can be switched off
 /// on its own: 0 (or a non-finite value) disables it.
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(default)]
 pub struct ScanGateCfg {
     /// Off: every posed frame adds points, as before the gate existed.
@@ -65,7 +65,8 @@ pub struct FrameQuality {
 }
 
 /// Why a frame was not kept. The numeric codes go into the frame header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Reject {
     PoseRms = 1,
     FewCorners = 2,

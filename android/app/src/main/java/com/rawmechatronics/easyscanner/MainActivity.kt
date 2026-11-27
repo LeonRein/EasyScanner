@@ -979,6 +979,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             "laser.ply".takeIf { it in c.names },
             if (c.photos > 0) resources.getQuantityString(R.plurals.photos, c.photos, c.photos) else null,
             "session.json".takeIf { it in c.names },
+            "recording.jsonl".takeIf { it in c.names },
         )
         return getString(R.string.done_body, c.relativeDir, parts.joinToString(", "), c.files)
     }

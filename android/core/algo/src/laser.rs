@@ -339,6 +339,9 @@ struct Band {
 pub struct LaserDetector {
     resp: Vec<u8>,
     row_cen: Vec<f32>,
+    /// How far each row's stripe candidate stands out of its surroundings
+    /// ([`ScanLine::ridge`]), held against the frame's level.
+    row_ridge: Vec<u8>,
     bands: Vec<Band>,
     col_val: Vec<u8>,
     col_row: Vec<u32>,
@@ -385,6 +388,7 @@ impl LaserDetector {
 
         self.resp.resize(w * h, 0);
         self.row_cen.resize(h, f32::NAN);
+        self.row_ridge.resize(h, 0);
         let rows = y1 - y0;
         let n_bands = (rayon::current_num_threads() * 2).min(rows.div_ceil(16)).max(1);
         let band_rows = rows.div_ceil(n_bands);
@@ -402,9 +406,10 @@ impl LaserDetector {
         self.resp[y0 * w..y1 * w]
             .par_chunks_mut(band_rows * w)
             .zip(self.row_cen[y0..y1].par_chunks_mut(band_rows))
+            .zip(self.row_ridge[y0..y1].par_chunks_mut(band_rows))
             .zip(self.bands[..n_bands].par_iter_mut())
             .enumerate()
-            .for_each(|(bi, ((resp_band, cen_band), band))| {
+            .for_each(|(bi, (((resp_band, cen_band), peak_band), band))| {
                 band.col_val.clear();
                 band.col_val.resize(w, 0);
                 band.col_row.clear();
@@ -415,12 +420,15 @@ impl LaserDetector {
                 band.v4.resize(cw, 0);
                 let by0 = y0 + bi * band_rows;
                 let ps = f.layout.uv_pixel_stride;
-                for (ri, (row_out, cen)) in resp_band.chunks_mut(w).zip(cen_band.iter_mut()).enumerate() {
+                for (ri, ((row_out, cen), row_ridge)) in
+                    resp_band.chunks_mut(w).zip(cen_band.iter_mut()).zip(peak_band.iter_mut()).enumerate()
+                {
                     let y = by0 + ri;
                     let (sx0, sx1) = roi.spans[y - roi.y0];
                     let (sx0, sx1) = ((sx0 as usize).min(w), (sx1 as usize).min(w));
                     row_out.fill(0);
                     *cen = f32::NAN;
+                    *row_ridge = 0;
                     if sx1 <= sx0 {
                         continue;
                     }
@@ -463,6 +471,7 @@ impl LaserDetector {
                         continue;
                     }
                     let line = ScanLine { lo: sx0, hi: sx1, win, min_mass };
+                    *row_ridge = line.ridge(&|x| row_out[x], best_x);
                     if let Some(c) = line.centroid(|x| row_out[x], best_x) {
                         *cen = c;
                     }
@@ -499,21 +508,28 @@ impl LaserDetector {
         }
 
         // ── pass 2: column-axis centroids (the stripe runs left-right) ──
+        // A scan line crosses the stripe only where its peak stands out of
+        // the response on both sides by the level: a reddish surface has a
+        // response of its own, a plateau or a step, not a ridge.
         self.col_pts.clear();
         for x in 0..w {
             if self.col_val[x] == 0 {
                 continue;
             }
             let line = ScanLine { lo: y0, hi: y1, win, min_mass };
-            let resp = &self.resp;
-            if let Some(c) = line.centroid(|yy| resp[yy * w + x], self.col_row[x] as usize) {
+            let resp = |yy: usize| self.resp[yy * w + x];
+            let peak = self.col_row[x] as usize;
+            if f32::from(line.ridge(&resp, peak)) < level {
+                continue;
+            }
+            if let Some(c) = line.centroid(resp, peak) {
                 self.col_pts.push([x as f32, c]);
             }
         }
         self.row_pts.clear();
         for y in y0..y1 {
             let c = self.row_cen[y];
-            if !c.is_nan() {
+            if !c.is_nan() && f32::from(self.row_ridge[y]) >= level {
                 self.row_pts.push([c, y as f32]);
             }
         }
@@ -603,13 +619,37 @@ impl ScanLine {
         estimate
     }
 
-    /// The contiguous run `a..b` around `peak` where the response stays
-    /// above a fraction of the peak's: both flanks of a clipped stripe. It
-    /// grows at most `4·win` to each side, so a large reddish area does not
-    /// become one huge window.
-    fn extent(&self, resp: &impl Fn(usize) -> u8, peak: usize) -> (usize, usize) {
-        let edge = resp(peak) / Self::EXTENT_FRACTION;
+    /// The response the stripe stands on around `peak`: the higher of the
+    /// two sides' least responses within `4·win`. On a reddish surface that
+    /// is the surface's own response; at the edge of one, the surface side.
+    fn background(&self, resp: &impl Fn(usize) -> u8, peak: usize) -> u8 {
         let reach = 4 * self.win;
+        let left = (peak.saturating_sub(reach).max(self.lo)..peak).map(resp).min();
+        let right = (peak + 1..(peak + reach + 1).min(self.hi)).map(resp).min();
+        match (left, right) {
+            (Some(l), Some(r)) => l.max(r),
+            (Some(side), None) | (None, Some(side)) => side,
+            (None, None) => 0,
+        }
+    }
+
+    /// How far the response at `peak` stands above its
+    /// [background](Self::background): high for a stripe, about zero for
+    /// a plateau or a step.
+    fn ridge(&self, resp: &impl Fn(usize) -> u8, peak: usize) -> u8 {
+        resp(peak).saturating_sub(self.background(resp, peak))
+    }
+
+    /// The contiguous run `a..b` around `peak` where the response stays
+    /// above a fraction of the peak's height over the
+    /// [background](Self::background): both flanks of a clipped stripe,
+    /// ending where a reddish surface's own response begins. It grows at
+    /// most `4·win` to each side, so a large reddish area does not become
+    /// one huge window.
+    fn extent(&self, resp: &impl Fn(usize) -> u8, peak: usize) -> (usize, usize) {
+        let reach = 4 * self.win;
+        let background = self.background(resp, peak);
+        let edge = background + resp(peak).saturating_sub(background) / Self::EXTENT_FRACTION;
         let a = (peak.saturating_sub(reach).max(self.lo)..peak).rev().take_while(|&i| resp(i) > edge).last().unwrap_or(peak);
         let b = (peak + 1..(peak + reach + 1).min(self.hi)).take_while(|&i| resp(i) > edge).last().map_or(peak + 1, |i| i + 1);
         (a, b)
@@ -860,6 +900,36 @@ mod tests {
         assert!(stripe_rms(600.0, 0.12, 2.0, 0.0) < 0.15);
         // a wide clipped stripe: a fixed window held one flank only (~3.4 px)
         assert!(stripe_rms(600.0, 0.12, 4.0, 0.0) < 0.5);
+    }
+
+    #[test]
+    fn a_reddish_object_is_not_taken_for_the_stripe() {
+        use crate::bench::sim::YuvImage;
+        // a red stripe along row 40 over the left half; a reddish object
+        // (terracotta, chroma ~50) fills the right half's lower rows
+        let (w, h) = (640usize, 160usize);
+        let mut rgb = vec![0u8; w * h * 3];
+        for v in 0..h {
+            for u in 0..w {
+                let mut px = [120.0f64, 120.0, 120.0];
+                if u >= 320 && v >= 60 {
+                    px = [105.0, 58.0, 52.0];
+                }
+                if u < 320 {
+                    let g = 300.0 * (-0.5 * ((v as f64 - 40.3) / 1.5).powi(2)).exp();
+                    px = [px[0] + g, px[1] + 0.12 * g, px[2] + 0.12 * g];
+                }
+                for c in 0..3 {
+                    rgb[(v * w + u) * 3 + c] = px[c].round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let img = YuvImage::from_rgb(&rgb, w, h);
+        let mut out = Vec::new();
+        assert!(LaserDetector::default().detect(&img.frame().unwrap(), &Roi::full(w, h), &LaserParams::default(), &mut out));
+        let stray = out.iter().filter(|q| (q[1] - 40.3).abs() > 1.0).count();
+        assert_eq!(stray, 0, "{stray} of {} points on the object", out.len());
+        assert!(out.iter().all(|q| q[0] < 330.0));
     }
 
     #[test]

@@ -13,7 +13,6 @@ use crate::fusion::{FusionCfg, PoseFusion};
 use crate::gate::{FrameQuality, ScanGateCfg};
 use crate::geom::{Intrinsics, Pose, V3};
 use crate::imu::GyroFit;
-use crate::ippe::SINGLE_SOLUTION_MARGIN;
 use crate::rolling::{Correction, solve_corrected};
 use crate::stripe;
 use crate::volume::Volume;
@@ -111,7 +110,7 @@ pub fn reconstruct(rec: &Recording, from: PoseFrom, fusion_cfg: &FusionCfg) -> R
     // scan gate's pose checks
     let gate = ScanGateCfg::default();
     let mut fusion = PoseFusion::new(*fusion_cfg);
-    fusion.set_nominal_mount(rec.cam_from_imu);
+    fusion.set_platform_mount(rec.cam_from_imu);
     let mut gyro = rec.gyro.iter().peekable();
     let mut r = Reconstruction::default();
     for (i, f) in rec.frames.iter().enumerate() {
@@ -126,11 +125,12 @@ pub fn reconstruct(rec: &Recording, from: PoseFrom, fusion_cfg: &FusionCfg) -> R
         let corr = fusion.correction(&clock);
         r.corrected_frames += usize::from(corr.is_some());
         let fp = frame_pose(f, rec, &k, from, corr.as_ref());
-        let trusted = fp.is_some_and(|p| {
-            let q = FrameQuality { reproj_rms: p.reproj_rms, corners: p.corners, margin: SINGLE_SOLUTION_MARGIN, speed: None };
+        // the benchmark's PnP has a single solution: no ambiguity margin
+        let trusted = fp.filter(|p| {
+            let q = FrameQuality { reproj_rms: p.reproj_rms, corners: p.corners, margin: f64::INFINITY, speed: None };
             gate.check_pose(&q).is_ok()
         });
-        fusion.observe(&clock, fp.as_ref().map(|p| &p.pose), trusted);
+        fusion.observe(&clock, trusted.as_ref().map(|p| &p.pose));
         if let Some(fp) = &fp {
             triangulate(&f.laser_px, &k, plane, &fp.pose, corr.as_ref(), &vol, |b| {
                 r.points.push(b);

@@ -22,7 +22,10 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import java.util.concurrent.Executor
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
 
 /** Factory intrinsics estimate, at the active-array resolution. */
 data class IntrinsicsGuess(
@@ -43,7 +46,13 @@ data class RowTiming(
 
 /** Something that knows the row timing of the frames it streams. */
 interface RowTimingSource {
-    val rowTiming: RowTiming
+    /**
+     * The timing of the frame with this sensor timestamp, or of the latest
+     * frame when its capture result has not arrived yet: it changes only
+     * with the sensor mode and the exposure, so a frame's neighbour is a
+     * close stand-in.
+     */
+    fun rowTiming(timestampNs: Long): RowTiming
 }
 
 /** What the app needs to know about one back camera. */
@@ -57,11 +66,12 @@ data class CameraInfo(
      */
     val gyroClockShared: Boolean,
     /**
-     * Nominal rotation from the device's sensor axes (Android sensor
-     * coordinates) to this back camera's axes (x right, y down, z forward
-     * in the raw sensor image), rows = camera axes. The core refines it.
+     * Rotation from the device's sensor axes (Android sensor coordinates)
+     * to this back camera's axes (x right, y down, z forward in the raw
+     * sensor image), rows = camera axes, as the platform defines it through
+     * `SENSOR_ORIENTATION`; `null` without one. The core refines it.
      */
-    val camFromImu: Array<DoubleArray>,
+    val camFromImu: List<List<Double>>?,
     /** YUV sizes with the sensor's aspect that reach the target fps, largest first. */
     val analysisSizes: List<Size>,
     /** JPEG sizes with exactly the analysis stream's aspect, largest first: photo keyframes. */
@@ -104,13 +114,13 @@ data class CameraInfo(
          * image's axes in device coordinates: x = (cos θ, −sin θ, 0),
          * y = (−sin θ, −cos θ, 0), z = (0, 0, −1).
          */
-        fun backCameraFromDevice(orientationDeg: Int): Array<DoubleArray> {
-            val t = Math.toRadians(orientationDeg.toDouble())
-            val (c, s) = Math.cos(t) to Math.sin(t)
-            return arrayOf(
-                doubleArrayOf(c, -s, 0.0),
-                doubleArrayOf(-s, -c, 0.0),
-                doubleArrayOf(0.0, 0.0, -1.0),
+        fun backCameraFromDevice(orientationDeg: Int): List<List<Double>> {
+            val t = orientationDeg * PI / 180
+            val (c, s) = cos(t) to sin(t)
+            return listOf(
+                listOf(c, -s, 0.0),
+                listOf(-s, -c, 0.0),
+                listOf(0.0, 0.0, -1.0),
             )
         }
 
@@ -155,14 +165,14 @@ data class CameraInfo(
                 focal?.let { append(" · f %.2f mm".format(it)) }
                 append(" · ").append(active.width()).append('x').append(active.height())
             }
-            val orientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            val orientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION)
             return CameraInfo(
                 id = id,
                 label = label,
-                sensorOrientation = orientation,
+                sensorOrientation = orientation ?: 90,
                 gyroClockShared = c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
                     CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME,
-                camFromImu = backCameraFromDevice(orientation),
+                camFromImu = orientation?.let { backCameraFromDevice(it) },
                 analysisSizes = analysis,
                 stillSizes = stills,
                 previewSize = preview,
@@ -281,9 +291,14 @@ class CameraController(
     @Volatile var focusSettled = false
         private set
 
-    /** Row timing of the last completed frame: constant per sensor mode and exposure. */
-    @Volatile override var rowTiming = RowTiming.UNKNOWN
-        private set
+    /** Row timing of the recent frames by sensor timestamp, newest last. */
+    private val recentTiming = object : LinkedHashMap<Long, RowTiming>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, RowTiming>) = size > TIMING_FRAMES
+    }
+    @Volatile private var latestTiming = RowTiming.UNKNOWN
+
+    override fun rowTiming(timestampNs: Long): RowTiming =
+        synchronized(recentTiming) { recentTiming[timestampNs] } ?: latestTiming
 
     private val frameCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
@@ -291,10 +306,12 @@ class CameraController(
             focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
             focusSettled = request.get(CaptureRequest.CONTROL_AF_MODE) == CameraMetadata.CONTROL_AF_MODE_OFF ||
                 af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED || af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
-            rowTiming = RowTiming(
+            val timing = RowTiming(
                 readoutNs = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L,
                 exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
             )
+            result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { ts -> synchronized(recentTiming) { recentTiming[ts] = timing } }
+            latestTiming = timing
         }
     }
 
@@ -549,6 +566,8 @@ class CameraController(
 
     companion object {
         private const val TAG = "EasyScanner"
+        /** Capture results kept to match row timing to frames: a few frames of slack. */
+        private const val TIMING_FRAMES = 8
 
         /** A steady `[fps, fps]` when offered, else the closest range reaching fps. */
         fun pickFpsRange(ranges: Array<Range<Int>>, fps: Int): Range<Int>? =

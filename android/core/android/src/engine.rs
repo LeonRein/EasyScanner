@@ -24,12 +24,12 @@ use scan_algo::geom::{FaceOutFrame, Intrinsics, Pose, V3, euler_xyz_deg};
 use scan_algo::imu::GyroSample;
 use scan_algo::keyframe::{Due, Hold, Miss, PoseTrack, TrackedPose, Trigger};
 use scan_algo::laser::{LaserDetector, LaserParams, Roi, YuvFrame};
+use scan_algo::overlay;
 use scan_algo::photo_session::{Cylinder, PhotoSession, SessionInfo};
 use scan_algo::plane::{PlaneCalibrator, PlaneFit};
 use scan_algo::rolling::RowClock;
 use scan_algo::stripe::{self, BoardStripe};
 use scan_algo::volume::Volume;
-use scan_algo::overlay;
 use serde::Deserialize;
 
 use crate::board::{BoardTracker, PoseResult, corner_bbox, distance};
@@ -234,8 +234,7 @@ impl Engine {
     pub fn configure(&mut self, json: &str) -> Result<(), String> {
         let cfg: Config = serde_json::from_str(json).map_err(|e| format!("bad config: {e}"))?;
         if cfg.board != self.cfg.board || cfg.detector != self.cfg.detector {
-            self.tracker =
-                BoardTracker::new(cfg.board, cfg.detector.aruco3, cfg.detector.roi_tracking).map_err(|e| e.to_string())?;
+            self.tracker = BoardTracker::new(cfg.board, cfg.detector.aruco3, cfg.detector.roi_tracking).map_err(|e| e.to_string())?;
         }
         if cfg.board != self.cfg.board {
             // a different board invalidates collected views and lines, and
@@ -250,7 +249,7 @@ impl Engine {
             self.fusion = PoseFusion::new(cfg.fusion);
         }
         self.fusion.set_cfg(cfg.fusion);
-        self.fusion.set_nominal_mount(cfg.camera.cam_from_imu);
+        self.fusion.set_platform_mount(cfg.camera.cam_from_imu);
         self.calib.target = cfg.calib_views.max(4);
         self.plane_cal.min_lines = cfg.plane_views.max(3);
         self.plane_cal.fit = cfg.plane_fit;
@@ -331,17 +330,15 @@ impl Engine {
 
         let k = self.k_base.for_frame(w, hgt);
         // the luma plane IS the grey image ArUco wants — wrapped, not copied
-        let gray = unsafe {
-            Mat::new_rows_cols_with_data_unsafe(hgt as i32, w as i32, CV_8UC1, f.y.as_ptr() as *mut _, f.y_stride)
-        }?;
+        let gray = unsafe { Mat::new_rows_cols_with_data_unsafe(hgt as i32, w as i32, CV_8UC1, f.y.as_ptr() as *mut _, f.y_stride) }?;
         let n_corners = self.tracker.detect(&gray)?;
         let correction = self.fusion.correction(&clock);
         let expected = self.fusion.expected_rotation(&clock);
         let pose_res = self.tracker.solve_pose(&k, expected.as_ref(), correction.as_ref())?;
         let t_board = t0.elapsed();
 
-        let sharpness = corner_bbox(&self.tracker.corners)
-            .and_then(|bb| laplacian_variance(f.y, f.y_stride, (f.width, f.height), bb, 40_000));
+        let sharpness =
+            corner_bbox(&self.tracker.corners).and_then(|bb| laplacian_variance(f.y, f.y_stride, (f.width, f.height), bb, 40_000));
         let focus_pct = sharpness.map(|s| {
             self.focus_max = self.focus_max.max(s);
             100.0 * s / self.focus_max
@@ -377,8 +374,9 @@ impl Engine {
         // the plane calibration tilts the board between still views: pose checks only
         let plane_pose_ok = quality.as_ref().is_some_and(|q| gate.check_pose(q).is_ok());
         let scan_verdict: Option<Result<(), Reject>> = quality.as_ref().map(|q| gate.check(q));
-        // a pose good enough for the plane calibration is good enough to calibrate the gyro against
-        self.fusion.observe(&clock, pose_res.as_ref().map(|p| &p.pose), plane_pose_ok);
+        // a pose good enough for the plane calibration is good enough to
+        // calibrate the gyro against and to read the camera's motion from
+        self.fusion.observe(&clock, pose_res.as_ref().filter(|_| plane_pose_ok).map(|p| &p.pose));
 
         // ── live intrinsics calibration: every genuinely new view ──
         if self.calib_active && pose_res.is_some() && !self.calib.solving() {
@@ -424,7 +422,7 @@ impl Engine {
                 found = self.laser.detect(f, roi, &params, &mut self.laser_px);
             }
             if let (true, Some(p)) = (found, pose) {
-                board_stripe = stripe::on_board(&self.laser_px, &k, &p, &vol);
+                board_stripe = stripe::on_board(&self.laser_px, &k, &p, correction.as_ref(), &vol);
             }
         }
         if !found {
@@ -432,7 +430,10 @@ impl Engine {
         }
 
         // ── laser-plane calibration: on-board stripes across tilts ──
-        if self.plane_active && plane_pose_ok && let Some(s) = &board_stripe {
+        if self.plane_active
+            && plane_pose_ok
+            && let Some(s) = &board_stripe
+        {
             let n_lines = self.plane_cal.add(&s.cam_pts);
             let last = self.plane_cal.last_rms.map(|r| format!(" — last fit {r:.1}mm")).unwrap_or_default();
             self.msgs.plane = format!("vary board tilt{last}");
@@ -442,14 +443,13 @@ impl Engine {
                 match self.plane_cal.solve(false) {
                     Some(fit) => self.accept_plane(fit, false),
                     None => {
-                        self.msgs.plane =
-                            format!(
-                                "fit {:.1}mm, {:.0}% inliers (need ≤ {:.1}mm, ≥ {:.0}%) — vary tilt or force",
-                                self.plane_cal.last_rms.unwrap_or(f64::NAN),
-                                100.0 * self.plane_cal.last_inlier_frac.unwrap_or(f64::NAN),
-                                self.cfg.plane_fit.max_rms_mm,
-                                100.0 * self.cfg.plane_fit.min_inlier_frac,
-                            );
+                        self.msgs.plane = format!(
+                            "fit {:.1}mm, {:.0}% inliers (need ≤ {:.1}mm, ≥ {:.0}%) — vary tilt or force",
+                            self.plane_cal.last_rms.unwrap_or(f64::NAN),
+                            100.0 * self.plane_cal.last_inlier_frac.unwrap_or(f64::NAN),
+                            self.cfg.plane_fit.max_rms_mm,
+                            100.0 * self.cfg.plane_fit.min_inlier_frac,
+                        );
                     }
                 }
             }
@@ -628,7 +628,16 @@ impl Engine {
             o.set(h::POSE_MARGIN, p.margin.unwrap_or(f64::NAN));
         }
         o.set(h::FOCUS_PCT, focus_pct.unwrap_or(f64::NAN));
-        o.set(h::LASER_STATE, if !self.cfg.laser.enabled { 0.0 } else if found { 2.0 } else { 1.0 });
+        o.set(
+            h::LASER_STATE,
+            if !self.cfg.laser.enabled {
+                0.0
+            } else if found {
+                2.0
+            } else {
+                1.0
+            },
+        );
         o.set(h::LASER_POINTS, self.laser_px.len() as f64);
         o.set(h::LASER_PEAK, self.laser.stats.peak as f64);
         o.set(h::LASER_ROI_FRAC, roi_frac);
@@ -928,11 +937,7 @@ impl Engine {
             camera_id: self.cfg.camera.id.clone(),
             board: self.cfg.board,
             // the cylinder inside the box this app scans in
-            volume: Cylinder {
-                height_mm: vol.height,
-                radius_mm: 0.5 * vol.board_w.min(vol.board_h) + vol.margin,
-                floor_mm: FLOOR_MM,
-            },
+            volume: Cylinder { height_mm: vol.height, radius_mm: 0.5 * vol.board_w.min(vol.board_h) + vol.margin, floor_mm: FLOOR_MM },
             k: self.k_base,
             calibrated: self.k_file.is_some(),
             k_rms_px: self.k_file.as_ref().and_then(|f| f.rms_px),
@@ -1103,12 +1108,7 @@ impl Engine {
     /// Status lines for the HUD, as JSON.
     pub fn messages(&self) -> String {
         let intr = match &self.k_file {
-            Some(f) => format!(
-                "calibrated {}x{}{}",
-                f.width,
-                f.height,
-                f.rms_px.map(|r| format!(" rms {r:.2}px")).unwrap_or_default()
-            ),
+            Some(f) => format!("calibrated {}x{}{}", f.width, f.height, f.rms_px.map(|r| format!(" rms {r:.2}px")).unwrap_or_default()),
             None if self.cfg.camera.guess.is_some() => "camera estimate (uncalibrated)".to_string(),
             None => "DEFAULT guess (uncalibrated)".to_string(),
         };

@@ -11,31 +11,39 @@ pub const AMBIGUOUS_MARGIN: f64 = 3.0;
 /// … and the expected branch is taken only while it fits at most this much
 /// worse than the best one.
 pub const MAX_FIT_RATIO: f64 = 2.0;
-/// Margin reported when IPPE returned a single solution.
-pub const SINGLE_SOLUTION_MARGIN: f64 = 99.0;
+
+/// One of IPPE's solutions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Branch {
+    /// Board→camera rotation.
+    pub rotation: M3,
+    /// Reprojection RMS (px).
+    pub rms: f64,
+}
 
 /// The chosen branch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Choice {
+    /// Index into the branches.
     pub index: usize,
-    /// Runner-up reprojection error over the best one (≫ 1 unambiguous).
+    /// Runner-up reprojection error over the best one: ≫ 1 is unambiguous,
+    /// infinite with a single branch.
     pub margin: f64,
 }
 
-/// Pick one of IPPE's solutions, given as (board→camera rotation,
-/// reprojection RMS). `expected` is the rotation the camera should have now:
-/// the previous pose, or better, the previous pose turned on by the gyro.
-pub fn choose(cands: &[(M3, f64)], expected: Option<&M3>) -> Option<Choice> {
-    let mut order: Vec<usize> = (0..cands.len()).collect();
-    order.sort_by(|&a, &b| cands[a].1.total_cmp(&cands[b].1));
-    let &best = order.first()?;
-    let margin = order.get(1).map_or(SINGLE_SOLUTION_MARGIN, |&second| cands[second].1 / cands[best].1.max(1e-6));
+/// Pick one of IPPE's branches. `expected` is the rotation the camera
+/// should have now: the previous pose, or better, the previous pose turned
+/// on by the gyro. `None` without branches.
+pub fn choose(branches: &[Branch], expected: Option<&M3>) -> Option<Choice> {
+    let by_fit = |a: &usize, b: &usize| branches[*a].rms.total_cmp(&branches[*b].rms);
+    let best = (0..branches.len()).min_by(by_fit)?;
+    let runner_up = (0..branches.len()).filter(|&i| i != best).min_by(by_fit);
+    let margin = runner_up.map_or(f64::INFINITY, |i| branches[i].rms / branches[best].rms.max(1e-6));
     let index = match expected {
-        Some(r) if cands.len() > 1 && margin < AMBIGUOUS_MARGIN => {
-            let nearest = (0..cands.len())
-                .min_by(|&a, &b| rotation_distance(r, &cands[a].0).total_cmp(&rotation_distance(r, &cands[b].0)))
-                .unwrap_or(best);
-            if cands[nearest].1 <= cands[best].1 * MAX_FIT_RATIO { nearest } else { best }
+        Some(r) if margin < AMBIGUOUS_MARGIN => {
+            let distance = |i: usize| rotation_distance(r, &branches[i].rotation);
+            let nearest = (0..branches.len()).min_by(|&a, &b| distance(a).total_cmp(&distance(b))).unwrap_or(best);
+            if branches[nearest].rms <= branches[best].rms * MAX_FIT_RATIO { nearest } else { best }
         }
         _ => best,
     };
@@ -47,24 +55,28 @@ mod tests {
     use super::*;
     use crate::geom::rodrigues;
 
+    fn branch(r: [f64; 3], rms: f64) -> Branch {
+        Branch { rotation: rodrigues(r), rms }
+    }
+
     #[test]
     fn clear_fit_wins_regardless_of_expectation() {
-        let (a, b) = (rodrigues([3.0, 0.2, 0.0]), rodrigues([3.0, -0.2, 0.0]));
-        let c = choose(&[(a, 0.3), (b, 1.5)], Some(&b)).unwrap();
+        let (a, b) = (branch([3.0, 0.2, 0.0], 0.3), branch([3.0, -0.2, 0.0], 1.5));
+        let c = choose(&[a, b], Some(&b.rotation)).unwrap();
         assert_eq!(c, Choice { index: 0, margin: 5.0 });
     }
 
     #[test]
     fn ambiguous_fit_follows_the_expected_rotation() {
-        let (a, b) = (rodrigues([3.0, 0.2, 0.0]), rodrigues([3.0, -0.2, 0.0]));
+        let (a, b) = (branch([3.0, 0.2, 0.0], 0.30), branch([3.0, -0.2, 0.0], 0.33));
         let near_b = rodrigues([3.0, -0.18, 0.01]);
-        assert_eq!(choose(&[(a, 0.30), (b, 0.33)], Some(&near_b)).unwrap().index, 1);
-        assert_eq!(choose(&[(a, 0.30), (b, 0.33)], None).unwrap().index, 0);
+        assert_eq!(choose(&[a, b], Some(&near_b)).unwrap().index, 1);
+        assert_eq!(choose(&[a, b], None).unwrap().index, 0);
     }
 
     #[test]
-    fn single_or_no_solution() {
-        assert_eq!(choose(&[(rodrigues([0.1, 0.0, 0.0]), 0.4)], None).unwrap().margin, SINGLE_SOLUTION_MARGIN);
+    fn single_or_no_branch() {
+        assert_eq!(choose(&[branch([0.1, 0.0, 0.0], 0.4)], None).unwrap().margin, f64::INFINITY);
         assert!(choose(&[], None).is_none());
     }
 }

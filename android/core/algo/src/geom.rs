@@ -104,25 +104,59 @@ pub fn determinant(m: &M3) -> f64 {
     dot(m[0], cross(m[1], m[2]))
 }
 
-/// The rotation closest to `m` in the Frobenius norm (the orthogonal polar
-/// factor `m·(mᵀm)^-½`, with the reflection removed when `det m < 0`).
+/// Outer product `a·bᵀ`.
+pub fn outer(a: V3, b: V3) -> M3 {
+    a.map(|ai| b.map(|bj| ai * bj))
+}
+
+pub fn mat_add(a: &M3, b: &M3) -> M3 {
+    std::array::from_fn(|i| add(a[i], b[i]))
+}
+
+/// A unit vector perpendicular to the unit vector `a`.
+fn perpendicular(a: V3) -> V3 {
+    // cross with the axis `a` is least aligned with
+    let axis = if a[0].abs() <= a[1].abs() && a[0].abs() <= a[2].abs() {
+        [1.0, 0.0, 0.0]
+    } else if a[1].abs() <= a[2].abs() {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    normalize(cross(a, axis)).unwrap_or([0.0, 0.0, 1.0])
+}
+
+/// `m` with its rows made orthonormal again (Gram–Schmidt): removes the
+/// rounding a long product of rotations accumulates. `m` must be close to
+/// a rotation.
+pub fn orthonormalize(m: &M3) -> M3 {
+    let Some(x) = normalize(m[0]) else { return IDENTITY };
+    let Some(y) = normalize(sub(m[1], scale(x, dot(m[1], x)))) else { return IDENTITY };
+    [x, y, cross(x, y)]
+}
+
+/// The rotation closest to `m` in the Frobenius norm, from its singular
+/// value decomposition `m = U·Σ·Vᵀ`: `R = U·diag(1, 1, ±1)·Vᵀ`, the sign
+/// making `det R = +1`.
 ///
 /// Also the Kabsch solution: for `m = Σ bᵢ·aᵢᵀ` it is the rotation `R`
-/// that best maps every `aᵢ` onto its `bᵢ`.
+/// that best maps every `aᵢ` onto its `bᵢ`. Rank-deficient input is fine:
+/// for rank 2 (all `aᵢ` in one plane) the rotation is still determined and
+/// found; below that the missing directions are completed arbitrarily.
 pub fn nearest_rotation(m: &M3) -> M3 {
-    let (vals, vecs) = sym3_eigen(&mat_mul(&transpose(m), m));
-    // the smallest singular direction takes the sign that makes det = +1
-    let flip = if determinant(m) < 0.0 { -1.0 } else { 1.0 };
-    let mut inv_sqrt = [[0.0; 3]; 3];
-    for k in 0..3 {
-        let w = if k == 2 { flip } else { 1.0 } / vals[k].max(1e-300).sqrt();
-        for (i, row) in inv_sqrt.iter_mut().enumerate() {
-            for (j, cell) in row.iter_mut().enumerate() {
-                *cell += w * vecs[k][i] * vecs[k][j];
-            }
-        }
-    }
-    mat_mul(m, &inv_sqrt)
+    let (vals, v) = sym3_eigen(&mat_mul(&transpose(m), m));
+    let sigma = vals.map(|x| x.max(0.0).sqrt());
+    let tiny = 1e-12 * sigma[0].max(1e-300);
+    // left singular vectors u_i = m·v_i / σ_i where σ_i is not negligible
+    let left = |i: usize| (sigma[i] > tiny).then(|| scale(mat_vec(m, v[i]), 1.0 / sigma[i])).and_then(normalize);
+    let u1 = left(0).unwrap_or([1.0, 0.0, 0.0]);
+    // re-orthogonalise u2 against u1 (they are orthogonal up to rounding)
+    let u2 = left(1).and_then(|u| normalize(sub(u, scale(u1, dot(u, u1))))).unwrap_or_else(|| perpendicular(u1));
+    let u3 = cross(u1, u2);
+    let s = if determinant(&[v[0], v[1], v[2]]) < 0.0 { -1.0 } else { 1.0 };
+    let us = [u1, u2, scale(u3, s)];
+    // R = Σ_i u_i·v_iᵀ
+    us.iter().zip(&v).fold([[0.0; 3]; 3], |acc, (u, vi)| mat_add(&acc, &outer(*u, *vi)))
 }
 
 /// Angle (rad) of the relative rotation `aᵀ·b` — the geodesic distance.
@@ -214,18 +248,14 @@ pub fn sym3_eigen(m: &M3) -> ([f64; 3], [V3; 3]) {
             let c = 1.0 / (t * t + 1.0).sqrt();
             let s = t * c;
             // A' = Jᵀ A J for the rotation J in the (p, q) plane.
-            for k in 0..3 {
-                let akp = a[k][p];
-                let akq = a[k][q];
-                a[k][p] = c * akp - s * akq;
-                a[k][q] = s * akp + c * akq;
+            for row in a.iter_mut() {
+                let (akp, akq) = (row[p], row[q]);
+                row[p] = c * akp - s * akq;
+                row[q] = s * akp + c * akq;
             }
-            for k in 0..3 {
-                let apk = a[p][k];
-                let aqk = a[q][k];
-                a[p][k] = c * apk - s * aqk;
-                a[q][k] = s * apk + c * aqk;
-            }
+            let (rp, rq) = (a[p], a[q]);
+            a[p] = std::array::from_fn(|k| c * rp[k] - s * rq[k]);
+            a[q] = std::array::from_fn(|k| s * rp[k] + c * rq[k]);
             for row in v.iter_mut() {
                 let vkp = row[p];
                 let vkq = row[q];
@@ -253,15 +283,10 @@ pub fn mean_scatter(pts: &[V3]) -> Option<(V3, M3)> {
         mean = add(mean, *p);
     }
     mean = scale(mean, 1.0 / n);
-    let mut s = [[0.0; 3]; 3];
-    for p in pts {
+    let s = pts.iter().fold([[0.0; 3]; 3], |acc, p| {
         let d = sub(*p, mean);
-        for i in 0..3 {
-            for j in 0..3 {
-                s[i][j] += d[i] * d[j];
-            }
-        }
-    }
+        mat_add(&acc, &outer(d, d))
+    });
     Some((mean, s))
 }
 
@@ -495,16 +520,24 @@ mod tests {
         assert!(close(determinant(&q), 1.0, 1e-9));
     }
 
-    fn test_k() -> Intrinsics {
-        Intrinsics {
-            fx: 1400.0,
-            fy: 1390.0,
-            cx: 960.0,
-            cy: 720.0,
-            dist: [-0.08, 0.05, 0.001, -0.0005, 0.0],
-            width: 1920.0,
-            height: 1440.0,
+    #[test]
+    fn kabsch_in_a_plane_is_still_exact() {
+        // all vectors in one plane: m has rank 2, the rotation is still determined
+        let r = rodrigues([0.7, 0.2, -1.3]);
+        let a = [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [1.0, 1.0, 0.0], [-0.5, 0.3, 0.0]];
+        let m = a.iter().fold([[0.0; 3]; 3], |acc, x| mat_add(&acc, &outer(mat_vec(&r, *x), *x)));
+        let q = nearest_rotation(&m);
+        assert!(rotation_distance(&q, &r) < 1e-9, "{q:?}");
+        // rank 1 and zero still give a rotation
+        for m in [outer([1.0, 2.0, 0.5], [0.3, -1.0, 2.0]), [[0.0; 3]; 3]] {
+            let q = nearest_rotation(&m);
+            assert!(close(determinant(&q), 1.0, 1e-9));
+            assert!(rotation_distance(&mat_mul(&transpose(&q), &q), &IDENTITY) < 1e-9);
         }
+    }
+
+    fn test_k() -> Intrinsics {
+        Intrinsics { fx: 1400.0, fy: 1390.0, cx: 960.0, cy: 720.0, dist: [-0.08, 0.05, 0.001, -0.0005, 0.0], width: 1920.0, height: 1440.0 }
     }
 
     #[test]

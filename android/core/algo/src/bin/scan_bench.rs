@@ -67,16 +67,29 @@ fn f(x: Option<f64>, digits: usize) -> String {
 
 fn table(reports: &[Report]) {
     println!(
-        "{:<30} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>8}",
-        "scenario", "posed", "points", "pos mm", "rot °", "plane°", "mean", "median", "p95", "rms", ">1mm %", "ball Δr", "RS %",
-        "gyro"
+        "{:<42} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>8} {:>7}",
+        "scenario",
+        "posed",
+        "points",
+        "pos mm",
+        "rot °",
+        "plane°",
+        "mean",
+        "median",
+        "p95",
+        "rms",
+        ">1mm %",
+        "ball Δr",
+        "RS %",
+        "gyro",
+        "mount°"
     );
     for r in reports {
         let s = |x: Option<Stats>, g: fn(&Stats) -> f64| x.as_ref().map(g);
         let ball = r.spheres.first();
         println!(
-            "{:<30} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>8}",
-            r.name.chars().take(30).collect::<String>(),
+            "{:<42} {:>9} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>8} {:>7}",
+            r.name.chars().take(42).collect::<String>(),
             format!("{}/{}", r.frames_posed, r.frames),
             r.points,
             f(s(r.pose_pos_mm, |s| s.rms), 3),
@@ -89,14 +102,19 @@ fn table(reports: &[Report]) {
             f(r.outliers_1mm.map(|x| 100.0 * x), 2),
             f(ball.and_then(|b| b.radius_err_mm), 3),
             f(Some(100.0 * r.corrected_frames as f64 / r.frames.max(1) as f64), 0),
-            r.gyro.and_then(|g| g.from_frame).map_or("-".into(), |i| format!("@{i}")),
+            r.gyro.map_or("-".into(), |g| {
+                let mount = if g.mount_sigma_deg.is_some() { "fit" } else { "pf" };
+                g.from_frame.map_or("-".into(), |i| format!("@{i} {mount}"))
+            }),
+            f(r.gyro.and_then(|g| g.rotation_err_deg), 2),
         );
     }
     println!(
         "\npos/rot: camera pose error RMS · plane°: laser-plane angle error · mean … rms (mm): signed distance of\n\
          every point to the true surface (median/p95 of |e|) · >1mm %: points off by more than 1 mm ·\n\
          ball Δr: sphere-fit radius error of the 25 mm ball (mm) · RS %: frames rolling-shutter corrected ·\n\
-         gyro: frame from which the self-calibrated gyro was in use"
+         gyro: frame from which the self-calibrated gyro was in use, with the platform's (pf) or a fitted (fit)\n\
+         mount at the end · mount°: error of that mount"
     );
 }
 
@@ -141,8 +159,9 @@ fn main() -> ExitCode {
         }
         "run" => {
             let mut cfg = match a.value("--config") {
-                Some(p) => serde_json::from_str(&std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?)
-                    .map_err(|e| format!("{p}: {e}"))?,
+                Some(p) => {
+                    serde_json::from_str(&std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?).map_err(|e| format!("{p}: {e}"))?
+                }
                 None if a.flag("--realistic") => BenchCfg::realistic(),
                 None => BenchCfg::default(),
             };

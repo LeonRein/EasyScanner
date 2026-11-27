@@ -103,12 +103,14 @@ class FrameResult(capacity: Int = 32 * 1024) {
     object Gyro {
         const val ABSENT = 0
         const val CALIBRATING = 1
-        const val CALIBRATED = 2
+        const val PLATFORM_MOUNT = 2
+        const val FITTED_MOUNT = 3
 
         fun label(code: Int) = when (code) {
             ABSENT -> "off"
             CALIBRATING -> "calibrating (turn the phone)"
-            CALIBRATED -> "calibrated"
+            PLATFORM_MOUNT -> "calibrated (platform mount)"
+            FITTED_MOUNT -> "calibrated (fitted mount)"
             else -> "?"
         }
     }

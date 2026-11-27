@@ -101,7 +101,7 @@ data class AppSettings(
                 })
             }
             if (manualFocus && camera?.manualFocus == true) put("focus_diopters", focusDiopters.toDouble())
-            camera?.let { put("cam_from_imu", JSONArray(it.camFromImu.map { row -> JSONArray(row.toList()) })) }
+            camera?.camFromImu?.let { m -> put("cam_from_imu", JSONArray(m.map { row -> JSONArray(row) })) }
         })
         // gyro samples only line up with frames on a shared clock
         put("fusion", JSONObject().apply { put("gyro", camera?.gyroClockShared == true) })

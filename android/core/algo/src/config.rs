@@ -149,9 +149,9 @@ pub struct CameraCfg {
     pub guess: Option<IntrinsicsJson>,
     /// Locked lens focus (diopters); `None` while autofocus runs.
     pub focus_diopters: Option<f64>,
-    /// IMU→camera rotation (row-major) as Camera2 reports it (lens pose
-    /// relative to the gyroscope); the gyro self-calibration falls back on
-    /// it while the camera turns about one axis only.
+    /// IMU→camera rotation (row-major) as the platform defines it: Android's
+    /// sensor axes and Camera2's `SENSOR_ORIENTATION`. The gyro calibration
+    /// starts from it and refines it once the camera turns about two axes.
     pub cam_from_imu: Option<M3>,
 }
 
@@ -223,15 +223,7 @@ impl IntrinsicsFile {
         for (d, s) in dist.iter_mut().zip(&self.dist) {
             *d = *s;
         }
-        Intrinsics {
-            fx: self.fx,
-            fy: self.fy,
-            cx: self.cx,
-            cy: self.cy,
-            dist,
-            width: self.width as f64,
-            height: self.height as f64,
-        }
+        Intrinsics { fx: self.fx, fy: self.fy, cx: self.cx, cy: self.cy, dist, width: self.width as f64, height: self.height as f64 }
     }
 }
 
@@ -353,8 +345,7 @@ mod tests {
         assert_eq!(cfg.laser.laser_color(), LaserColor::Green);
         assert_eq!(cfg.calib_views, 64);
         assert_eq!(cfg.scan_gate, ScanGateCfg::default());
-        let cfg: Config =
-            serde_json::from_str(r#"{"scan_gate":{"max_speed_mm_s":60},"plane_fit":{"max_rms_mm":0.8}}"#).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{"scan_gate":{"max_speed_mm_s":60},"plane_fit":{"max_rms_mm":0.8}}"#).unwrap();
         assert_eq!(cfg.scan_gate.max_speed_mm_s, 60.0);
         assert_eq!(cfg.scan_gate.min_corners, ScanGateCfg::default().min_corners);
         assert_eq!(cfg.plane_fit.max_rms_mm, 0.8);
@@ -372,8 +363,7 @@ mod tests {
         assert!(!back.fits(&Intrinsics { cx: 0.0, ..k }), "a re-calibrated camera makes the plane stale");
         assert!(load_plane(&dir, "1").is_none());
         // the desktop prototype's file has no model: present, but not usable
-        fs::write(dir.join(PLANE_FILE), r#"{"n":[0,0.8,-0.6],"d":-120,"rms_mm":0.7,"n_points":10,"frame":"opencv_camera_mm"}"#)
-            .unwrap();
+        fs::write(dir.join(PLANE_FILE), r#"{"n":[0,0.8,-0.6],"d":-120,"rms_mm":0.7,"n_points":10,"frame":"opencv_camera_mm"}"#).unwrap();
         assert!(!load_plane(&dir, "0").unwrap().fits(&k));
         fs::remove_dir_all(&dir).unwrap();
     }

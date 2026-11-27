@@ -329,6 +329,13 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     // ── HUD / buttons ────────────────────────────────────────────────────────
 
+    /** IPPE's branch margin: "-" without one, "∞" for a single branch. */
+    private fun marginLabel(m: Float) = when {
+        m.isNaN() -> "-"
+        m.isInfinite() -> "∞"
+        else -> "%.1fx".format(m)
+    }
+
     private fun renderHud() {
         val r = processor.results.latest() ?: return
         fun f(slot: Int) = r[slot]
@@ -340,7 +347,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         if (r.flag(H.DETECTED)) {
             sb.append("board %d pts  rms %.2f px  margin %s  focus %s\n".format(
                 f(H.N_CORNERS).toInt(), f(H.REPROJ_RMS),
-                if (has(H.POSE_MARGIN)) "%.1fx".format(f(H.POSE_MARGIN)) else "-",
+                marginLabel(f(H.POSE_MARGIN)),
                 if (has(H.FOCUS_PCT)) "%.0f%%".format(f(H.FOCUS_PCT)) else "-"))
             sb.append("cam X %.1f  Y %.1f  Z %.1f mm  d %.0f\n".format(
                 f(H.CAM_X), f(H.CAM_Y), f(H.CAM_Z), f(H.DISTANCE)))

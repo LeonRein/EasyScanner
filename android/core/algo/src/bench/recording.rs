@@ -127,7 +127,8 @@ pub struct Recording {
     /// The laser plane the pipeline uses.
     pub laser_plane: PlaneRec,
     pub frames: Vec<FrameRec>,
-    /// The IMU→camera rotation the phone reported (Camera2 lens pose).
+    /// The IMU→camera rotation the platform defines (from Camera2's
+    /// `SENSOR_ORIENTATION`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cam_from_imu: Option<M3>,
     /// Gyroscope samples (gyro clock, IMU frame), oldest first.
@@ -141,9 +142,18 @@ impl Recording {
     /// 2: row timing per frame, gyro samples, truth poses at the middle row.
     pub const VERSION: u32 = 2;
 
+    /// Read a recording; one of another version is refused (its frame
+    /// timestamps and truth poses mean other instants).
     pub fn load(path: &Path) -> io::Result<Recording> {
         let f = std::fs::File::open(path)?;
-        serde_json::from_reader(io::BufReader::new(f)).map_err(io::Error::other)
+        let rec: Recording = serde_json::from_reader(io::BufReader::new(f)).map_err(io::Error::other)?;
+        if rec.version != Self::VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("recording version {} (this build reads version {})", rec.version, Self::VERSION),
+            ));
+        }
+        Ok(rec)
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {

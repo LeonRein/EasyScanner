@@ -9,9 +9,7 @@
 //! every observation is moved to the frame's middle row, so the pose and the
 //! stripe describe one instant.
 
-use serde::{Deserialize, Serialize};
-
-use crate::geom::{Intrinsics, Pose, V3, add, mat_t_vec, mat_vec, rodrigues, scale, sub};
+use crate::geom::{Intrinsics, Pose, V3, add, mat_mul, mat_t_vec, mat_vec, rodrigues, scale, sub};
 
 /// When each row of a frame was exposed.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,20 +48,6 @@ impl RowClock {
     }
 }
 
-/// Where the camera motion for the correction comes from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MotionSource {
-    /// No correction.
-    Off,
-    /// Rate and velocity from the recent board poses only.
-    Poses,
-    /// Rate from the calibrated gyro, velocity from the board poses; the
-    /// board poses alone until the gyro is calibrated.
-    #[default]
-    Gyro,
-}
-
 /// The camera's motion during one frame, constant over the readout.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameMotion {
@@ -99,7 +83,9 @@ impl FrameMotion {
 /// reference instant.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Correction {
+    /// When the frame's rows were exposed.
     pub clock: RowClock,
+    /// How the camera moved meanwhile.
     pub motion: FrameMotion,
 }
 
@@ -117,6 +103,15 @@ impl Correction {
                 k.project(self.motion.to_reference(scale(k.ray(u, v), z), dt)).unwrap_or([u, v])
             })
             .collect()
+    }
+
+    /// The board pose of the row at image height `v`, from the pose `mid`
+    /// at the reference instant: the inverse of [`FrameMotion::to_reference`]
+    /// applied to the board→camera map.
+    pub fn pose_at_row(&self, mid: &Pose, v: f64) -> Pose {
+        let dt = self.clock.dt(v);
+        let back = rodrigues(scale(self.motion.rate, -dt));
+        Pose { r: mat_mul(&back, &mid.r), t: mat_vec(&back, sub(mid.t, scale(self.motion.velocity, dt))) }
     }
 
     /// A stripe point triangulated in the camera frame of its own row (at
@@ -155,7 +150,7 @@ pub fn solve_corrected<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom::{mat_mul, norm};
+    use crate::geom::{norm, rotation_distance};
 
     fn k() -> Intrinsics {
         Intrinsics { fx: 920.0, fy: 920.0, cx: 639.5, cy: 479.5, dist: [0.05, -0.1, 0.0, 0.0, 0.0], width: 1280.0, height: 960.0 }
@@ -217,5 +212,10 @@ mod tests {
         let corrected = err(&corr.corners(&k, &obj, &observed, &mid));
         assert!(raw > 3.0, "the test motion must matter: {raw}");
         assert!(corrected < 1e-6, "{corrected}");
+        // the pose of a row is the moving camera's pose at that row's time
+        let v = 900.0;
+        let row = corr.pose_at_row(&mid, v);
+        let truth = at(c.dt(v));
+        assert!(rotation_distance(&row.r, &truth.r) < 1e-6 && norm(sub(row.t, truth.t)) < 1e-9, "{row:?}");
     }
 }

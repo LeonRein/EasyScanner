@@ -17,7 +17,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
 use jni::JNIEnv;
-use jni::objects::{JByteBuffer, JClass, JFloatArray, JLongArray, JString};
+use jni::objects::{JByteBuffer, JClass, JFloatArray, JLongArray, JString, ReleaseMode};
 use jni::sys::{jint, jlong, jstring};
 use scan_algo::imu::GyroSample;
 use scan_algo::laser::YuvFrame;
@@ -82,11 +82,7 @@ pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeCrea
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeDestroy<'l>(
-    _env: JNIEnv<'l>,
-    _cls: JClass<'l>,
-    handle: jlong,
-) {
+pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativeDestroy<'l>(_env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong) {
     if handle != 0 {
         // SAFETY: the handle came from Box::into_raw in nativeCreate.
         drop(unsafe { Box::from_raw(handle as *mut Engine) });
@@ -193,12 +189,12 @@ pub extern "system" fn Java_com_rawmechatronics_easyscanner_NativeLib_nativePush
     count: jint,
 ) {
     guard(&mut env, (), |env| {
-        let n = count.max(0) as usize;
-        let mut ts = vec![0i64; n];
-        let mut w = vec![0f32; 3 * n];
-        env.get_long_array_region(&timestamps_ns, 0, &mut ts).map_err(|e| e.to_string())?;
-        env.get_float_array_region(&rates, 0, &mut w).map_err(|e| e.to_string())?;
-        let samples = ts.iter().zip(w.chunks_exact(3)).map(|(&t_ns, r)| GyroSample { t_ns, rate: [r[0], r[1], r[2]].map(f64::from) });
+        // SAFETY: the arrays are only read, and released (without copying
+        // back) before this call returns; Kotlin does not touch them meanwhile
+        let ts = unsafe { env.get_array_elements(&timestamps_ns, ReleaseMode::NoCopyBack) }.map_err(|e| e.to_string())?;
+        let w = unsafe { env.get_array_elements(&rates, ReleaseMode::NoCopyBack) }.map_err(|e| e.to_string())?;
+        let n = (count.max(0) as usize).min(ts.len()).min(w.len() / 3);
+        let samples = ts[..n].iter().zip(w.chunks_exact(3)).map(|(&t_ns, r)| GyroSample { t_ns, rate: [r[0], r[1], r[2]].map(f64::from) });
         unsafe { engine(handle) }?.push_gyro(samples);
         Ok(())
     })

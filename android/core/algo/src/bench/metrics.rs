@@ -9,9 +9,11 @@ use serde::Serialize;
 
 use crate::geom::{V3, dot, norm, rotation_distance, sub};
 
+use crate::imu::MountSource;
+
 use super::pnp::{pose_error, solve_dense};
-use super::recording::Recording;
 use super::reconstruct::Reconstruction;
+use super::recording::Recording;
 use super::scene::Shape;
 
 /// Summary of a signed error sample.
@@ -144,9 +146,11 @@ pub struct GyroReport {
     pub from_frame: Option<usize>,
     /// Its fit residual (deg).
     pub residual_deg: f64,
+    /// The standard error of the mount if it was fitted, `None` if it is the
+    /// platform's (deg).
+    pub mount_sigma_deg: Option<f64>,
     /// Errors against the simulated gyro (synthetic recordings only).
     pub rotation_err_deg: Option<f64>,
-    pub bias_err_dps: Option<f64>,
     pub offset_err_ms: Option<f64>,
 }
 
@@ -196,8 +200,11 @@ pub fn evaluate(name: &str, rec: &Recording, recon: &Reconstruction) -> Report {
         GyroReport {
             from_frame: recon.gyro_from_frame,
             residual_deg: fit.residual_deg,
+            mount_sigma_deg: match fit.mount {
+                MountSource::Platform => None,
+                MountSource::Fitted { sigma_deg } => Some(sigma_deg),
+            },
             rotation_err_deg: true_gyro.map(|t| rotation_distance(&c.cam_from_imu, &t.cam_from_imu).to_degrees()),
-            bias_err_dps: true_gyro.map(|t| norm(sub(c.bias, t.bias)).to_degrees()),
             offset_err_ms: true_gyro.map(|t| (c.offset_ns - t.offset_ns) * 1e-6),
         }
     });
@@ -308,7 +315,14 @@ pub fn read_ply(path: &Path) -> io::Result<Vec<V3>> {
     };
     let sizes: Vec<usize> = props.iter().map(|(t, _)| size(t)).collect::<io::Result<_>>()?;
     let stride: usize = sizes.iter().sum();
-    let offs: Vec<usize> = sizes.iter().scan(0, |a, s| { let o = *a; *a += s; Some(o) }).collect();
+    let offs: Vec<usize> = sizes
+        .iter()
+        .scan(0, |a, s| {
+            let o = *a;
+            *a += s;
+            Some(o)
+        })
+        .collect();
     let get = |rec: &[u8], i: usize| -> f64 {
         let o = offs[i];
         match props[i].0.as_str() {
@@ -327,8 +341,8 @@ pub fn read_ply(path: &Path) -> io::Result<Vec<V3>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plane::Rng;
     use crate::bench::sim::gauss;
+    use crate::plane::Rng;
 
     #[test]
     fn sphere_fit_recovers_a_noisy_cap_with_outliers() {

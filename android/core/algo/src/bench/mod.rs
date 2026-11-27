@@ -7,10 +7,10 @@
 //! 1. [`sim`] simulates a hand-held scan of known solids ([`scene`]) on the
 //!    board: ChArUco corner pixels with noise and occlusion, the laser stripe
 //!    either projected exactly or rendered into a YUV frame and found by the
-//!    app's own [`crate::laser::LaserDetector`], rolling shutter, the phone's
-//!    gyroscope (noise, bias, clock offset, mounting), a wrong
-//!    camera calibration, and the app's laser-plane calibration replayed on
-//!    simulated board stripes.
+//!    app's own [`crate::laser::LaserDetector`], rolling shutter and wrongly
+//!    reported frame timing, the phone's gyroscope (noise, bias, scale,
+//!    jitter, clock offset, mount), a wrong camera calibration, and the
+//!    app's laser-plane calibration replayed on simulated board stripes.
 //! 2. The result is a [`recording::Recording`] — the same format a real phone
 //!    session can be saved in — with the ground truth attached.
 //! 3. [`reconstruct`] turns a recording into a cloud with the engine's steps
@@ -40,14 +40,13 @@ use crate::fusion::FusionCfg;
 use crate::geom::{Intrinsics, Pose, V3, dot, mat_vec, rodrigues};
 use crate::plane::Rng;
 use crate::plane::{PlaneCalibrator, PlaneFit};
-use crate::rolling::MotionSource;
 use crate::stripe;
 
 use metrics::Report;
 use reconstruct::{PoseFrom, Reconstruction};
 use recording::{CornerRec, FrameRec, PlaneRec, Recording, Truth, VolumeDims};
 use scene::{BoardDims, Scene, Shape};
-use sim::{Camera, CameraModel, GyroModel, IntrinsicsError, LaserMount, StripeModel, Trajectory, look_at};
+use sim::{Camera, CameraModel, GyroModel, IntrinsicsError, LaserMount, StripeModel, TimingError, Trajectory, look_at, uniform};
 
 /// Which laser plane the reconstruction uses.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +81,8 @@ pub struct BenchCfg {
     pub corner_noise_px: f64,
     /// Rolling-shutter readout, first to last row (ms); 0 = global shutter.
     pub rolling_shutter_ms: f64,
+    /// How the frame timing the camera reports is off.
+    pub timing: TimingError,
     pub stripe: StripeModel,
     /// The phone's gyroscope; `None` = no gyro samples in the recording.
     pub gyro: Option<GyroModel>,
@@ -106,6 +107,7 @@ impl Default for BenchCfg {
             trajectory: Trajectory::default(),
             corner_noise_px: 0.0,
             rolling_shutter_ms: 0.0,
+            timing: TimingError::default(),
             stripe: StripeModel::Analytic { noise_px: 0.0 },
             gyro: None,
             fusion: FusionCfg::default(),
@@ -137,7 +139,7 @@ impl BenchCfg {
 pub fn scenarios() -> Vec<BenchCfg> {
     let ideal = BenchCfg::default();
     let noisy = BenchCfg { corner_noise_px: 0.2, stripe: StripeModel::Analytic { noise_px: 0.3 }, ..ideal.clone() };
-    let no_correction = FusionCfg { rolling_shutter: MotionSource::Off, ..FusionCfg::default() };
+    let no_correction = FusionCfg { rolling_shutter: false, ..FusionCfg::default() };
     let mut out = vec![
         ideal.clone(),
         BenchCfg { corner_noise_px: 0.2, ..ideal.named("corner noise 0.2 px") },
@@ -159,11 +161,40 @@ pub fn scenarios() -> Vec<BenchCfg> {
         BenchCfg::realistic(),
     ];
     // a brisk hand: ~200 mm/s, ~35°/s — what the scan gate rejects today
-    let brisk = BenchCfg { rolling_shutter_ms: 20.0, trajectory: Trajectory { sweep_hz: 0.75, ..Trajectory::default() }, ..noisy };
+    let brisk = BenchCfg {
+        rolling_shutter_ms: 20.0,
+        trajectory: Trajectory { sweep_hz: 0.75, ..Trajectory::default() },
+        gyro: Some(GyroModel::default()),
+        ..noisy
+    };
     out.extend([
-        BenchCfg { fusion: no_correction, ..brisk.named("brisk, RS 20 ms, uncorrected") },
-        BenchCfg { fusion: FusionCfg { rolling_shutter: MotionSource::Poses, ..FusionCfg::default() }, ..brisk.named("brisk, RS corrected (poses)") },
-        BenchCfg { gyro: Some(GyroModel::default()), ..brisk.named("brisk, RS corrected (gyro)") },
+        BenchCfg { fusion: no_correction, ..brisk.named("brisk, uncorrected") },
+        BenchCfg { fusion: FusionCfg { gyro: false, ..FusionCfg::default() }, ..brisk.named("brisk, corrected from poses") },
+        brisk.named("brisk, corrected with gyro"),
+    ]);
+    // What the simulated camera and gyro get right by construction, broken
+    // one at a time. Timing and gyro errors leave an uncorrected
+    // reconstruction as it is, so "brisk, uncorrected" is their baseline;
+    // a different motion gets its own.
+    let two_axis = Trajectory { wobble_deg: 5.0, ..brisk.trajectory };
+    let skew = |rel: f64| TimingError { readout_rel: rel, ..TimingError::default() };
+    let late_stamp = TimingError { timestamp_shift_ms: brisk.rolling_shutter_ms, ..TimingError::default() };
+    let exposure = TimingError { exposure_ms: [2.0, 16.0], ..TimingError::default() };
+    let all_timing = TimingError { readout_rel: 0.1, timestamp_shift_ms: late_stamp.timestamp_shift_ms, exposure_ms: exposure.exposure_ms };
+    out.extend([
+        BenchCfg { trajectory: two_axis, fusion: no_correction, ..brisk.named("brisk two-axis (wobble 5°), uncorrected") },
+        BenchCfg { trajectory: two_axis, ..brisk.named("brisk two-axis (wobble 5°), gyro") },
+        BenchCfg { timing: skew(0.1), ..brisk.named("brisk, gyro, skew reported +10 %") },
+        BenchCfg { timing: skew(-0.1), ..brisk.named("brisk, gyro, skew reported −10 %") },
+        BenchCfg { timing: late_stamp, ..brisk.named("brisk, gyro, timestamp at readout end") },
+        BenchCfg { timing: exposure, ..brisk.named("brisk, gyro, exposure 2–16 ms") },
+        BenchCfg { gyro: Some(GyroModel::imperfect()), ..brisk.named("brisk, imperfect gyro") },
+        BenchCfg {
+            trajectory: two_axis,
+            timing: all_timing,
+            gyro: Some(GyroModel::imperfect()),
+            ..brisk.named("brisk two-axis, gyro, all of the above")
+        },
     ]);
     out
 }
@@ -179,11 +210,7 @@ fn calibration_pose(b: &BoardDims, i: usize) -> Pose {
     let el = (35.0 + 50.0 * frac(i * 0.618_034)).to_radians();
     let az = (360.0 * frac(i * 0.381_966 + 0.1)).to_radians();
     let dist = 280.0 + 160.0 * frac(i * 0.754_878);
-    let aim = [
-        0.5 * b.width_mm() + 80.0 * (frac(i * 0.569_840) - 0.5),
-        0.5 * b.height_mm() + 80.0 * (frac(i * 0.414_214) - 0.5),
-        0.0,
-    ];
+    let aim = [0.5 * b.width_mm() + 80.0 * (frac(i * 0.569_840) - 0.5), 0.5 * b.height_mm() + 80.0 * (frac(i * 0.414_214) - 0.5), 0.0];
     let out = [el.cos() * az.cos(), el.cos() * az.sin(), -el.sin()];
     let side = [-az.sin(), az.cos(), 0.0];
     look_at([aim[0] + dist * out[0], aim[1] + dist * out[1], aim[2] + dist * out[2]], aim, side)
@@ -210,7 +237,7 @@ pub fn calibrate_plane(cfg: &BenchCfg, frames: usize, min_lines: usize) -> Resul
         let truth = calibration_pose(&cfg.board, i);
         let obs = cam.observe(&|_| truth, 0.0);
         let Some(pose) = solve_corners(&cfg.board, &k_est, &obs.corners) else { continue };
-        if let Some(s) = stripe::on_board(&obs.laser_px, &k_est, &pose, &vol) {
+        if let Some(s) = stripe::on_board(&obs.laser_px, &k_est, &pose, None, &vol) {
             let n = cal.add(&s.cam_pts);
             if cal.ready() && n != solved_at {
                 solved_at = n;
@@ -247,20 +274,25 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Recording, String> {
     let readout_s = cfg.rolling_shutter_ms * 1e-3;
     let mut cam = Camera::new(&scene, cfg.camera.into(), cfg.laser, cfg.stripe, cfg.corner_noise_px, readout_s, cfg.seed);
     let traj = |t: f64| cfg.trajectory.pose(t);
+    let mut timing_rng = Rng::new(cfg.seed ^ 0x7131);
+    let ns = |s: f64| (s * 1e9).round() as i64;
     let mut frames = Vec::new();
     let mut poses = Vec::new();
+    // `t`: the middle of the first row's exposure
     for t in cfg.trajectory.frame_times() {
         let obs = cam.observe(&traj, t);
-        let frame = FrameRec {
-            ts_ns: (t * 1e9).round() as i64,
-            readout_ns: (readout_s * 1e9).round() as i64,
-            exposure_ns: 0,
+        let [lo, hi] = cfg.timing.exposure_ms;
+        let exposure_s = (lo + (hi - lo) * uniform(&mut timing_rng)) * 1e-3;
+        frames.push(FrameRec {
+            ts_ns: ns(t - 0.5 * exposure_s + cfg.timing.timestamp_shift_ms * 1e-3),
+            readout_ns: ns(readout_s * (1.0 + cfg.timing.readout_rel)),
+            exposure_ns: ns(exposure_s),
             pose: None,
             corners: obs.corners.iter().map(|&(id, q)| CornerRec { id, u: q[0], v: q[1] }).collect(),
             laser_px: obs.laser_px,
-        };
-        poses.push(traj(frame.clock(cfg.camera.height).mid_ns() * 1e-9).into());
-        frames.push(frame);
+        });
+        // the true middle row, whatever the reported timing says
+        poses.push(traj(t + 0.5 * readout_s).into());
     }
     let gyro = cfg.gyro.map_or_else(Vec::new, |g| {
         let end = cfg.trajectory.duration_s + readout_s + 0.1;
@@ -274,7 +306,7 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Recording, String> {
         intrinsics: cfg.intrinsics_error.apply(cfg.camera),
         laser_plane: used,
         frames,
-        cam_from_imu: cfg.gyro.map(|g| g.reported_mount()),
+        cam_from_imu: cfg.gyro.map(|g| g.platform_mount()),
         gyro,
         truth: Some(Truth {
             scene,
@@ -368,29 +400,41 @@ mod tests {
             trajectory: Trajectory { duration_s: 6.0, azimuth_span_deg: 108.0, sweep_hz: 0.75, ..Trajectory::default() },
             ..BenchCfg::default()
         };
-        let off = BenchCfg { fusion: FusionCfg { rolling_shutter: MotionSource::Off, ..FusionCfg::default() }, ..brisk.clone() };
+        let off = BenchCfg { fusion: FusionCfg { rolling_shutter: false, ..FusionCfg::default() }, ..brisk.clone() };
         let (raw, corrected) = (run(&off).unwrap().report, run(&brisk).unwrap().report);
         let (a, b) = (raw.pose_pos_mm.unwrap().rms, corrected.pose_pos_mm.unwrap().rms);
         assert!(b < 0.6 * a, "pose error {a:.2} mm uncorrected, {b:.2} mm corrected");
         assert!(corrected.corrected_frames > corrected.frames * 9 / 10);
     }
 
-    #[test]
-    fn gyro_self_calibration_finds_the_simulated_gyro() {
-        let cfg = BenchCfg {
+    fn gyro_scan(duration_s: f64, wobble_deg: f64) -> BenchCfg {
+        BenchCfg {
             corner_noise_px: 0.2,
             rolling_shutter_ms: 20.0,
             gyro: Some(GyroModel::default()),
-            trajectory: Trajectory { duration_s: 6.0, azimuth_span_deg: 108.0, ..Trajectory::default() },
+            trajectory: Trajectory { duration_s, azimuth_span_deg: 18.0 * duration_s, wobble_deg, ..Trajectory::default() },
             ..BenchCfg::default()
-        };
-        let g = run(&cfg).unwrap().report.gyro.expect("the gyro calibrates");
-        // the smooth orbit turns about one axis: the reported mounting (0.5° off) is kept
-        assert!(g.rotation_err_deg.unwrap() < 1.0, "{g:?}");
-        // the offset is the one that makes gyro and board agree; it also takes
-        // up the few ms by which the not yet gyro-corrected poses lag
-        assert!(g.offset_err_ms.unwrap().abs() < 10.0, "{g:?}");
-        assert!(g.from_frame.is_some_and(|f| f < 90), "{g:?}");
+        }
+    }
+
+    #[test]
+    fn gyro_self_calibration_finds_the_simulated_gyro() {
+        let g = run(&gyro_scan(8.0, 1.0)).unwrap().report.gyro.expect("the gyro calibrates");
+        // the hand turns about one axis: the platform's mount (0.5° off) is kept
+        assert_eq!(g.mount_sigma_deg, None, "{g:?}");
+        assert!((g.rotation_err_deg.unwrap() - 0.5).abs() < 1e-6, "{g:?}");
+        // the orbit turns the camera at a steady 18°/s, which hides the offset:
+        // only changes of the rate show it (and only they suffer from it)
+        assert!(g.offset_err_ms.unwrap().abs() < 8.0, "{g:?}");
+        assert!(g.from_frame.is_some_and(|f| f <= 61), "{g:?}");
+    }
+
+    #[test]
+    fn a_two_axis_hand_fits_the_mount() {
+        let g = run(&gyro_scan(16.0, 5.0)).unwrap().report.gyro.expect("the gyro calibrates");
+        assert!(g.mount_sigma_deg.is_some(), "the mount is fitted: {g:?}");
+        assert!(g.rotation_err_deg.unwrap() < 0.4, "better than the platform's 0.5°: {g:?}");
+        assert!(g.offset_err_ms.unwrap().abs() < 3.0, "{g:?}");
     }
 
     #[test]

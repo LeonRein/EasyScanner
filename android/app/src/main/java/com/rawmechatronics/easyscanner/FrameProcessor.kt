@@ -94,7 +94,7 @@ class FrameProcessor(filesDir: String, private val listener: Listener) : ImageRe
                     NativeLib.nativePushGyro(handle, gyroBatch.timestampsNs, gyroBatch.rates, gyroBatch.count)
                 }
             }
-            val rows = timing?.rowTiming ?: RowTiming.UNKNOWN
+            val rows = timing?.rowTiming(img.timestamp) ?: RowTiming.UNKNOWN
             val out = results.writeBuffer()
             val t0 = System.nanoTime()
             var n = NativeLib.nativeProcess(

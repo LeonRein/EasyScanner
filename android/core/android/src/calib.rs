@@ -21,7 +21,20 @@ use scan_algo::geom::{Intrinsics, Pose};
 use crate::board::{make_board, pose_from};
 
 /// Reprojection-RMS ceiling (px) at 1920 px, scaled up for larger frames.
-const MAX_RMS_PX: f64 = 2.5;
+/// A phone with a printed board reaches 0.3–0.6 px; more means blurred or
+/// misdetected views, or a board that is not the one configured.
+const MAX_RMS_PX: f64 = 1.5;
+/// The focal length's standard deviation must stay below this fraction of
+/// it: the views must pin K down, not just fit it (0.5 % of f costs about
+/// 1.4 mm with the true laser plane in the benchmark).
+const MAX_FOCAL_SIGMA_REL: f64 = 0.002;
+/// A view reprojecting this many times worse than the median view (and at
+/// least `OUTLIER_MIN_PX`) is dropped and K solved again without it.
+const OUTLIER_FACTOR: f64 = 3.0;
+const OUTLIER_MIN_PX: f64 = 0.5;
+/// At most this fraction of the views is dropped as outliers. More than
+/// that is no stray view but a systematic problem, left to the RMS gate.
+const MAX_OUTLIER_FRAC: f64 = 0.2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalibState {
@@ -32,18 +45,22 @@ pub enum CalibState {
     Rejected = 4,
 }
 
+/// A camera calibration that passed the gates.
+pub struct Calibration {
+    pub k: Intrinsics,
+    pub rms: f64,
+    /// Standard deviations of fx, fy, cx, cy (px).
+    pub sigma: [f64; 4],
+    /// Views dropped as outliers before the final solve.
+    pub dropped: usize,
+    /// The board's shape measured with it, when asked for and the views
+    /// determined one.
+    pub surface: Option<SurfaceFit>,
+}
+
 pub enum Outcome {
-    /// `surface`: the board's shape measured with it, when asked for and
-    /// the views determined one.
-    Solved {
-        k: Intrinsics,
-        rms: f64,
-        surface: Option<SurfaceFit>,
-    },
-    Rejected {
-        rms: f64,
-        reason: String,
-    },
+    Solved(Box<Calibration>),
+    Rejected { rms: f64, reason: String },
 }
 
 struct View {
@@ -138,7 +155,8 @@ impl LiveCalibrator {
         }
         let out = self.job.take()?.join().unwrap_or(Outcome::Rejected { rms: f64::INFINITY, reason: "solver panicked".into() });
         match &out {
-            Outcome::Solved { rms, .. } | Outcome::Rejected { rms, .. } => self.last_rms = rms.is_finite().then_some(*rms),
+            Outcome::Solved(c) => self.last_rms = Some(c.rms),
+            Outcome::Rejected { rms, .. } => self.last_rms = rms.is_finite().then_some(*rms),
         }
         Some(out)
     }
@@ -194,6 +212,16 @@ fn solve(
     let size = Size::new(w as i32, h as i32);
     let mut solved = calibrate(&obj_all, &img_all, size, &seed)?;
 
+    // views far worse than the rest (blurred, a misdetected corner): drop
+    // them and solve again
+    let mut dropped = 0;
+    if let Some(keep) = inliers(&solved.view_errors) {
+        dropped = keep.iter().filter(|&&k| !k).count();
+        obj_all = obj_all.iter().zip(&keep).filter(|&(_, &k)| k).map(|(v, _)| v).collect();
+        img_all = img_all.iter().zip(&keep).filter(|&(_, &k)| k).map(|(v, _)| v).collect();
+        solved = calibrate(&obj_all, &img_all, size, &solved.k)?;
+    }
+
     // the board's shape from the solve's poses, then K again with the
     // corners on that shape; kept when it fits the views better
     let mut surface = None;
@@ -208,7 +236,7 @@ fn solve(
             solved = again;
         }
     }
-    let Solved { k: out, rms, .. } = solved;
+    let Solved { k: out, rms, sigma, .. } = solved;
 
     let gate = MAX_RMS_PX * (w as f64 / 1920.0).max(1.0);
     if !rms.is_finite() || rms > gate {
@@ -223,18 +251,46 @@ fn solve(
             ),
         });
     }
-    Ok(Outcome::Solved { k: out, rms, surface })
+    if !(sigma[0] <= MAX_FOCAL_SIGMA_REL * out.fx && sigma[1] <= MAX_FOCAL_SIGMA_REL * out.fy) {
+        return Ok(Outcome::Rejected {
+            rms,
+            reason: format!(
+                "focal length uncertain (±{:.1} px of {:.0}) — add views from steeper angles and closer",
+                sigma[0].max(sigma[1]),
+                out.fx
+            ),
+        });
+    }
+    Ok(Outcome::Solved(Box::new(Calibration { k: out, rms, sigma, dropped, surface })))
 }
 
 /// One `calibrateCamera` result.
 struct Solved {
     k: Intrinsics,
     rms: f64,
+    /// Standard deviations of fx, fy, cx, cy (px).
+    sigma: [f64; 4],
+    /// Each view's reprojection RMS (px).
+    view_errors: Vec<f64>,
     poses: Vec<Pose>,
 }
 
 /// `cv::calibrateCamera` from `seed`. Board points off the plane z = 0 need
 /// the intrinsic guess, which is always given.
+/// Which views to keep, given each view's reprojection error: `None` when
+/// there is no outlier, or more than [`MAX_OUTLIER_FRAC`] of them. The drop
+/// may leave fewer views than the target: the solve runs as soon as the
+/// target is reached, so any drop at all would otherwise be refused.
+fn inliers(view_errors: &[f64]) -> Option<Vec<bool>> {
+    let mut sorted = view_errors.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let median = *sorted.get(sorted.len() / 2)?;
+    let limit = (OUTLIER_FACTOR * median).max(OUTLIER_MIN_PX);
+    let keep: Vec<bool> = view_errors.iter().map(|&e| e <= limit).collect();
+    let outliers = keep.iter().filter(|&&k| !k).count();
+    (outliers > 0 && outliers as f64 <= MAX_OUTLIER_FRAC * view_errors.len() as f64).then_some(keep)
+}
+
 fn calibrate(obj: &Vector<Vector<Point3f>>, img: &Vector<Vector<Point2f>>, size: Size, seed: &Intrinsics) -> opencv::Result<Solved> {
     let mut k = Mat::from_slice_2d(&[[seed.fx, 0.0, seed.cx], [0.0, seed.fy, seed.cy], [0.0, 0.0, 1.0]])?;
     let mut d = Mat::from_slice(&seed.dist)?.try_clone()?;
@@ -242,7 +298,26 @@ fn calibrate(obj: &Vector<Vector<Point3f>>, img: &Vector<Vector<Point2f>>, size:
     // never FIX_ASPECT_RATIO / FIX_PRINCIPAL_POINT (same as the server)
     let flags = calib3d::CALIB_USE_INTRINSIC_GUESS | calib3d::CALIB_ZERO_TANGENT_DIST | calib3d::CALIB_FIX_K3;
     let criteria = TermCriteria::new(core::TermCriteria_COUNT + core::TermCriteria_EPS, 30, f64::EPSILON)?;
-    let rms = calib3d::calibrate_camera(obj, img, size, &mut k, &mut d, &mut rvecs, &mut tvecs, flags, criteria)?;
+    let (mut std_intrinsics, mut std_extrinsics, mut per_view) = (Mat::default(), Mat::default(), Mat::default());
+    let rms = calib3d::calibrate_camera_extended(
+        obj,
+        img,
+        size,
+        &mut k,
+        &mut d,
+        &mut rvecs,
+        &mut tvecs,
+        &mut std_intrinsics,
+        &mut std_extrinsics,
+        &mut per_view,
+        flags,
+        criteria,
+    )?;
+    let mut sigma = [0.0; 4];
+    for (i, v) in sigma.iter_mut().enumerate() {
+        *v = *std_intrinsics.at::<f64>(i as i32)?;
+    }
+    let view_errors = (0..per_view.rows()).map(|i| per_view.at::<f64>(i).copied()).collect::<opencv::Result<Vec<f64>>>()?;
     let mut dist = [0.0; 5];
     for (i, v) in dist.iter_mut().enumerate() {
         *v = *d.at::<f64>(i as i32)?;
@@ -257,7 +332,7 @@ fn calibrate(obj: &Vector<Vector<Point3f>>, img: &Vector<Vector<Point2f>>, size:
         height: f64::from(size.height),
     };
     let poses = rvecs.iter().zip(tvecs.iter()).map(|(r, t)| pose_from(&r, &t)).collect::<opencv::Result<_>>()?;
-    Ok(Solved { k, rms, poses })
+    Ok(Solved { k, rms, sigma, view_errors, poses })
 }
 
 /// The board's shape from a solve's views and poses, when they determine it.
@@ -285,4 +360,29 @@ fn measure_surface(
 /// The views' board points moved onto `surface`.
 fn on_surface(obj: &Vector<Vector<Point3f>>, surface: &BoardSurface) -> Vector<Vector<Point3f>> {
     obj.iter().map(|o| o.iter().map(|p| Point3f::new(p.x, p.y, surface.height(f64::from(p.x), f64::from(p.y)) as f32)).collect()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_blurred_view_is_dropped_even_at_the_target_count() {
+        let mut errors = vec![0.3; 64];
+        errors[17] = 2.4;
+        let keep = inliers(&errors).expect("an outlier");
+        assert_eq!(keep.iter().filter(|&&k| !k).count(), 1);
+        assert!(!keep[17]);
+    }
+
+    #[test]
+    fn small_or_widespread_errors_drop_nothing() {
+        assert_eq!(inliers(&[0.3; 64]), None);
+        // above 3x the median but below the floor: the views are all fine
+        assert_eq!(inliers(&[0.05, 0.05, 0.05, 0.4]), None);
+        // a quarter of the views off is a systematic problem, not stray views
+        let errors: Vec<f64> = (0..64).map(|i| if i % 4 == 0 { 3.0 } else { 0.3 }).collect();
+        assert_eq!(inliers(&errors), None);
+        assert_eq!(inliers(&[]), None);
+    }
 }

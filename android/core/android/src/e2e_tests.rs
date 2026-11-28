@@ -657,10 +657,15 @@ fn a_bent_board_is_measured_and_a_moved_one_noticed() {
 
     // the board laid down anew, flat this time: doubted, then re-measured
     let flat = BoardSurface::flat();
-    let (_, mut seen) = hold_views(&mut e, &r, &k, &flat, SurfaceState::Replaced);
-    if !seen.contains(&(SurfaceState::Replaced as i32)) {
-        // the doubt dropped the views: the next round decides
+    // The first fit after the move mixes views of both placements and
+    // raises the doubt; it drops the views, so later fits see the flat board
+    // only. A replacement needs two of them that agree: up to three rounds.
+    let mut seen = Vec::new();
+    for _ in 0..3 {
         seen.extend(hold_views(&mut e, &r, &k, &flat, SurfaceState::Replaced).1);
+        if seen.contains(&(SurfaceState::Replaced as i32)) {
+            break;
+        }
     }
     eprintln!("states after the move: {seen:?}");
     let doubted = seen.iter().position(|&s| s == SurfaceState::Measuring as i32);

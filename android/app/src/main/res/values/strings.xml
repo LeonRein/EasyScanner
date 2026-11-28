@@ -106,6 +106,7 @@
     <string name="photo_taking">taking a photo…</string>
     <string name="photo_hold_board">photo due: board out of view</string>
     <string name="photo_hold_steady">photo due: hold steady</string>
+    <string name="scan_stopped">The scan stopped by itself. Resume it or finish the scan.</string>
     <string name="act_resume">Resume</string>
     <string name="act_finish">Finish</string>
     <string name="act_discard">Discard scan</string>

@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#08080A"
+    android:background="?attr/colorSurfaceContainerLowest"
     android:fitsSystemWindows="true">
 
+    <!-- the camera picture; its aspect is set in code, the overlay maps onto it -->
     <FrameLayout
         android:id="@+id/previewFrame"
         android:layout_width="0dp"
@@ -25,65 +27,149 @@
             android:layout_width="match_parent"
             android:layout_height="match_parent" />
 
+        <!-- is the board in view; a long press shows the debug overlay -->
+        <com.google.android.material.chip.Chip
+            android:id="@+id/boardStatus"
+            style="@style/Widget.Material3.Chip.Assist"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|start"
+            android:layout_margin="12dp"
+            android:accessibilityLiveRegion="polite"
+            android:textAppearance="?attr/textAppearanceLabelLarge"
+            app:chipBackgroundColor="@color/preview_scrim"
+            app:chipStrokeWidth="0dp"
+            tools:chipIcon="@drawable/ic_check_circle"
+            tools:text="Board found" />
+
+        <LinearLayout
+            android:id="@+id/topActions"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|end"
+            android:layout_margin="8dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/libraryButton"
+                style="@style/Widget.EasyScanner.PreviewIconButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="@string/library"
+                app:icon="@drawable/ic_photo_library" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/settingsButton"
+                style="@style/Widget.EasyScanner.PreviewIconButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="@string/settings"
+                app:icon="@drawable/ic_settings" />
+        </LinearLayout>
+
+        <!-- the debug overlay: off unless Settings › Debug overlay is on -->
         <TextView
             android:id="@+id/hud"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_margin="6dp"
-            android:background="#B308080A"
+            android:layout_gravity="top|start"
+            android:layout_marginStart="12dp"
+            android:layout_marginTop="64dp"
+            android:layout_marginEnd="12dp"
+            android:background="@drawable/bg_preview_scrim"
             android:fontFamily="monospace"
-            android:padding="6dp"
-            android:textColor="#FAFAFA"
-            android:textSize="10sp" />
+            android:padding="8dp"
+            android:textAppearance="?attr/textAppearanceLabelSmall"
+            android:textColor="?attr/colorOnSurface"
+            android:visibility="gone" />
 
-        <ImageButton
-            android:id="@+id/settingsButton"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
-            android:layout_gravity="top|end"
-            android:layout_margin="6dp"
-            android:background="#B308080A"
-            android:contentDescription="@string/settings"
-            android:src="@android:drawable/ic_menu_preferences" />
-
-        <ImageButton
-            android:id="@+id/libraryButton"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
-            android:layout_gravity="top|end"
-            android:layout_marginTop="6dp"
-            android:layout_marginEnd="56dp"
-            android:background="#B308080A"
-            android:contentDescription="@string/library"
-            android:src="@android:drawable/ic_menu_gallery" />
+        <!-- why the running step makes no progress, readable at arm's length -->
+        <TextView
+            android:id="@+id/coach"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_margin="16dp"
+            android:background="@drawable/bg_preview_scrim"
+            android:drawablePadding="8dp"
+            android:gravity="center_vertical"
+            android:paddingStart="12dp"
+            android:paddingTop="8dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="8dp"
+            android:textAppearance="?attr/textAppearanceTitleMedium"
+            android:textColor="?attr/colorOnSurface"
+            android:visibility="gone"
+            app:drawableStartCompat="@drawable/ic_warning"
+            app:drawableTint="@color/md_error"
+            tools:text="Board not found: keep it all in the picture"
+            tools:visibility="visible" />
     </FrameLayout>
 
     <LinearLayout
+        android:id="@+id/panel"
         android:layout_width="0dp"
         android:layout_height="0dp"
+        android:background="@drawable/bg_panel"
         android:orientation="vertical"
-        android:padding="8dp"
+        android:paddingStart="20dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="12dp"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@id/previewFrame">
 
-        <!-- the guided steps (filled in code); the mode toggle replaces them in expert mode -->
+        <!-- guided mode: "Step 3 of 5", tap for all steps; the help button -->
         <LinearLayout
-            android:id="@+id/steps"
+            android:id="@+id/stepHeader"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="horizontal" />
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/stepLabel"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="-12dp"
+                android:textAppearance="?attr/textAppearanceLabelLarge"
+                tools:text="Step 3 of 5" />
+
+            <com.google.android.material.progressindicator.LinearProgressIndicator
+                android:id="@+id/stepProgress"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1"
+                android:importantForAccessibility="no"
+                android:max="5"
+                app:trackCornerRadius="2dp"
+                app:trackThickness="4dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/helpButton"
+                style="@style/Widget.Material3.Button.IconButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="-12dp"
+                android:contentDescription="@string/help"
+                app:icon="@drawable/ic_help" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/stepTitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:paddingTop="8dp"
-            android:textColor="#FAFAFA"
-            android:textSize="18sp"
-            android:textStyle="bold" />
+            android:accessibilityHeading="true"
+            android:textAppearance="?attr/textAppearanceHeadlineSmall"
+            android:textColor="?attr/colorOnSurface"
+            tools:text="Calibrate the camera" />
 
+        <!-- expert mode: the four tool modes -->
         <com.google.android.material.button.MaterialButtonToggleGroup
             android:id="@+id/modes"
             android:layout_width="match_parent"
@@ -124,58 +210,129 @@
                 android:text="@string/mode_scan" />
         </com.google.android.material.button.MaterialButtonToggleGroup>
 
-        <!-- scrolls: a step's text plus the core's messages can outgrow the
-             panel, above all at large font scales -->
+        <!-- scrolls: at large font scales a step's content can outgrow the panel -->
         <ScrollView
-            android:id="@+id/statusScroll"
+            android:id="@+id/panelScroll"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
             android:fadeScrollbars="false">
 
-            <TextView
-                android:id="@+id/status"
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:paddingTop="6dp"
-                android:textColor="#D8D4D4"
-                android:textSize="13sp" />
+                android:orientation="vertical"
+                android:paddingTop="4dp"
+                android:paddingBottom="8dp">
+
+                <TextView
+                    android:id="@+id/instruction"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textAppearance="?attr/textAppearanceBodyLarge"
+                    android:textColor="?attr/colorOnSurfaceVariant"
+                    tools:text="Move the phone slowly around the board, tilted to every side, near and far." />
+
+                <TextView
+                    android:id="@+id/metric"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:paddingTop="12dp"
+                    android:textAppearance="?attr/textAppearanceHeadlineMedium"
+                    android:textColor="?attr/colorOnSurface"
+                    android:visibility="gone"
+                    tools:text="12.4 k points" />
+
+                <LinearLayout
+                    android:id="@+id/progressRow"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:paddingTop="16dp">
+
+                    <com.google.android.material.progressindicator.LinearProgressIndicator
+                        android:id="@+id/progress"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:max="1000"
+                        app:trackCornerRadius="4dp"
+                        app:trackThickness="8dp" />
+
+                    <TextView
+                        android:id="@+id/progressLabel"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="12dp"
+                        android:textAppearance="?attr/textAppearanceLabelLarge"
+                        android:textColor="?attr/colorOnSurface"
+                        tools:text="7 of 20 views" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/detail"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:paddingTop="8dp"
+                    android:textAppearance="?attr/textAppearanceBodyMedium"
+                    android:textColor="?attr/colorOnSurfaceVariant"
+                    android:visibility="gone" />
+
+                <com.google.android.material.card.MaterialCardView
+                    android:id="@+id/notice"
+                    style="@style/Widget.Material3.CardView.Filled"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:visibility="gone">
+
+                    <TextView
+                        android:id="@+id/noticeText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:drawablePadding="12dp"
+                        android:gravity="center_vertical"
+                        android:padding="12dp"
+                        android:textAppearance="?attr/textAppearanceBodyMedium"
+                        app:drawableStartCompat="@drawable/ic_warning" />
+                </com.google.android.material.card.MaterialCardView>
+            </LinearLayout>
         </ScrollView>
 
+        <!-- the overflow, one secondary action and the primary one, always at the end -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:gravity="center_vertical"
             android:orientation="horizontal">
 
-            <Button
-                android:id="@+id/action1"
-                android:layout_width="0dp"
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/overflowButton"
+                style="@style/Widget.Material3.Button.IconButton"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginEnd="4dp"
-                android:layout_weight="1" />
+                android:layout_marginStart="-8dp"
+                android:contentDescription="@string/more_actions"
+                app:icon="@drawable/ic_more_vert" />
 
-            <Button
-                android:id="@+id/action2"
-                style="?attr/materialButtonOutlinedStyle"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_marginEnd="4dp"
-                android:layout_weight="1" />
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/secondaryAction"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="wrap_content"
+                android:layout_height="56dp"
+                android:layout_marginEnd="8dp"
+                android:maxWidth="160dp"
+                tools:text="Finish" />
 
-            <Button
-                android:id="@+id/action3"
-                style="?attr/materialButtonOutlinedStyle"
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/primaryAction"
+                style="@style/Widget.Material3.Button"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_marginEnd="4dp"
-                android:layout_weight="1" />
-
-            <Button
-                android:id="@+id/action4"
-                style="?attr/materialButtonOutlinedStyle"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1" />
+                android:layout_height="56dp"
+                android:layout_weight="1"
+                android:textAppearance="?attr/textAppearanceLabelLarge"
+                tools:text="Start" />
         </LinearLayout>
     </LinearLayout>
 </androidx.constraintlayout.widget.ConstraintLayout>

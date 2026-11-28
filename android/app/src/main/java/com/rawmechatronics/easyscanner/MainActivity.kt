@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraManager
@@ -16,14 +15,8 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
-import android.view.Gravity
 import android.view.TextureView
-import android.view.View
 import android.view.WindowManager
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -31,6 +24,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
 import androidx.preference.PreferenceManager
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.snackbar.Snackbar
 import com.rawmechatronics.easyscanner.FrameResult.Calib
 import com.rawmechatronics.easyscanner.FrameResult.Ev
 import com.rawmechatronics.easyscanner.FrameResult.H
@@ -56,9 +51,6 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     private enum class Mode { VIEW, CAMERA, LASER, SCAN }
 
-    /** One button of the guided panel. */
-    private class Act(val label: String, val enabled: Boolean = true, val run: () -> Unit)
-
     private lateinit var b: ActivityMainBinding
     private lateinit var mgr: CameraManager
     private lateinit var processor: FrameProcessor
@@ -78,6 +70,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private var calibActive = false
     private var planeActive = false
     private var scanOn = false
+    /** This side asked the scan to stop; any other stop came from the core (cloud full, board moved). */
+    private var scanStopRequested = false
 
     /** The open photo session's directory (set on the UI thread, read on the still thread). */
     /** Back while a scan session is open asks first instead of leaving it behind. */
@@ -98,12 +92,13 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     private val wizard = Wizard()
     private var readiness = Readiness(boardConfirmed = false, focusLocked = false, calibrated = false, planeReady = false)
-    private val stepViews = ArrayList<TextView>()
-    private var acts: List<Act?> = emptyList()
+    private lateinit var panel: PanelView
     /** The last copy to Download, for the Saved step, and the session it is of. */
     private var copied: SessionExport.Copied? = null
     private var exporting: File? = null
     private var copyNote = ""
+    /** What the copy holds, under [copyNote]. */
+    private var copyDetail: String? = null
     /** Unsaved sessions are offered once per process. */
     private var pendingOffered = false
 
@@ -149,8 +144,14 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         b.overlay.source = processor.results
         settings = AppSettings.load(this)
 
+        panel = PanelView(b)
         b.settingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
         b.libraryButton.setOnClickListener { startActivity(Intent(this, LibraryActivity::class.java)) }
+        b.stepLabel.setOnClickListener { showSteps() }
+        b.boardStatus.setOnLongClickListener {
+            toggleDebugOverlay()
+            true
+        }
         b.modes.check(R.id.modeView)
         b.modes.addOnButtonCheckedListener { _, id, checked ->
             if (checked && expert) setMode(
@@ -161,24 +162,6 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                     else -> Mode.VIEW
                 }
             )
-        }
-        for (s in STEPS) {
-            val v = TextView(this).apply {
-                gravity = Gravity.CENTER
-                setPadding(0, 6, 0, 6)
-                textSize = 13f
-                setOnClickListener { openStep(s) }
-            }
-            b.steps.addView(v, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            stepViews.add(v)
-        }
-        listOf(b.action1, b.action2, b.action3, b.action4).forEachIndexed { i, btn ->
-            btn.setOnClickListener { onAction(i) }
-        }
-        b.action4.setOnLongClickListener {
-            if (!expert || mode != Mode.SCAN || photoDir == null) return@setOnLongClickListener false
-            processor.command(Cmd.PHOTO_SNAP) { renderStatus() }
-            true
         }
         b.texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) = startCamera()
@@ -230,7 +213,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         applyInterface()
         val ids = CameraInfo.backCameraIds(mgr)
         if (ids.isEmpty()) {
-            status(getString(R.string.no_camera))
+            showNote(getString(R.string.no_camera), Snackbar.LENGTH_INDEFINITE)
             return
         }
         val inf = CameraInfo.query(mgr, st.cameraId.takeIf { it in ids } ?: ids.first(), st.targetFps, st.maxLongSide)
@@ -250,7 +233,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 .also { it.reset(0, System.nanoTime()) }
         } else null
         camera.open(inf, b.texture.surfaceTexture!!, sizes.first(), st)
-        renderButtons()
+        renderPanel()
         offerPending()
     }
 
@@ -262,7 +245,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             onError("camera session failed at ${size.width}x${size.height}")
             return
         }
-        status("camera refused ${size.width}x${size.height}, using ${sizes[next].width}x${sizes[next].height}")
+        showNote("camera refused ${size.width}x${size.height}, using ${sizes[next].width}x${sizes[next].height}")
         processor.handler.post { governor?.limitTo(next, System.nanoTime()) }
         camera.setAnalysisSize(sizes[next])
     }
@@ -334,98 +317,44 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
      */
     private fun onStillFailed(msg: String, fatal: Boolean) {
         if (photoDir == null) return
-        status(msg)
+        showNote(msg)
         if (fatal) {
-            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-            processor.command(Cmd.PHOTOS_OFF, msg) { renderStatus() }
+            processor.command(Cmd.PHOTOS_OFF, msg) { renderPanel() }
             camera.setStills(emptyList())
         } else {
-            processor.command(Cmd.PHOTO_FAILED, msg) { renderStatus() }
+            processor.command(Cmd.PHOTO_FAILED, msg) { renderPanel() }
         }
     }
 
     override fun onMessages(json: String) {
         messages = runCatching { JSONObject(json) }.getOrDefault(messages)
-        renderStatus()
+        renderPanel()
     }
 
-    override fun onError(msg: String) {
-        status(msg)
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-    }
+    override fun onError(msg: String) = showNote(msg)
 
-    // ── HUD / buttons ────────────────────────────────────────────────────────
-
-    /** IPPE's branch margin: "-" without one, "∞" for a single branch. */
-    private fun marginLabel(m: Float) = when {
-        m.isNaN() -> "-"
-        m.isInfinite() -> "∞"
-        else -> "%.1fx".format(m)
-    }
+    // ── preview overlays and the panel ───────────────────────────────────────
 
     private fun renderHud() {
         val r = processor.results.latest() ?: return
-        fun f(slot: Int) = r[slot]
-        fun has(slot: Int) = !f(slot).isNaN()
-        val sb = StringBuilder()
-        sb.append("%.0fx%.0f  %.1f fps  proc %.1f ms (board %.1f, laser %.1f)\n".format(
-            f(H.FRAME_W), f(H.FRAME_H), fps.fps, r.procMs, f(H.T_BOARD_MS), f(H.T_LASER_MS)))
-        sb.append(governor?.let { "auto: ${it.status}" } ?: "fixed resolution").append('\n')
-        if (r.flag(H.DETECTED)) {
-            sb.append("board %d pts  rms %.2f px  margin %s  focus %s\n".format(
-                f(H.N_CORNERS).toInt(), f(H.REPROJ_RMS),
-                marginLabel(f(H.POSE_MARGIN)),
-                if (has(H.FOCUS_PCT)) "%.0f%%".format(f(H.FOCUS_PCT)) else "-"))
-            sb.append("cam X %.1f  Y %.1f  Z %.1f mm  d %.0f\n".format(
-                f(H.CAM_X), f(H.CAM_Y), f(H.CAM_Z), f(H.DISTANCE)))
-            sb.append("    roll %.1f  pitch %.1f  yaw %.1f deg\n".format(f(H.ROLL), f(H.PITCH), f(H.YAW)))
-        } else {
-            sb.append("board: not found (%d corners, %d markers)\n".format(f(H.N_CORNERS).toInt(), f(H.N_MARKERS).toInt()))
+        val st = settings
+        if (st?.debugOverlay == true) {
+            b.hud.text = DebugHud.text(
+                r,
+                DebugHud.Context(
+                    fps = fps.fps,
+                    resolution = governor?.status,
+                    intrinsics = messages.optString("intrinsics", "?"),
+                    messages = coreMessages(),
+                ),
+            )
         }
-        sb.append("K: %s  fx %.0f cx %.0f cy %.0f\n".format(
-            messages.optString("intrinsics", "?"), f(H.FX), f(H.CX), f(H.CY)))
-        when (f(H.LASER_STATE).toInt()) {
-            FrameResult.Laser.OFF -> sb.append("laser: off")
-            FrameResult.Laser.NONE -> sb.append("laser: none (peak %.0f)".format(f(H.LASER_PEAK)))
-            else -> {
-                sb.append("laser: %d pts  peak %.0f".format(f(H.LASER_POINTS).toInt(), f(H.LASER_PEAK)))
-                if (has(H.LASER_LENGTH)) sb.append("  on board %.0f mm @ %.0f deg".format(f(H.LASER_LENGTH), f(H.LASER_ANGLE)))
-                if (f(H.IN_VOLUME) > 0f) sb.append("  in volume %d".format(f(H.IN_VOLUME).toInt()))
-            }
-        }
-        sb.append('\n')
-        val plane = when {
-            r.flag(H.PLANE_OK) -> "ok"
-            r.flag(H.PLANE_STALE) -> "STALE (camera re-calibrated)"
-            else -> "none"
-        }
-        sb.append("plane: %s  cloud %d pts %.1f MB".format(plane, f(H.CLOUD_POINTS).toInt(), f(H.CLOUD_MB)))
-        if (r.flag(H.SCAN_ON)) {
-            val kept = f(H.GATE_KEPT).toInt()
-            val rejected = f(H.GATE_REJECTED).toInt()
-            sb.append("\nframes kept %d / rejected %d".format(kept, rejected))
-            if (has(H.SCAN_GATE)) sb.append("  now: %s".format(FrameResult.Gate.label(f(H.SCAN_GATE).toInt())))
-            sb.append("\ngyro: %s".format(FrameResult.Gyro.label(f(H.GYRO_STATE).toInt())))
-            if (r.flag(H.RS_CORRECTED)) sb.append("  rolling shutter corrected")
-        }
-        val photoState = f(H.PHOTO_STATE).toInt()
-        if (photoState != Photo.OFF) {
-            sb.append("\nphotos %d  %s".format(f(H.PHOTO_COUNT).toInt(), photoStateLabel(photoState)))
-            if (has(H.CAM_SPEED)) sb.append("  moving %.0f mm/s %.1f deg/s".format(f(H.CAM_SPEED), f(H.CAM_TURN)))
-        }
-        // the core closed our session (board, camera or calibration changed, the laser plane re-fitted)
-        val closedByCore = photoState == Photo.OFF && photoDir != null && f(H.PHOTO_SERIAL).toInt() == photoSerial
-        if (expert) when (mode) {
-            Mode.CAMERA -> sb.append("\ncalib %d/%d views  last rms %s".format(
-                f(H.CALIB_COUNT).toInt(), f(H.CALIB_TARGET).toInt(),
-                if (has(H.CALIB_RMS)) "%.2f px".format(f(H.CALIB_RMS)) else "-"))
-            Mode.LASER -> sb.append("\nlines %d/%d  spread %.2f  last fit %s".format(
-                f(H.PLANE_LINES).toInt(), f(H.PLANE_TARGET).toInt(), f(H.PLANE_SPREAD),
-                if (has(H.PLANE_RMS)) "%.2f mm".format(f(H.PLANE_RMS)) else "-"))
-            else -> {}
-        }
-        b.hud.text = sb
+        panel.renderBoardStatus(boardStatusOf(r))
+        panel.renderCoach(st?.let { stallHint(r, it) })
 
+        // the core closed our session (board, camera or calibration changed, the laser plane re-fitted)
+        val closedByCore = r[H.PHOTO_STATE].toInt() == Photo.OFF && photoDir != null &&
+            r[H.PHOTO_SERIAL].toInt() == photoSerial
         // every read of r is above: what follows can render, which takes a newer frame
         val newCalib = r.flag(H.CALIB_ACTIVE)
         val newPlane = r.flag(H.PLANE_ACTIVE)
@@ -437,24 +366,77 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             dir?.let { exportClosed(it) }
         }
         if (newCalib != calibActive || newPlane != planeActive || newScan != scanOn) {
+            if (scanOn && !newScan && !scanStopRequested && !closedByCore) explainScanStop()
+            if (!newScan) scanStopRequested = false
             calibActive = newCalib
             planeActive = newPlane
             scanOn = newScan
-            renderButtons()
+            // nothing to reach for in the top corner while walking around the object
+            b.topActions.showIf(!scanOn)
         }
-        if (!expert) renderWizard()
+        renderPanel()
     }
 
-    private fun photoStateLabel(state: Int) = when (state) {
-        Photo.WAITING -> "waiting"
-        Photo.IN_FLIGHT -> "taking..."
-        Photo.HOLD_NO_BOARD -> "due: no board"
-        Photo.HOLD_POSE_RMS -> "due: pose rms high"
-        Photo.HOLD_FEW_CORNERS -> "due: too few board corners"
-        Photo.HOLD_SETTLING -> "due: measuring motion"
-        Photo.HOLD_MOVING -> "due: hold steady"
-        Photo.NO_PHOTOS -> "scan only"
-        else -> "?"
+    /** The core's latest messages, for the debug overlay and expert mode. */
+    private fun coreMessages(): List<String> =
+        messages.keys().asSequence().map { messages.optString(it, "") }.filter { it.isNotEmpty() }.toList()
+
+    private fun boardStatusOf(r: FrameResult) = when {
+        r.flag(H.DETECTED) -> BoardStatus(getString(R.string.board_status_found), BoardStatus.Kind.FOUND)
+        r[H.N_MARKERS] >= MISMATCH_MARKERS -> BoardStatus(getString(R.string.board_status_mismatch), BoardStatus.Kind.MISMATCH)
+        else -> BoardStatus(getString(R.string.board_status_none), BoardStatus.Kind.NONE)
+    }
+
+    /**
+     * Why the running step makes no progress on the latest frame, in plain
+     * words: the counters alone do not say that the board is out of view or
+     * that the laser colour setting does not match the laser. Null while the
+     * step is idle or progressing.
+     */
+    private fun stallHint(r: FrameResult, st: AppSettings): String? {
+        val running = when (mode) {
+            Mode.CAMERA -> calibActive
+            Mode.LASER -> planeActive
+            Mode.SCAN -> scanOn
+            Mode.VIEW -> false
+        }
+        if (!running) return null
+        if (!r.flag(H.DETECTED)) return getString(R.string.stall_no_board)
+        if (mode == Mode.CAMERA) return null
+        when (r[H.LASER_STATE].toInt()) {
+            FrameResult.Laser.OFF -> return getString(R.string.stall_laser_off)
+            FrameResult.Laser.NONE -> return getString(R.string.stall_no_laser, laserColorLabel(st.laserColor))
+        }
+        val gate = r[H.SCAN_GATE]
+        if (mode == Mode.SCAN && !gate.isNaN() && gate.toInt() != FrameResult.Gate.KEPT) {
+            return getString(R.string.stall_gate, FrameResult.Gate.label(gate.toInt()))
+        }
+        return null
+    }
+
+    /** The label Settings shows for a laser colour value. */
+    private fun laserColorLabel(value: String): String {
+        val i = resources.getStringArray(R.array.laser_color_values).indexOf(value)
+        return resources.getStringArray(R.array.laser_color_labels).getOrElse(i) { value }
+    }
+
+    /** The photo keyframe state as the scanning user needs it. */
+    private fun photoStateText(state: Int) = getString(
+        when (state) {
+            Photo.IN_FLIGHT -> R.string.photo_taking
+            Photo.HOLD_NO_BOARD, Photo.HOLD_FEW_CORNERS -> R.string.photo_hold_board
+            Photo.HOLD_POSE_RMS, Photo.HOLD_SETTLING, Photo.HOLD_MOVING -> R.string.photo_hold_steady
+            else -> R.string.photo_waiting
+        }
+    )
+
+    /** Settings › Debug overlay, also toggled by a long press on the board status. */
+    private fun toggleDebugOverlay() {
+        val on = settings?.debugOverlay != true
+        prefs().edit().putBoolean(AppSettings.KEY_DEBUG_OVERLAY, on).apply()
+        settings = AppSettings.load(this)
+        applyInterface()
+        showNote(getString(if (on) R.string.debug_overlay_on else R.string.debug_overlay_off), Snackbar.LENGTH_SHORT)
     }
 
     /**
@@ -464,33 +446,25 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private fun setMode(m: Mode, keepSession: Boolean = false) {
         // leaving a mode stops what it was doing
         when (mode) {
-            Mode.CAMERA -> if (m != Mode.CAMERA && calibCollecting()) processor.command(Cmd.CALIB_STOP)
+            Mode.CAMERA -> if (m != Mode.CAMERA && calibActive) processor.command(Cmd.CALIB_STOP)
             Mode.LASER -> if (m != Mode.LASER && planeActive) processor.command(Cmd.PLANE_STOP)
             Mode.SCAN -> if (m != Mode.SCAN) {
-                if (keepSession) {
-                    if (scanOn) processor.command(Cmd.SCAN_STOP)
-                } else {
-                    if (scanOn) processor.command(Cmd.SCAN_STOP)
-                    if (photoDir != null) stopPhotos()
-                }
+                if (scanOn) stopScan()
+                if (!keepSession && photoDir != null) stopPhotos()
             }
             Mode.VIEW -> {}
         }
         mode = m
-        renderButtons()
-        renderStatus()
+        renderPanel()
     }
 
-    private fun calibCollecting() = calibActive
+    private fun laserEnabled() = prefs().getBoolean("laser_enabled", true)
 
-    private fun laserEnabled() = PreferenceManager.getDefaultSharedPreferences(this).getBoolean("laser_enabled", true)
-
-    /** Guided steps or the expert mode toggle, as the settings say. */
+    /** Guided steps or the expert mode toggle, and the debug overlay, as the settings say. */
     private fun applyInterface() {
         val e = expert
-        b.steps.visibility = if (e) View.GONE else View.VISIBLE
-        b.stepTitle.visibility = if (e) View.GONE else View.VISIBLE
-        b.modes.visibility = if (e) View.VISIBLE else View.GONE
+        b.modes.showIf(e)
+        b.hud.showIf(settings?.debugOverlay == true)
         if (e) {
             b.modes.check(
                 when (mode) {
@@ -501,98 +475,95 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 }
             )
         }
-        renderButtons()
-        renderStatus()
+        renderPanel()
     }
 
-    private fun renderButtons() {
-        if (!expert) {
-            renderWizard()
-            return
-        }
-        val labels: List<String?> = when (mode) {
-            Mode.VIEW -> listOf(getString(if (laserEnabled()) R.string.act_laser_on else R.string.act_laser_off), null, null, null)
-            Mode.CAMERA -> listOf(
-                getString(if (calibCollecting()) R.string.act_pause else R.string.act_start),
-                getString(R.string.act_capture), getString(R.string.act_reset), getString(R.string.act_forget_k),
+    /** The bottom panel: the guided step, or the expert mode's tools. */
+    private fun renderPanel() {
+        if (expert) panel.render(expertPanel()) else renderWizard()
+    }
+
+    /** A short note at the bottom of the screen, above the actions. */
+    private fun showNote(text: String, duration: Int = Snackbar.LENGTH_LONG) {
+        Snackbar.make(b.root, text, duration)
+            .setAnchorView(b.primaryAction)
+            .setTextMaxLines(SNACKBAR_LINES)
+            .show()
+    }
+
+    private fun startPauseAction(running: Boolean, idle: Int = R.string.act_start, run: () -> Unit) = PanelAction(
+        getString(if (running) R.string.act_pause else idle),
+        icon = if (running) R.drawable.ic_pause else R.drawable.ic_play_arrow,
+        run = run,
+    )
+
+    // ── expert mode ──────────────────────────────────────────────────────────
+
+    private fun expertPanel(): PanelContent {
+        val show: (String) -> Unit = { renderPanel() }
+        val details = coreMessages().joinToString("\n").ifEmpty { null }
+        return when (mode) {
+            Mode.VIEW -> PanelContent(
+                instruction = getString(R.string.hint_view),
+                detail = details,
+                primary = PanelAction(getString(if (laserEnabled()) R.string.act_laser_on else R.string.act_laser_off)) {
+                    prefs().edit().putBoolean("laser_enabled", !laserEnabled()).apply()
+                    applySettingsLive()
+                    renderPanel()
+                },
             )
-            Mode.LASER -> listOf(
-                getString(if (planeActive) R.string.act_pause else R.string.act_start),
-                getString(R.string.act_force), getString(R.string.act_forget_plane), null,
+            Mode.CAMERA -> PanelContent(
+                instruction = getString(R.string.hint_camera),
+                detail = details,
+                primary = startPauseAction(calibActive) {
+                    processor.command(if (calibActive) Cmd.CALIB_STOP else Cmd.CALIB_START, done = show)
+                },
+                secondary = PanelAction(getString(R.string.act_capture)) { processor.command(Cmd.CALIB_CAPTURE, done = show) },
+                overflow = listOf(
+                    PanelAction(getString(R.string.act_reset)) { processor.command(Cmd.CALIB_RESET, done = show) },
+                    PanelAction(getString(R.string.act_forget_k)) { processor.command(Cmd.FORGET_INTRINSICS, done = show) },
+                ),
             )
-            Mode.SCAN -> listOf(
-                getString(if (scanOn) R.string.act_stop else R.string.act_start),
-                getString(R.string.act_export), getString(R.string.act_clear),
-                getString(if (photoDir != null) R.string.act_photos_on else R.string.act_photos_off),
+            Mode.LASER -> PanelContent(
+                instruction = getString(R.string.hint_laser),
+                detail = details,
+                primary = startPauseAction(planeActive) {
+                    processor.command(if (planeActive) Cmd.PLANE_STOP else Cmd.PLANE_START, done = show)
+                },
+                secondary = PanelAction(getString(R.string.act_force)) { processor.command(Cmd.PLANE_FORCE, done = show) },
+                overflow = listOf(
+                    PanelAction(getString(R.string.act_forget_plane)) { processor.command(Cmd.FORGET_PLANE, done = show) },
+                ),
+            )
+            Mode.SCAN -> PanelContent(
+                instruction = getString(R.string.hint_scan),
+                help = getString(R.string.help_expert_scan),
+                detail = details,
+                primary = PanelAction(
+                    getString(if (scanOn) R.string.act_stop else R.string.act_start),
+                    icon = if (scanOn) R.drawable.ic_pause else R.drawable.ic_play_arrow,
+                ) { if (scanOn) stopScan(show) else processor.command(Cmd.SCAN_START, done = show) },
+                secondary = PanelAction(getString(R.string.act_export), icon = R.drawable.ic_share) { exportPly() },
+                overflow = listOfNotNull(
+                    PanelAction(getString(if (photoDir != null) R.string.act_photos_on else R.string.act_photos_off)) {
+                        if (photoDir == null) startPhotos() else stopPhotos()
+                    },
+                    photoDir?.let { PanelAction(getString(R.string.act_photo_now)) { processor.command(Cmd.PHOTO_SNAP, done = show) } },
+                    PanelAction(getString(R.string.act_clear)) { processor.command(Cmd.CLOUD_CLEAR, done = show) },
+                ),
             )
         }
-        listOf<Button>(b.action1, b.action2, b.action3, b.action4).zip(labels).forEach { (btn, label) ->
-            btn.visibility = if (label == null) View.INVISIBLE else View.VISIBLE
-            btn.isEnabled = true
-            btn.text = label ?: ""
-        }
     }
 
-    private fun renderStatus() {
-        if (!expert) {
-            renderWizard()
-            return
-        }
-        val (hint, key) = when (mode) {
-            Mode.VIEW -> R.string.hint_view to "intrinsics"
-            Mode.CAMERA -> R.string.hint_camera to "calib"
-            Mode.LASER -> R.string.hint_laser to "plane"
-            Mode.SCAN -> R.string.hint_scan to "scan"
-        }
-        val keys = if (mode == Mode.SCAN) listOf(key, "photos") else listOf(key)
-        val msg = keys.map { messages.optString(it, "") }.filter { it.isNotEmpty() }.joinToString("\n")
-        status(if (msg.isEmpty()) getString(hint) else "$msg\n\n${getString(hint)}")
-    }
-
-    private fun status(text: String) {
-        b.status.text = text
-    }
-
-    private fun onAction(i: Int) {
-        if (!expert) {
-            acts.getOrNull(i)?.takeIf { it.enabled }?.run?.invoke()
-            renderWizard()
-            return
-        }
-        val show: (String) -> Unit = { renderStatus() }
-        when (mode) {
-            Mode.VIEW -> if (i == 0) {
-                val p = PreferenceManager.getDefaultSharedPreferences(this)
-                p.edit().putBoolean("laser_enabled", !laserEnabled()).apply()
-                applySettingsLive()
-                renderButtons()
-            }
-            Mode.CAMERA -> when (i) {
-                0 -> processor.command(if (calibCollecting()) Cmd.CALIB_STOP else Cmd.CALIB_START, done = show)
-                1 -> processor.command(Cmd.CALIB_CAPTURE, done = show)
-                2 -> processor.command(Cmd.CALIB_RESET, done = show)
-                3 -> processor.command(Cmd.FORGET_INTRINSICS, done = show)
-            }
-            Mode.LASER -> when (i) {
-                0 -> processor.command(if (planeActive) Cmd.PLANE_STOP else Cmd.PLANE_START, done = show)
-                1 -> processor.command(Cmd.PLANE_FORCE, done = show)
-                2 -> processor.command(Cmd.FORGET_PLANE, done = show)
-            }
-            Mode.SCAN -> when (i) {
-                0 -> processor.command(if (scanOn) Cmd.SCAN_STOP else Cmd.SCAN_START, done = show)
-                1 -> {
-                    val dir = File(getExternalFilesDir(null), "scans").apply { mkdirs() }
-                    val name = "scan_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".ply"
-                    val file = File(dir, name)
-                    processor.command(Cmd.EXPORT_PLY, file.absolutePath) { msg ->
-                        renderStatus()
-                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-                        if (msg.startsWith("exported")) shareScan(file)   // engine.rs export_ply
-                    }
-                }
-                2 -> processor.command(Cmd.CLOUD_CLEAR, done = show)
-                3 -> if (photoDir == null) startPhotos() else stopPhotos()
-            }
+    /** Write the cloud as a PLY into the app's files, then copy it to Download and offer it. */
+    private fun exportPly() {
+        val dir = File(getExternalFilesDir(null), "scans").apply { mkdirs() }
+        val name = "scan_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".ply"
+        val file = File(dir, name)
+        processor.command(Cmd.EXPORT_PLY, file.absolutePath) { msg ->
+            renderPanel()
+            showNote(msg)
+            if (msg.startsWith("exported")) shareScan(file)   // engine.rs export_ply
         }
     }
 
@@ -624,7 +595,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         if (expert) return
         val rd = currentReadiness()
         if (!wizard.open(s, rd)) {
-            Toast.makeText(this, getString(R.string.step_locked, getString(stepLabel(rd.firstOpen))), Toast.LENGTH_SHORT).show()
+            showNote(getString(R.string.step_locked, getString(stepLabel(rd.firstOpen))), Snackbar.LENGTH_SHORT)
         }
         renderWizard()
     }
@@ -637,7 +608,25 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         Step.SCAN, Step.DONE -> R.string.step_scan
     }
 
-    /** The guided panel: step strip, title, what to do and how it goes, the buttons. */
+    /** All steps with their state; a tap opens a finished step again or the first open one. */
+    private fun showSteps() {
+        val rd = currentReadiness()
+        val labels = STEPS.map { s ->
+            val name = getString(stepLabel(s))
+            when {
+                s == wizard.step || wizard.step == Step.DONE && s == Step.SCAN -> getString(R.string.step_entry_current, name)
+                rd.done(s) -> getString(R.string.step_entry_done, name)
+                else -> getString(R.string.step_entry_todo, name)
+            }
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.steps_title)
+            .setItems(labels.toTypedArray()) { _, i -> openStep(STEPS[i]) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /** The guided panel for the step the wizard is on. */
     private fun renderWizard() {
         if (expert) return
         val r = processor.results.latest()
@@ -650,180 +639,144 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             return
         }
         val st = settings ?: return
+        val position = STEPS.indexOf(if (step == Step.DONE) Step.SCAN else step)
+        panel.setStepPosition(position, STEPS.size)
+        val content = guidedPanel(step, r, st).copy(
+            stepLabel = if (step == Step.DONE) null else getString(R.string.step_position, position + 1, STEPS.size),
+        )
+        panel.render(content)
+    }
 
-        STEPS.forEachIndexed { i, s ->
-            val current = step == s || step == Step.DONE && s == Step.SCAN
-            val mark = when {
-                current -> "● "
-                rd.done(s) -> "✓ "
-                else -> "○ "
-            }
-            stepViews[i].setIfChanged(mark + getString(stepLabel(s)))
-            stepViews[i].setTextColor(if (current) Color.WHITE else if (rd.done(s)) DONE_COLOR else TODO_COLOR)
-        }
-
+    private fun guidedPanel(step: Step, r: FrameResult?, st: AppSettings): PanelContent {
         fun f(slot: Int) = r?.get(slot) ?: Float.NaN
-        fun msg(key: String) = messages.optString(key, "").let { if (it.isEmpty()) "" else "\n$it" }
-        fun stall() = r?.let { stallHint(step, it, st) }?.let { "\n$it" } ?: ""
-        val title: Int
-        val body: String
-        when (step) {
+        return when (step) {
             Step.BOARD -> {
-                title = R.string.title_board
                 val board = st.board
                 val name = AppSettings.BOARD_PRESETS.firstOrNull { it.board == board }?.label
                     ?: "${board.squaresX}×${board.squaresY} · ${board.squareMm} / ${board.markerMm} mm · dict ${board.dict}"
-                val corners = f(H.N_CORNERS).toInt()
                 val seen = r?.flag(H.DETECTED) == true
-                val live = when {
-                    seen -> getString(R.string.board_seen, corners, f(H.REPROJ_RMS))
-                    f(H.N_MARKERS) >= 4f -> getString(R.string.board_mismatch, f(H.N_MARKERS).toInt())
-                    else -> getString(R.string.board_none)
-                }
-                body = getString(R.string.body_board, name) + "\n\n" + live
-                acts = listOf(
-                    Act(getString(R.string.act_board_ok), enabled = seen && corners >= 12) { confirmBoard() },
-                    Act(getString(R.string.act_board_change)) { chooseBoard() },
-                    null, null,
+                val mismatch = !seen && f(H.N_MARKERS) >= MISMATCH_MARKERS
+                PanelContent(
+                    title = getString(R.string.title_board),
+                    instruction = getString(R.string.instr_board),
+                    help = getString(R.string.help_board),
+                    detail = getString(R.string.board_detail, name),
+                    notice = if (mismatch) Notice(getString(R.string.board_mismatch), Notice.Level.WARNING) else null,
+                    primary = PanelAction(
+                        getString(R.string.act_board_ok),
+                        enabled = seen && f(H.N_CORNERS) >= MIN_BOARD_CORNERS,
+                        icon = R.drawable.ic_check,
+                    ) { confirmBoard() },
+                    secondary = PanelAction(getString(R.string.act_board_change)) { chooseBoard() },
                 )
             }
             Step.FOCUS -> {
-                title = R.string.title_focus
                 val d = camera.focusDiopters
-                val live = if (st.manualFocus) getString(R.string.focus_locked, focusText(st.focusDiopters))
-                else getString(
-                    R.string.focus_live,
-                    getString(if (camera.focusSettled) R.string.focus_settled else R.string.focus_moving),
-                    d?.let { focusText(it) } ?: "?",
-                )
                 val kFocus = messages.optDouble("k_focus").toFloat()
-                val calibrated = if (kFocus.isNaN()) "" else "\n" + getString(R.string.focus_calibrated, focusText(kFocus))
-                body = getString(R.string.body_focus) + "\n\n" + live + calibrated
-                acts = listOf(
+                val progress = when {
+                    st.manualFocus -> Progress(1f, getString(R.string.focus_locked, focusText(st.focusDiopters)))
+                    d != null && camera.focusSettled -> Progress(1f, getString(R.string.focus_settled, focusText(d)))
+                    else -> Progress(null, getString(R.string.focus_moving))
+                }
+                PanelContent(
+                    title = getString(R.string.title_focus),
+                    instruction = getString(R.string.instr_focus),
+                    help = getString(R.string.help_focus),
+                    progress = progress,
+                    detail = if (kFocus.isNaN()) null else getString(R.string.focus_calibrated, focusText(kFocus)),
                     // not only once settled: some autofocus never reports it on a flat board
-                    Act(getString(R.string.act_focus_lock), enabled = d != null && !st.manualFocus) {
+                    primary = PanelAction(getString(R.string.act_focus_lock), enabled = d != null && !st.manualFocus) {
                         d?.let { lockFocus(it) }
                     },
-                    if (kFocus.isNaN()) null else Act(getString(R.string.act_focus_calibrated)) { lockFocus(kFocus) },
-                    if (st.manualFocus) Act(getString(R.string.act_focus_auto)) { unlockFocus() } else null,
-                    null,
-                )
-            }
-            Step.CAMERA -> {
-                title = R.string.title_camera
-                val rms = f(H.CALIB_RMS)
-                body = getString(R.string.body_camera) + "\n\n" +
-                    getString(R.string.camera_live, f(H.CALIB_COUNT).toInt(), f(H.CALIB_TARGET).toInt(),
-                        if (rms.isNaN()) "-" else "%.2f px".format(rms)) + stall() + msg("calib")
-                acts = listOf(
-                    Act(getString(if (calibActive) R.string.act_pause else R.string.act_start)) {
-                        processor.command(if (calibActive) Cmd.CALIB_STOP else Cmd.CALIB_START)
+                    secondary = when {
+                        st.manualFocus -> PanelAction(getString(R.string.act_focus_auto)) { unlockFocus() }
+                        !kFocus.isNaN() -> PanelAction(getString(R.string.act_focus_calibrated)) { lockFocus(kFocus) }
+                        else -> null
                     },
-                    Act(getString(R.string.act_reset)) { processor.command(Cmd.CALIB_RESET) },
-                    null, null,
                 )
             }
+            Step.CAMERA -> PanelContent(
+                title = getString(R.string.title_camera),
+                instruction = getString(R.string.instr_camera),
+                help = getString(R.string.help_camera),
+                progress = countProgress(f(H.CALIB_COUNT), f(H.CALIB_TARGET), R.string.camera_progress),
+                primary = startPauseAction(calibActive) {
+                    processor.command(if (calibActive) Cmd.CALIB_STOP else Cmd.CALIB_START)
+                },
+                overflow = listOf(PanelAction(getString(R.string.act_reset)) { processor.command(Cmd.CALIB_RESET) }),
+            )
             Step.LASER -> {
-                title = R.string.title_laser
-                val rms = f(H.PLANE_RMS)
-                val stale = if (r?.flag(H.PLANE_STALE) == true && !planeActive) "\n" + getString(R.string.laser_stale) else ""
-                body = getString(R.string.body_laser) + stale + "\n\n" +
-                    getString(R.string.laser_live, f(H.PLANE_LINES).toInt(), f(H.PLANE_TARGET).toInt(), f(H.PLANE_SPREAD),
-                        if (rms.isNaN()) "-" else "%.2f mm".format(rms)) + stall() + msg("plane")
-                acts = listOf(
-                    Act(getString(if (planeActive) R.string.act_pause else R.string.act_start)) {
+                val stale = r?.flag(H.PLANE_STALE) == true && !planeActive
+                PanelContent(
+                    title = getString(R.string.title_laser),
+                    instruction = getString(R.string.instr_laser),
+                    help = getString(R.string.help_laser),
+                    progress = countProgress(f(H.PLANE_LINES), f(H.PLANE_TARGET), R.string.laser_progress),
+                    notice = if (stale) Notice(getString(R.string.laser_stale), Notice.Level.WARNING) else null,
+                    primary = startPauseAction(planeActive) {
                         if (planeActive) processor.command(Cmd.PLANE_STOP) else {
                             ensureLaserOn()
                             processor.command(Cmd.PLANE_START)
                         }
                     },
-                    Act(getString(R.string.act_force), enabled = planeActive && f(H.PLANE_LINES) >= 3f) {
-                        processor.command(Cmd.PLANE_FORCE)
-                    },
-                    null, null,
+                    secondary = if (planeActive) PanelAction(
+                        getString(R.string.act_force), enabled = f(H.PLANE_LINES) >= MIN_PLANE_LINES,
+                    ) { processor.command(Cmd.PLANE_FORCE) } else null,
                 )
             }
             Step.SCAN -> {
-                title = R.string.title_scan
                 val open = photoDir != null
                 val photoState = f(H.PHOTO_STATE).toInt()
-                val photos = if (!open || photoState == Photo.NO_PHOTOS) getString(R.string.scan_no_photos)
-                else getString(R.string.scan_photos, f(H.PHOTO_COUNT).toInt(), photoStateLabel(photoState))
-                val intro = getString(R.string.body_scan) +
-                    if (st.photos.withScan) " " + getString(R.string.body_scan_photos) else ""
-                body = intro + "\n\n" + getString(R.string.scan_live, pointsText(f(H.CLOUD_POINTS)), photos) +
-                    stall() + msg("scan") + msg("photos")
-                acts = listOf(
-                    Act(getString(if (scanOn) R.string.act_pause else if (open) R.string.act_resume else R.string.act_start)) {
+                val photos = open && photoState != Photo.NO_PHOTOS
+                val instruction = getString(R.string.instr_scan) +
+                    if (st.photos.withScan) " " + getString(R.string.instr_scan_photos) else ""
+                PanelContent(
+                    title = getString(R.string.title_scan),
+                    instruction = instruction,
+                    help = getString(R.string.help_scan),
+                    metric = if (open) getString(R.string.scan_points, pointsText(f(H.CLOUD_POINTS))) else null,
+                    detail = if (photos) getString(
+                        R.string.scan_photos_state,
+                        resources.getQuantityString(R.plurals.photos, f(H.PHOTO_COUNT).toInt(), f(H.PHOTO_COUNT).toInt()),
+                        photoStateText(photoState),
+                    ) else null,
+                    primary = startPauseAction(scanOn, idle = if (open) R.string.act_resume else R.string.act_start) {
                         toggleScan()
                     },
-                    Act(getString(R.string.act_finish), enabled = open) { finishScan() },
-                    Act(getString(R.string.act_discard), enabled = open) { discardScan() },
-                    if (open && photoState != Photo.NO_PHOTOS) Act(getString(R.string.act_photo_now)) {
-                        processor.command(Cmd.PHOTO_SNAP)
-                    } else null,
+                    secondary = PanelAction(getString(R.string.act_finish), enabled = open, icon = R.drawable.ic_check) {
+                        finishScan()
+                    },
+                    overflow = listOfNotNull(
+                        if (photos) PanelAction(getString(R.string.act_photo_now)) { processor.command(Cmd.PHOTO_SNAP) } else null,
+                        PanelAction(getString(R.string.act_discard), enabled = open) { discardScan() },
+                    ),
                 )
             }
             Step.DONE -> {
-                title = R.string.title_done
-                body = copyNote
                 val uri = copied?.scanUri
-                acts = listOf(
-                    Act(getString(R.string.act_new_scan)) { newScan() },
-                    uri?.let { Act(getString(R.string.act_share_ply)) { sharePly(it) } },
-                    null, null,
+                val newScan = PanelAction(getString(R.string.act_new_scan), icon = R.drawable.ic_add) { newScan() }
+                PanelContent(
+                    title = getString(R.string.title_done),
+                    instruction = copyNote,
+                    help = getString(R.string.help_done),
+                    detail = copyDetail,
+                    primary = uri?.let { PanelAction(getString(R.string.act_share_ply), icon = R.drawable.ic_share) { sharePly(it) } }
+                        ?: newScan,
+                    secondary = if (uri != null) newScan else null,
                 )
             }
         }
-        b.stepTitle.setIfChanged(getString(title))
-        b.status.setIfChanged(body)
-        listOf<Button>(b.action1, b.action2, b.action3, b.action4).forEachIndexed { i, btn ->
-            val a = acts.getOrNull(i)
-            // the buttons a step has share the row
-            btn.visibility = if (a == null) View.GONE else View.VISIBLE
-            btn.setIfChanged(a?.label ?: "")
-            btn.isEnabled = a?.enabled == true
-        }
     }
 
-    /**
-     * Why the running step makes no progress on the latest frame, in plain
-     * words: the counters alone do not say that the board is out of view or
-     * that the laser colour setting does not match the laser. Null while the
-     * step is idle or progressing.
-     */
-    private fun stallHint(step: Step, r: FrameResult, st: AppSettings): String? {
-        val running = when (step) {
-            Step.CAMERA -> calibActive
-            Step.LASER -> planeActive
-            Step.SCAN -> scanOn
-            else -> false
-        }
-        if (!running) return null
-        if (!r.flag(H.DETECTED)) return getString(R.string.stall_no_board)
-        if (step == Step.CAMERA) return null
-        when (r[H.LASER_STATE].toInt()) {
-            FrameResult.Laser.OFF -> return getString(R.string.stall_laser_off)
-            FrameResult.Laser.NONE -> return getString(R.string.stall_no_laser, laserColorLabel(st.laserColor))
-        }
-        val gate = r[H.SCAN_GATE]
-        if (step == Step.SCAN && !gate.isNaN() && gate.toInt() != FrameResult.Gate.KEPT) {
-            return getString(R.string.stall_gate, FrameResult.Gate.label(gate.toInt()))
-        }
-        return null
+    /** "7 of 20 views" with its bar; nothing before the core reports a target. */
+    private fun countProgress(done: Float, target: Float, label: Int): Progress? {
+        if (done.isNaN() || target.isNaN() || target <= 0f) return null
+        return Progress.of(done.toInt(), target.toInt(), getString(label, done.toInt(), target.toInt()))
     }
 
-    /** The label Settings shows for a laser colour value. */
-    private fun laserColorLabel(value: String): String {
-        val i = resources.getStringArray(R.array.laser_color_values).indexOf(value)
-        return resources.getStringArray(R.array.laser_color_labels).getOrElse(i) { value }
-    }
-
-    private fun TextView.setIfChanged(s: String) {
-        if (text.toString() != s) text = s
-    }
-
-    private fun focusText(d: Float) = if (d > 0.01f) "%.1f D (%.0f cm)".format(d, 100f / d) else "infinity"
+    /** A lens focus in diopters as the distance it is sharp at. */
+    private fun focusText(d: Float) =
+        if (d > 0.01f) getString(R.string.focus_distance, 100f / d) else getString(R.string.focus_far)
 
     private fun pointsText(n: Float) = when {
         n.isNaN() -> "0"
@@ -844,7 +797,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private fun chooseBoard() {
         val presets = AppSettings.BOARD_PRESETS
         val labels = presets.map { it.label } + getString(R.string.board_other)
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(R.string.board_pick)
             .setItems(labels.toTypedArray()) { _, i ->
                 if (i < presets.size) {
@@ -881,10 +834,21 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         applySettingsLive()
     }
 
+    private fun stopScan(done: (String) -> Unit = {}) {
+        scanStopRequested = true
+        processor.command(Cmd.SCAN_STOP, done = done)
+    }
+
+    /** The core ended the scan by itself: say why, or the user keeps sweeping for nothing. */
+    private fun explainScanStop() {
+        val why = listOf("scan", "surface").map { messages.optString(it, "") }.firstOrNull { it.isNotEmpty() }
+        showNote(why ?: getString(R.string.scan_stopped))
+    }
+
     /** Start (a new session for the first start), pause or resume the scan. */
     private fun toggleScan() {
         if (scanOn) {
-            processor.command(Cmd.SCAN_STOP)
+            stopScan()
             return
         }
         ensureLaserOn()
@@ -908,14 +872,15 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         copied = null
         exporting = dir
         copyNote = getString(R.string.done_saving)
+        copyDetail = null
         wizard.finished()
     }
 
     /** Why nothing works without the camera, and the way to grant it in Settings. */
     private fun explainCameraDenied() {
-        status(getString(R.string.need_camera))
+        showNote(getString(R.string.need_camera), Snackbar.LENGTH_INDEFINITE)
         if (cameraDeniedDialog?.isShowing == true) return
-        cameraDeniedDialog = AlertDialog.Builder(this)
+        cameraDeniedDialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.camera_denied_title)
             .setMessage(R.string.camera_denied_body)
             .setPositiveButton(R.string.act_open_settings) { _, _ ->
@@ -927,7 +892,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     /** Back during a scan: finish it, discard it, or stay. */
     private fun confirmLeaveScan() {
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(R.string.leave_scan_title)
             .setMessage(R.string.leave_scan_body)
             .setPositiveButton(R.string.act_finish) { _, _ -> finishScan() }
@@ -937,7 +902,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     }
 
     private fun discardScan() {
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(R.string.discard_title)
             .setMessage(R.string.discard_body)
             .setPositiveButton(R.string.act_discard) { _, _ ->
@@ -964,8 +929,9 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             // a later Finish owns the Saved step now
             if (isFinishing || isDestroyed || exporting != dir) return@runOnUiThread
             copied = res.getOrNull()
+            copyDetail = res.getOrNull()?.let { contentsText(it) }
             copyNote = res.fold(
-                { savedText(it) },
+                { getString(R.string.done_saved, it.relativeDir) },
                 // the core leaves no session behind when nothing was captured
                 { if (dir.exists()) getString(R.string.done_failed, it.message, dir.absolutePath) else getString(R.string.done_empty) },
             )
@@ -973,7 +939,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         }
     }.start()
 
-    private fun savedText(c: SessionExport.Copied): String {
+    /** What a copied session holds: "scan.ply, laser.ply, 12 photos, … (17 files)". */
+    private fun contentsText(c: SessionExport.Copied): String {
         val parts = listOfNotNull(
             SessionExport.SCAN_PLY.takeIf { it in c.names },
             "laser.ply".takeIf { it in c.names },
@@ -981,7 +948,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             "session.json".takeIf { it in c.names },
             "recording.jsonl".takeIf { it in c.names },
         )
-        return getString(R.string.done_body, c.relativeDir, parts.joinToString(", "), c.files)
+        return getString(R.string.done_contents, parts.joinToString(", "), c.files)
     }
 
     /** The core closed the session mid-scan; its files go to Download now, with a note. */
@@ -992,7 +959,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             if (isFinishing || isDestroyed) return@runOnUiThread
             val why = messages.optString("photos", "")
             val note = res.fold({ getString(R.string.closed_saved, it.relativeDir) }, { getString(R.string.closed_kept, dir.name) })
-            Toast.makeText(this, if (why.isEmpty()) note else "$note\n$why", Toast.LENGTH_LONG).show()
+            showNote(if (why.isEmpty()) note else "$note\n$why")
         }
     }.start()
 
@@ -1008,7 +975,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             val latest = pending.last()
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
-                AlertDialog.Builder(this)
+                MaterialAlertDialogBuilder(this)
                     .setTitle(R.string.pending_title)
                     .setMessage(getString(R.string.pending_body, pending.size, latest.name, SessionExport.photoCount(latest)))
                     .setPositiveButton(R.string.act_save_now) { _, _ -> copyPending(pending) }
@@ -1020,7 +987,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     private fun copyPending(dirs: List<File>) = Thread {
         val ok = dirs.count { runCatching { SessionExport.copyToDownloads(this, it) }.onFailure { e -> Log.w(TAG, "copy ${it.name}", e) }.isSuccess }
-        runOnUiThread { Toast.makeText(this, getString(R.string.pending_saved, ok), Toast.LENGTH_LONG).show() }
+        runOnUiThread { showNote(getString(R.string.pending_saved, ok)) }
     }.start()
 
     private fun sharePly(uri: Uri) {
@@ -1058,10 +1025,10 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         runOnUiThread {
             if (isFinishing || isDestroyed) return@runOnUiThread
             if (uri == null) {
-                Toast.makeText(this, getString(R.string.scan_copy_failed), Toast.LENGTH_LONG).show()
+                showNote(getString(R.string.scan_copy_failed))
                 return@runOnUiThread
             }
-            Toast.makeText(this, getString(R.string.scan_saved, "${SessionExport.DOWNLOADS_DIR}/${file.name}"), Toast.LENGTH_LONG).show()
+            showNote(getString(R.string.scan_saved, "${SessionExport.DOWNLOADS_DIR}/${file.name}"))
             sharePly(uri)
         }
     }.start()
@@ -1091,22 +1058,22 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         val arg = JSONObject().put("dir", dir.absolutePath).put("session_id", dir.name)
             .put("started_utc", utc).put("serial", serial).put("photos", photos).put("fresh", fresh)
         processor.command(Cmd.PHOTOS_START, arg.toString()) { msg ->
-            renderStatus()
+            renderPanel()
             // engine.rs open_photos: anything else is a refusal
             if (msg.startsWith("photos on")) {
                 if (photoSerial == serial && photoDir != null) onOpen()
             } else if (photoSerial == serial && photoDir != null) {
-                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                showNote(msg)
                 endPhotos()
             }
         }
-        renderButtons()
+        renderPanel()
     }
 
     private fun stopPhotos() {
         processor.command(Cmd.PHOTOS_STOP) { msg ->
-            renderStatus()
-            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            renderPanel()
+            showNote(msg)
         }
         endPhotos()
     }
@@ -1115,7 +1082,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private fun endPhotos() {
         photoDir = null
         camera.setStills(emptyList())
-        renderButtons()
+        renderPanel()
     }
 
     /** Delivered frame rate from sensor timestamps (smoothed). */
@@ -1139,7 +1106,12 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         /** No registered PLY type; a generic one keeps MediaStore from renaming the file. */
         const val PLY_MIME = "application/octet-stream"
         val STEPS = listOf(Step.BOARD, Step.FOCUS, Step.CAMERA, Step.LASER, Step.SCAN)
-        val DONE_COLOR = Color.rgb(120, 200, 140)
-        val TODO_COLOR = Color.rgb(140, 140, 150)
+        /** ArUco markers in view without a board: the settings name another board. */
+        const val MISMATCH_MARKERS = 4f
+        /** Board corners needed before the guided flow trusts the board. */
+        const val MIN_BOARD_CORNERS = 12f
+        /** Laser lines needed for an early plane fit. */
+        const val MIN_PLANE_LINES = 3f
+        const val SNACKBAR_LINES = 4
     }
 }

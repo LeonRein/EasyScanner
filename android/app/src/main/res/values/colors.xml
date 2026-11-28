@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Material 3 dark scheme around the app's indigo (seed #6366F1). The
+        scanner screen is always dark: the camera picture is the content, and a
+        bright UI would wash out the laser stripe when used outdoors.
+    -->
+    <color name="md_primary">#BEC2FF</color>
+    <color name="md_on_primary">#272B60</color>
+    <color name="md_primary_container">#3D4278</color>
+    <color name="md_on_primary_container">#E0E0FF</color>
+    <color name="md_secondary">#C5C4DD</color>
+    <color name="md_on_secondary">#2E2F42</color>
+    <color name="md_secondary_container">#444559</color>
+    <color name="md_on_secondary_container">#E2E0F9</color>
+    <color name="md_tertiary">#E8B9D5</color>
+    <color name="md_on_tertiary">#46263B</color>
+    <color name="md_tertiary_container">#5F3C52</color>
+    <color name="md_on_tertiary_container">#FFD8EE</color>
+    <color name="md_error">#FFB4AB</color>
+    <color name="md_on_error">#690005</color>
+    <color name="md_error_container">#93000A</color>
+    <color name="md_on_error_container">#FFDAD6</color>
+    <color name="md_surface">#131318</color>
+    <color name="md_on_surface">#E4E1E9</color>
+    <color name="md_on_surface_variant">#C7C5D0</color>
+    <color name="md_surface_variant">#46464F</color>
+    <color name="md_outline">#918F9A</color>
+    <color name="md_outline_variant">#46464F</color>
+    <color name="md_surface_container_lowest">#0E0E13</color>
+    <color name="md_surface_container_low">#1B1B21</color>
+    <color name="md_surface_container">#1F1F25</color>
+    <color name="md_surface_container_high">#2A292F</color>
+    <color name="md_surface_container_highest">#35343A</color>
+    <color name="md_surface_bright">#39383F</color>
+    <color name="md_inverse_surface">#E4E1E9</color>
+    <color name="md_inverse_on_surface">#303036</color>
+    <color name="md_inverse_primary">#555A92</color>
+
+    <!-- a finished step and a board in view: green reads as "good" beside the error red -->
+    <color name="status_ok">#8BD5A0</color>
+    <!-- behind text and icons drawn over the camera picture -->
+    <color name="preview_scrim">#B30E0E13</color>
+</resources>

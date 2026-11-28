@@ -8,6 +8,11 @@
             android:title="Expert mode"
             android:summary="The four tool modes (View, Camera, Laser, Scan) instead of the guided steps"
             android:defaultValue="false" />
+        <SwitchPreferenceCompat
+            android:key="debug_overlay"
+            android:title="Debug overlay"
+            android:summary="Show the frame rate, pose, calibration and laser numbers over the camera picture (also: long press the board status)"
+            android:defaultValue="false" />
     </PreferenceCategory>
 
     <PreferenceCategory android:title="Performance">

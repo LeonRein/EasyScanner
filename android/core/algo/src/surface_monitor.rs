@@ -12,16 +12,17 @@
 //! * no shape yet: a well-determined fit becomes the shape;
 //! * the same within the fits' uncertainty: confirmed;
 //! * clearly different: suspect. The views are dropped and only views taken
-//!   from now on decide: a second fit that differs too replaces the shape
-//!   (the board was moved), one that agrees confirms it (the first was a
-//!   fluke).
+//!   from now on decide: a second fit that agrees with the suspect one
+//!   replaces the shape (the board was moved), one that agrees with the
+//!   shape in use confirms it (the first was a fluke), and one that agrees
+//!   with neither becomes the new suspect.
 //!
 //! The user does nothing but move the phone around the board, which every
 //! calibration and scan does anyway.
 
 use serde::{Deserialize, Serialize};
 
-use crate::board_surface::{BoardSurface, SurfaceFit, SurfaceView, SurfaceViews, fit};
+use crate::board_surface::{BoardSurface, MAX_DEGREE, MIN_DEGREE, SurfaceFit, SurfaceView, SurfaceViews, fit};
 use crate::geom::Intrinsics;
 
 /// How the board's shape is known, for the app's status line.
@@ -107,8 +108,8 @@ pub struct SurfaceMonitor {
     current: Option<MeasuredSurface>,
     flat: BoardSurface,
     state: SurfaceState,
-    /// A fit disagreed with the shape in use; the next one decides.
-    suspect: bool,
+    /// A fit that disagreed with the shape in use; the next one decides.
+    suspect: Option<MeasuredSurface>,
     last_job_s: Option<f64>,
 }
 
@@ -124,17 +125,18 @@ impl SurfaceMonitor {
     /// their uncertainty.
     pub const MIN_CHANGE_MM: f64 = 0.25;
 
-    /// For a `width`×`height` mm board, with height terms up to `degree`.
+    /// For a `width`×`height` mm board, with height terms up to `degree`
+    /// (clamped to [`MIN_DEGREE`]..=[`MAX_DEGREE`]).
     pub fn new(width_mm: f64, height_mm: f64, degree: u8) -> Self {
         SurfaceMonitor {
             width_mm,
             height_mm,
-            degree,
+            degree: degree.clamp(MIN_DEGREE, MAX_DEGREE),
             views: SurfaceViews::new(width_mm, height_mm),
             current: None,
             flat: BoardSurface::flat(),
             state: SurfaceState::Unmeasured,
-            suspect: false,
+            suspect: None,
             last_job_s: None,
         }
     }
@@ -150,7 +152,7 @@ impl SurfaceMonitor {
     pub fn restore(&mut self, measured: MeasuredSurface) {
         self.current = Some(measured);
         self.state = SurfaceState::Measuring;
-        self.suspect = false;
+        self.suspect = None;
     }
 
     /// The shape poses and stripes are computed against: the measured one,
@@ -209,6 +211,7 @@ impl SurfaceMonitor {
         };
         if new.rms_px.is_nan() || new.rms_px > Self::MAX_RMS_PX {
             self.views.clear();
+            self.suspect = None;
             self.state = SurfaceState::Measuring;
             return Verdict::Inconsistent { rms_px: new.rms_px };
         }
@@ -217,30 +220,41 @@ impl SurfaceMonitor {
             self.state = SurfaceState::Verified;
             return Verdict::First;
         };
-        let difference_mm = old.surface.max_difference(&new.surface, self.width_mm, self.height_mm);
-        let tolerance = Self::MIN_CHANGE_MM.max(3.0 * old.height_sigma_mm.hypot(new.height_sigma_mm));
-        if difference_mm <= tolerance {
-            self.suspect = false;
+        let new = MeasuredSurface::from(new);
+        let difference_mm = self.difference(old, &new);
+        if difference_mm <= self.tolerance(old, &new) {
+            self.suspect = None;
             self.state = SurfaceState::Verified;
             // a better-determined measurement of the same shape refines it
             let refined = new.height_sigma_mm < 0.5 * old.height_sigma_mm;
             if refined {
-                self.current = Some(new.into());
+                self.current = Some(new);
             }
             return Verdict::Confirmed { difference_mm, refined };
         }
-        if !self.suspect {
+        let confirms_suspect = self.suspect.as_ref().is_some_and(|s| self.difference(s, &new) <= self.tolerance(s, &new));
+        if !confirms_suspect {
             // one fit could be thrown by a few poor views: re-measure from
             // views taken from now on before replacing anything
-            self.suspect = true;
+            self.suspect = Some(new);
             self.views.clear();
             self.state = SurfaceState::Measuring;
             return Verdict::Suspect { difference_mm };
         }
-        self.suspect = false;
-        self.current = Some(new.into());
+        self.suspect = None;
+        self.current = Some(new);
         self.state = SurfaceState::Replaced;
         Verdict::Replaced { difference_mm }
+    }
+
+    /// Largest height difference of two shapes over the board (mm).
+    fn difference(&self, a: &MeasuredSurface, b: &MeasuredSurface) -> f64 {
+        a.surface.max_difference(&b.surface, self.width_mm, self.height_mm)
+    }
+
+    /// How far two measurements of one placement may differ (mm).
+    fn tolerance(&self, a: &MeasuredSurface, b: &MeasuredSurface) -> f64 {
+        Self::MIN_CHANGE_MM.max(3.0 * a.height_sigma_mm.hypot(b.height_sigma_mm))
     }
 }
 
@@ -305,6 +319,37 @@ mod tests {
         let job = feed(&mut m, &warped(), 10.0, &mut rng).unwrap();
         assert!(matches!(m.accept(job.run(&k())), Verdict::Confirmed { .. }));
         assert!(m.surface().max_difference(&warped(), W, H) < 1e-9);
+    }
+
+    #[test]
+    fn two_stray_fits_that_disagree_replace_nothing() {
+        let mut rng = Rng::new(7);
+        let mut m = SurfaceMonitor::new(W, H, 3);
+        m.restore(MeasuredSurface { surface: warped(), rms_px: 0.2, flat_rms_px: 0.4, height_sigma_mm: 0.03 });
+        let job = feed(&mut m, &BoardSurface::flat(), 0.0, &mut rng).unwrap();
+        assert!(matches!(m.accept(job.run(&k())), Verdict::Suspect { .. }));
+        // a second fit unlike both the shape in use and the first stray one
+        let other = warped().with_coeffs(warped().coeffs().iter().map(|c| -c).collect()).unwrap();
+        let job = feed(&mut m, &other, 10.0, &mut rng).unwrap();
+        assert!(matches!(m.accept(job.run(&k())), Verdict::Suspect { .. }), "a new suspect, not a replacement");
+        assert!(m.surface().max_difference(&warped(), W, H) < 1e-9);
+        // the next fit agrees with that one: now the board has moved
+        let job = feed(&mut m, &other, 20.0, &mut rng).unwrap();
+        assert!(matches!(m.accept(job.run(&k())), Verdict::Replaced { .. }));
+    }
+
+    #[test]
+    fn a_degree_out_of_range_is_clamped() {
+        let mut rng = Rng::new(3);
+        for (degree, used) in [(0, MIN_DEGREE), (9, MAX_DEGREE)] {
+            let mut m = SurfaceMonitor::new(W, H, degree);
+            let job = feed(&mut m, &warped(), 0.0, &mut rng).expect("enough views");
+            assert_eq!(job.start.degree(), used);
+        }
+        // degree 0 would have no terms at all; clamped, it measures
+        let mut m = SurfaceMonitor::new(W, H, 0);
+        let job = feed(&mut m, &warped(), 0.0, &mut rng).unwrap();
+        assert_eq!(m.accept(job.run(&k())), Verdict::First);
     }
 
     #[test]

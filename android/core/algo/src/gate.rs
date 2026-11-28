@@ -95,13 +95,7 @@ impl ScanGateCfg {
         if on(self.max_reproj_px) && !at_most(q.reproj_rms, self.max_reproj_px) {
             return Err(Reject::PoseRms);
         }
-        if self.min_corners > 0 && q.corners < self.min_corners {
-            return Err(Reject::FewCorners);
-        }
-        if on(self.min_ippe_margin) && !at_most(self.min_ippe_margin, q.margin) {
-            return Err(Reject::Ambiguous);
-        }
-        Ok(())
+        self.check_geometry(q)
     }
 
     /// Every check: the pose, then the motion.
@@ -110,11 +104,26 @@ impl ScanGateCfg {
         if !self.enabled {
             return Ok(());
         }
-        let limits = on(self.max_speed_mm_s) || on(self.max_turn_deg_s);
-        if !limits {
+        self.check_motion(q.speed)
+    }
+
+    /// What a view that measures something (the board's shape, the camera)
+    /// needs: enough corners, an unambiguous pose and a steady camera. It
+    /// applies whether or not the gate is enabled, which only decides what
+    /// a scan keeps. The reprojection RMS is left out: it is computed with
+    /// the board shape in use, the very thing such a view may correct.
+    pub fn check_view(&self, q: &FrameQuality) -> Result<(), Reject> {
+        self.check_geometry(q)?;
+        self.check_motion(q.speed)
+    }
+
+    /// The motion limits alone: camera `speed` (mm/s, deg/s) within them.
+    /// Applied whether or not the gate is enabled.
+    pub fn check_motion(&self, speed: Option<(f64, f64)>) -> Result<(), Reject> {
+        if !on(self.max_speed_mm_s) && !on(self.max_turn_deg_s) {
             return Ok(());
         }
-        match q.speed {
+        match speed {
             None if self.require_speed => Err(Reject::Settling),
             None => Ok(()),
             Some((v, w)) => {
@@ -127,6 +136,17 @@ impl ScanGateCfg {
                 }
             }
         }
+    }
+
+    /// Corners and IPPE margin.
+    fn check_geometry(&self, q: &FrameQuality) -> Result<(), Reject> {
+        if self.min_corners > 0 && q.corners < self.min_corners {
+            return Err(Reject::FewCorners);
+        }
+        if on(self.min_ippe_margin) && !at_most(self.min_ippe_margin, q.margin) {
+            return Err(Reject::Ambiguous);
+        }
+        Ok(())
     }
 }
 
@@ -191,6 +211,19 @@ mod tests {
         assert_eq!(g.check_pose(&fast), Ok(()));
         assert_eq!(g.check_pose(&FrameQuality { speed: None, ..good() }), Ok(()));
         assert_eq!(g.check_pose(&FrameQuality { corners: 4, ..fast }), Err(Reject::FewCorners));
+    }
+
+    #[test]
+    fn a_measuring_view_needs_no_good_fit_but_a_steady_camera_always() {
+        let g = ScanGateCfg::default();
+        // a fit off because the board's shape in use is wrong: still a view
+        assert_eq!(g.check_view(&FrameQuality { reproj_rms: 4.0, ..good() }), Ok(()));
+        assert_eq!(g.check_view(&FrameQuality { corners: 10, ..good() }), Err(Reject::FewCorners));
+        assert_eq!(g.check_view(&FrameQuality { margin: 1.1, ..good() }), Err(Reject::Ambiguous));
+        // switching the scan gate off keeps every scan frame, not every view
+        let off = ScanGateCfg { enabled: false, ..g };
+        assert_eq!(off.check_view(&FrameQuality { speed: Some((300.0, 5.0)), ..good() }), Err(Reject::Moving));
+        assert_eq!(off.check_motion(None), Err(Reject::Settling));
     }
 
     #[test]

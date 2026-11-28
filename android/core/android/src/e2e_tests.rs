@@ -616,8 +616,9 @@ fn hold_views(e: &mut Engine, r: &Renderer, k: &Intrinsics, surface: &BoardSurfa
         }
     }
     let last = r.render_warped(k, &pose(520.0, 0.3, 0.0, 0.0, [0.0, 0.0]), surface);
+    // wall time, not frames: the fit thread competes with the other tests
     let start = Instant::now();
-    while !seen.contains(&(until as i32)) && start.elapsed() < Duration::from_secs(5) {
+    while !seen.contains(&(until as i32)) && start.elapsed() < Duration::from_secs(30) {
         out = step(e, &last);
         note(&out, &mut seen);
         std::thread::sleep(Duration::from_millis(20));

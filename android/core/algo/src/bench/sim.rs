@@ -414,7 +414,7 @@ impl<'a> Camera<'a> {
     /// Observe the frame whose first row starts exposing at `t0`.
     pub fn observe(&mut self, traj: &(dyn Fn(f64) -> Pose + Sync), t0: f64) -> Observation {
         let mut obs = Observation::default();
-        for (id, p) in self.scene.board.corners() {
+        for (id, p) in self.scene.corners() {
             let Some((q, pose)) = self.project_rs(traj, t0, p) else { continue };
             if !self.in_image(q, 3.0) || !self.scene.visible(pose.camera_position(), p) {
                 continue;
@@ -512,6 +512,7 @@ impl<'a> Camera<'a> {
                 let (s, surf) = scene.trace(cam, dir)?;
                 let x = add(cam, scale(dir, s));
                 let alb = scene.albedo(x, surf);
+                let tint = scene.tint(surf);
                 let xc = pose.to_cam(x);
                 let delta = dot(n, xc) - d;
                 let lit = if delta.abs() < 5.0 * sigma && mount.in_fan(xc) && scene.visible(l_b, x) {
@@ -519,11 +520,11 @@ impl<'a> Camera<'a> {
                 } else {
                     0.0
                 };
-                let base = alb * ambient;
-                let red = laser_gain * lit * alb;
+                let base = scale(tint, alb * ambient);
+                let red = scale(tint, laser_gain * lit * alb);
                 // second value: how far (mm, beyond the sheet's reach) this pixel is from being lit
                 let reach = delta.abs() - 5.0 * sigma - 4.0 * xc[2] / k.fx;
-                Some(([base + red, base + 0.12 * red, base + 0.12 * red], reach))
+                Some(([base[0] + red[0], base[1] + 0.12 * red[1], base[2] + 0.12 * red[2]], reach))
             };
             for u in 0..w {
                 let mut col = [40.0; 3];
@@ -635,7 +636,7 @@ mod tests {
 
     #[test]
     fn rendered_stripe_matches_the_analytic_one() {
-        let scene = Scene { board: BoardDims::default(), shapes: vec![Shape::ball_on_board(144.0, 144.0, 25.0)] };
+        let scene = Scene::flat(BoardDims::default(), vec![Shape::ball_on_board(144.0, 144.0, 25.0)]);
         let k: Intrinsics = CameraModel::default().into();
         let tr = Trajectory::default();
         let traj = |t: f64| tr.pose(t);

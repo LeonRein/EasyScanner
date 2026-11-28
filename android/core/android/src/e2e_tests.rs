@@ -316,6 +316,30 @@ fn laser_plane_calibration_recovers_the_plane_and_scan_classifies() {
     assert_eq!(out[h::IN_VOLUME], 0.0, "board points classified as object");
 }
 
+/// Feed the calibration `frames` until it saves (or a minute passes), each
+/// view held still for a few frames: the calibration takes steady views only.
+fn calibrate_from(e: &mut Engine, frames: &[Yuv]) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        for yuv in frames {
+            for _ in 0..HOLD_FRAMES {
+                let out = step(e, yuv);
+                if out[h::EVENTS] as u32 & ev::INTRINSICS_SAVED != 0 {
+                    return true;
+                }
+            }
+            if e.messages().contains("solving") {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    false
+}
+
+/// Frames a view is held for: the motion check needs the speed window
+/// (200 ms) past the jump to the next view.
+const HOLD_FRAMES: usize = 9;
+
 #[test]
 fn live_calibration_converges_from_a_wrong_guess() {
     let k = truth_k();
@@ -323,29 +347,9 @@ fn live_calibration_converges_from_a_wrong_guess() {
     let (mut e, dir) = engine("calib", guess);
     e.command(cmd::CALIB_START, "");
     let r = Renderer::new();
-    let views = viewpoints(80);
+    let frames: Vec<Yuv> = viewpoints(80).iter().map(|p| r.render(&k, p, None)).collect();
     let start = Instant::now();
-    let mut saved = false;
-    'outer: for _ in 0..3 {
-        for p in &views {
-            let yuv = r.render(&k, p, None);
-            let out = step(&mut e, &yuv);
-            if out[h::EVENTS] as u32 & ev::INTRINSICS_SAVED != 0 {
-                saved = true;
-                break 'outer;
-            }
-            if e.messages().contains("solving") {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-    // the solve runs on its own thread: wait for it
-    while !saved && start.elapsed() < Duration::from_secs(120) {
-        let yuv = r.render(&k, &views[0], None);
-        let out = step(&mut e, &yuv);
-        saved = out[h::EVENTS] as u32 & ev::INTRINSICS_SAVED != 0;
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let saved = calibrate_from(&mut e, &frames);
     assert!(saved, "calibration never saved: {}", e.messages());
     let f = config::load_intrinsics(&dir, "test").unwrap();
     eprintln!(
@@ -586,6 +590,7 @@ fn calibrated(e: &mut Engine, dir: &std::path::Path, k: Intrinsics) {
         camera_id: Some("test".into()),
         focus_diopters: None,
         rms_px: Some(0.1),
+        sigma_px: None,
     };
     config::save_intrinsics(dir, &file).unwrap();
     configure(e, k, "");
@@ -616,8 +621,9 @@ fn hold_views(e: &mut Engine, r: &Renderer, k: &Intrinsics, surface: &BoardSurfa
         }
     }
     let last = r.render_warped(k, &pose(520.0, 0.3, 0.0, 0.0, [0.0, 0.0]), surface);
+    // wall time, not frames: the fit thread competes with the other tests
     let start = Instant::now();
-    while !seen.contains(&(until as i32)) && start.elapsed() < Duration::from_secs(5) {
+    while !seen.contains(&(until as i32)) && start.elapsed() < Duration::from_secs(30) {
         out = step(e, &last);
         note(&out, &mut seen);
         std::thread::sleep(Duration::from_millis(20));
@@ -651,16 +657,25 @@ fn a_bent_board_is_measured_and_a_moved_one_noticed() {
 
     // the board laid down anew, flat this time: doubted, then re-measured
     let flat = BoardSurface::flat();
-    let (_, mut seen) = hold_views(&mut e, &r, &k, &flat, SurfaceState::Replaced);
-    if !seen.contains(&(SurfaceState::Replaced as i32)) {
-        // the doubt dropped the views: the next round decides
+    // The first fit after the move mixes views of both placements and
+    // raises the doubt; it drops the views, so later fits see the flat board
+    // only. A replacement needs two of them that agree: up to three rounds.
+    let mut seen = Vec::new();
+    for _ in 0..3 {
         seen.extend(hold_views(&mut e, &r, &k, &flat, SurfaceState::Replaced).1);
+        if seen.contains(&(SurfaceState::Replaced as i32)) {
+            break;
+        }
     }
     eprintln!("states after the move: {seen:?}");
     let doubted = seen.iter().position(|&s| s == SurfaceState::Measuring as i32);
     let replaced = seen.iter().position(|&s| s == SurfaceState::Replaced as i32);
     assert!(matches!((doubted, replaced), (Some(a), Some(b)) if a < b), "{seen:?}: {}", e.messages());
-    assert!(config::load_surface(&dir, &spec()).unwrap().surface.peak_to_valley(bw, bh) < 0.15);
+    // flat within the fit's noise (sigma ~0.13 mm), and clearly not the old shape
+    let replaced = config::load_surface(&dir, &spec()).unwrap();
+    let (pv, from_old) = (replaced.surface.peak_to_valley(bw, bh), replaced.surface.max_difference(&bent, bw, bh));
+    eprintln!("replaced: p-v {pv:.3} mm, sigma {:.3} mm, {from_old:.2} mm from the old shape", replaced.height_sigma_mm);
+    assert!(pv < 0.3 && from_old > 1.0, "p-v {pv:.3} mm, {from_old:.2} mm from the old shape");
 }
 
 #[test]
@@ -672,20 +687,7 @@ fn the_camera_calibration_measures_a_bent_board() {
     let r = Renderer::new();
     let bent = bent_board();
     let frames: Vec<Yuv> = viewpoints(96).iter().map(|p| r.render_warped(&k, p, &bent)).collect();
-    let start = Instant::now();
-    let mut saved = false;
-    'outer: while start.elapsed() < Duration::from_secs(60) {
-        for yuv in &frames {
-            let out = step(&mut e, yuv);
-            if out[h::EVENTS] as u32 & ev::INTRINSICS_SAVED != 0 {
-                saved = true;
-                break 'outer;
-            }
-            if e.messages().contains("solving") {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
+    let saved = calibrate_from(&mut e, &frames);
     assert!(saved, "calibration never saved: {}", e.messages());
     let f = config::load_intrinsics(&dir, "test").unwrap();
     eprintln!("calibrated fx {:.2} fy {:.2} cx {:.2} cy {:.2} rms {:?}", f.fx, f.fy, f.cx, f.cy, f.rms_px);

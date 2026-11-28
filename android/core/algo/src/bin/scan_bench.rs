@@ -1,7 +1,7 @@
 //! Scan-accuracy benchmark (see `scan_algo::bench`).
 //!
 //! ```text
-//! scan_bench sweep [--fast] [--seconds S] [--json]
+//! scan_bench sweep [--fast] [--seconds S] [--only NAME-PART] [--json]
 //!     every scenario of the error budget, one table
 //! scan_bench run [--config cfg.json] [--realistic] [--fast] [--seconds S]
 //!                [--save rec.jsonl] [--ply out.ply] [--json]
@@ -154,7 +154,8 @@ fn main() -> ExitCode {
     let result: Result<(), String> = (|| match cmd.as_str() {
         "sweep" => {
             let mut reports = Vec::new();
-            for mut cfg in bench::scenarios() {
+            let only = a.value("--only");
+            for mut cfg in bench::scenarios().into_iter().filter(|c| only.as_ref().is_none_or(|o| c.name.contains(o.as_str()))) {
                 adjust(&mut cfg, fast, seconds);
                 eprintln!("running: {}", cfg.name);
                 reports.push(bench::run(&cfg)?.report);

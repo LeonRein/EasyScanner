@@ -1,7 +1,8 @@
 name: Android build
 
 # Builds the APK (Kotlin app + Rust core against OpenCV's prefab), runs the
-# host tests, and uploads the APK so every pull request and every commit on
+# host tests (the algorithm crate, and the engine with its end-to-end tests
+# against a host OpenCV), and uploads the APK so every pull request and every commit on
 # main yields a testable build.
 #
 # Feature branches are built through their pull request only: a push trigger
@@ -60,6 +61,84 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked -p scan-algo --all-targets -- -D warnings
       - run: cargo test --locked -p scan-algo
+
+  # The engine (JNI crate) and its end-to-end tests against a host build of
+  # OpenCV: the e2e tests render ChArUco frames and push them through the
+  # whole engine, so they need the objdetect module (4.7+), which Ubuntu's
+  # packages lack. The build is cached by version.
+  engine-host-tests:
+    name: Engine tests (host OpenCV)
+    runs-on: ubuntu-latest
+    env:
+      OPENCV_VERSION: "4.12.0"
+      OPENCV_PREFIX: ${{ github.workspace }}/../opencv-install
+    defaults:
+      run:
+        working-directory: android/core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # restore and save separately: a run whose tests fail still keeps the build
+      - name: Restore the OpenCV build
+        id: opencv-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.OPENCV_PREFIX }}
+          key: opencv-${{ env.OPENCV_VERSION }}-core-imgproc-calib3d-objdetect-v1
+
+      - name: Build OpenCV
+        if: steps.opencv-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ninja-build > /dev/null
+          curl -sSfL "https://github.com/opencv/opencv/archive/refs/tags/$OPENCV_VERSION.tar.gz" | tar xz
+          cmake -S "opencv-$OPENCV_VERSION" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$OPENCV_PREFIX" \
+            -DBUILD_LIST=core,imgproc,calib3d,features2d,flann,objdetect \
+            -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_opencv_apps=OFF \
+            -DWITH_IPP=OFF -DWITH_ITT=OFF -DWITH_OPENCL=OFF -DWITH_ADE=OFF -DWITH_PROTOBUF=OFF \
+            -DWITH_FFMPEG=OFF -DWITH_GTK=OFF -DBUILD_JAVA=OFF -DBUILD_opencv_python3=OFF | tail -n 20
+          # Ninja prints a failed command's output on stdout: keep its end
+          cmake --build build --target install | tail -n 60
+
+      - name: Save the OpenCV build
+        if: steps.opencv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.OPENCV_PREFIX }}
+          key: ${{ steps.opencv-cache.outputs.cache-primary-key }}
+
+      # the opencv crate generates its bindings with libclang
+      - name: libclang
+        run: |
+          python3 -m pip install --quiet "libclang==$LIBCLANG_WHEEL"
+          dir=$(python3 -c 'import clang, os; print(os.path.join(os.path.dirname(clang.__file__), "native"))')
+          echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"
+
+      - name: Point the opencv crate at the build
+        run: |
+          {
+            echo "OPENCV_LINK_LIBS=opencv_core,opencv_imgproc,opencv_calib3d,opencv_features2d,opencv_flann,opencv_objdetect"
+            echo "OPENCV_LINK_PATHS=$OPENCV_PREFIX/lib"
+            echo "OPENCV_INCLUDE_PATHS=$OPENCV_PREFIX/include/opencv4"
+            echo "LD_LIBRARY_PATH=$OPENCV_PREFIX/lib"
+          } >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/core
+          # the opencv crate's build script does not watch OpenCV's headers:
+          # its generated bindings must not outlive a version bump
+          key: engine-host-opencv-${{ env.OPENCV_VERSION }}
+
+      - run: cargo clippy --locked -p easyscanner-core --all-targets -- -D warnings
+      # the test profile is optimised already; --release would build it all twice
+      - run: cargo test --locked -p easyscanner-core
 
   apk:
     name: APK (arm64-v8a)

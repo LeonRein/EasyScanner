@@ -32,7 +32,7 @@ jobs:
       run:
         working-directory: protocol/laser-link
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -50,8 +50,12 @@ jobs:
       run:
         working-directory: firmware/laser-switch
     steps:
-      - uses: actions/checkout@v4
-      - uses: esp-rs/xtensa-toolchain@v1.6
+      - uses: actions/checkout@v7
+      - uses: esp-rs/xtensa-toolchain@v1.7
+        # espup queries the GitHub API for the latest toolchain release;
+        # unauthenticated, the runner's shared IP hits the rate limit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           default: true
           buildtargets: esp32s3
@@ -62,7 +66,7 @@ jobs:
       - run: cargo fmt -- --check
       - run: cargo clippy --release -- -D warnings
       - run: cargo build --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: laser-switch-esp32s3
           path: firmware/laser-switch/target/xtensa-esp32s3-none-elf/release/laser-switch

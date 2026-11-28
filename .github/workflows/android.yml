@@ -50,7 +50,7 @@ jobs:
       run:
         working-directory: android/core
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -76,7 +76,7 @@ jobs:
       run:
         working-directory: android/core
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -84,7 +84,7 @@ jobs:
       # restore and save separately: a run whose tests fail still keeps the build
       - name: Restore the OpenCV build
         id: opencv-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.OPENCV_PREFIX }}
           key: opencv-${{ env.OPENCV_VERSION }}-core-imgproc-calib3d-objdetect-v1
@@ -108,7 +108,7 @@ jobs:
 
       - name: Save the OpenCV build
         if: steps.opencv-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.OPENCV_PREFIX }}
           key: ${{ steps.opencv-cache.outputs.cache-primary-key }}
@@ -147,9 +147,9 @@ jobs:
       run:
         working-directory: android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -179,7 +179,11 @@ jobs:
           workspaces: android/core
           key: android-arm64
 
-      - uses: gradle/actions/setup-gradle@v4
+      # basic: the MIT-licensed provider on top of actions/cache. The default
+      # ("enhanced") loads a proprietary library under separate terms of use.
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
 
       - name: Build APK and run unit tests
         run: ./gradlew --no-daemon assembleDebug testDebugUnitTest
@@ -198,7 +202,7 @@ jobs:
           cp app/build/outputs/apk/debug/*.apk "../dist/${name}.apk"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.name.outputs.name }}
           path: dist/*.apk
@@ -207,7 +211,7 @@ jobs:
 
       - name: Unit test reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unit-test-reports
           path: android/app/build/reports/tests/

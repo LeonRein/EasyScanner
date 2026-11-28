@@ -1,12 +1,14 @@
 //! ChArUco board detection and the camera-relative-to-board pose — the same
 //! math as the desktop prototype's `detect.py` (CharucoDetector → matchImagePoints →
-//! solvePnPGeneric/IPPE with temporal flip disambiguation), plus a tracking
-//! ROI so a found board is searched for near where it was, and the
+//! solvePnPGeneric/IPPE with temporal flip disambiguation), then refined
+//! against the board's measured shape (`scan_algo::board_surface`), plus a
+//! tracking ROI so a found board is searched for near where it was, and the
 //! rolling-shutter correction of the corners (`scan_algo::rolling`).
 
 use opencv::core::{self, Mat, Point2f, Point3f, Rect, Vector};
 use opencv::prelude::*;
 use opencv::{calib3d, objdetect};
+use scan_algo::board_surface::{BoardSurface, SurfaceView, refine_pose};
 use scan_algo::config::BoardSpec;
 use scan_algo::geom::{Intrinsics, M3, Pose, V3, norm, rodrigues};
 use scan_algo::ippe::{self, Branch};
@@ -23,6 +25,17 @@ pub struct PoseResult {
     /// Runner-up IPPE branch's error / the chosen one's: ≫1 unambiguous,
     /// ≈1 near-frontal and genuinely flippable.
     pub margin: Option<f64>,
+    /// The corners the pose was solved from: nominal board positions (mm)…
+    pub xy: Vec<[f64; 2]>,
+    /// … and their pixels, rolling-shutter corrected when the pose is.
+    pub px: Vec<[f64; 2]>,
+}
+
+impl PoseResult {
+    /// The corners and pose, for measuring the board's shape.
+    pub fn surface_view(&self) -> SurfaceView {
+        SurfaceView { xy: self.xy.clone(), px: self.px.clone(), pose: self.pose }
+    }
 }
 
 pub struct BoardTracker {
@@ -144,13 +157,20 @@ impl BoardTracker {
         self.marker_ids.len()
     }
 
-    /// Board→camera pose from the current detection.
+    /// Board→camera pose from the current detection, with the board's
+    /// corners lying on `surface`.
     ///
     /// `expected` is the rotation the camera should have now (the last pose
     /// turned on by the gyro); without it the last pose this tracker solved
     /// decides IPPE's near-frontal ambiguity. `corr` undoes the rolling
     /// shutter: the pose is then the one at the frame's middle row.
-    pub fn solve_pose(&mut self, k: &Intrinsics, expected: Option<&M3>, corr: Option<&Correction>) -> opencv::Result<Option<PoseResult>> {
+    pub fn solve_pose(
+        &mut self,
+        k: &Intrinsics,
+        surface: &BoardSurface,
+        expected: Option<&M3>,
+        corr: Option<&Correction>,
+    ) -> opencv::Result<Option<PoseResult>> {
         if self.corners.len() < 4 {
             return Ok(None);
         }
@@ -160,16 +180,33 @@ impl BoardTracker {
         if self.obj.len() < 4 {
             return Ok(None);
         }
-        let obj: Vec<V3> = self.obj.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
-        let img: Vec<[f64; 2]> = self.img.iter().map(|p| [p.x as f64, p.y as f64]).collect();
+        let xy: Vec<[f64; 2]> = self.obj.iter().map(|p| [f64::from(p.x), f64::from(p.y)]).collect();
+        let img: Vec<[f64; 2]> = self.img.iter().map(|p| [f64::from(p.x), f64::from(p.y)]).collect();
         let expected = expected.copied().or(self.prev_r);
         let obj_cv = &self.obj;
-        let res = solve_corrected(corr, k, &obj, &img, |px| solve_planar(obj_cv, k, &obj, px, expected.as_ref()), |r| r.pose)?;
+        // the corners where they are (for the rolling-shutter depths), and on the plane (for IPPE)
+        let obj: Vec<V3> = xy.iter().map(|&[x, y]| surface.point(x, y)).collect();
+        let flat: Vec<V3> = xy.iter().map(|&[x, y]| [x, y, 0.0]).collect();
+        let solve = |px: &[[f64; 2]]| -> opencv::Result<Option<PoseResult>> {
+            let Some(planar) = solve_planar(obj_cv, k, &flat, px, expected.as_ref())? else { return Ok(None) };
+            // IPPE assumes a plane: refine against the board's real shape
+            // (on a flat board this is the iterative refinement IPPE lacks)
+            let (pose, reproj_rms) = refine_pose(k, surface, &xy, px, planar.pose).unwrap_or((planar.pose, planar.reproj_rms));
+            Ok(Some(PoseResult { pose, reproj_rms, margin: planar.margin, xy: xy.clone(), px: px.to_vec() }))
+        };
+        let res = solve_corrected(corr, k, &obj, &img, solve, |r| r.pose)?;
         if let Some(r) = &res {
             self.prev_r = Some(r.pose.r);
         }
         Ok(res)
     }
+}
+
+/// A pose from IPPE (or the iterative fallback).
+struct Planar {
+    pose: Pose,
+    reproj_rms: f64,
+    margin: Option<f64>,
 }
 
 /// IPPE on the board points and their (possibly corrected) pixels, with the
@@ -181,7 +218,7 @@ fn solve_planar(
     obj: &[V3],
     px: &[[f64; 2]],
     expected: Option<&M3>,
-) -> opencv::Result<Option<PoseResult>> {
+) -> opencv::Result<Option<Planar>> {
     let k_mat = Mat::from_slice_2d(&[[k.fx, 0.0, k.cx], [0.0, k.fy, k.cy], [0.0, 0.0, 1.0]])?;
     let d_mat = Mat::from_slice(&k.dist)?;
     let img: Vector<Point2f> = px.iter().map(|p| Point2f::new(p[0] as f32, p[1] as f32)).collect();
@@ -208,7 +245,7 @@ fn solve_planar(
     let branches: Vec<Branch> = poses.iter().map(|p| Branch { rotation: p.r, rms: reproj_rms(k, p, obj, px) }).collect();
     if let Some(choice) = ippe::choose(&branches, expected) {
         let i = choice.index;
-        return Ok(Some(PoseResult { pose: poses[i], reproj_rms: branches[i].rms, margin: Some(choice.margin) }));
+        return Ok(Some(Planar { pose: poses[i], reproj_rms: branches[i].rms, margin: Some(choice.margin) }));
     }
     // IPPE refused the view — plain iterative PnP, no margin
     let (mut rvec, mut tvec) = (Mat::default(), Mat::default());
@@ -216,10 +253,10 @@ fn solve_planar(
         return Ok(None);
     }
     let pose = pose_from(&rvec, &tvec)?;
-    Ok(Some(PoseResult { pose, reproj_rms: reproj_rms(k, &pose, obj, px), margin: None }))
+    Ok(Some(Planar { pose, reproj_rms: reproj_rms(k, &pose, obj, px), margin: None }))
 }
 
-fn pose_from(rvec: &Mat, tvec: &Mat) -> opencv::Result<Pose> {
+pub(crate) fn pose_from(rvec: &Mat, tvec: &Mat) -> opencv::Result<Pose> {
     let r = [*rvec.at::<f64>(0)?, *rvec.at::<f64>(1)?, *rvec.at::<f64>(2)?];
     let t = [*tvec.at::<f64>(0)?, *tvec.at::<f64>(1)?, *tvec.at::<f64>(2)?];
     Ok(Pose { r: rodrigues(r), t })

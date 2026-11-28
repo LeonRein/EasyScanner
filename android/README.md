@@ -135,6 +135,47 @@ Camera2 YUV_420_888 ──(direct ByteBuffers, no copy)──▶ nativeProcess (
   over USB or, after `adb tcpip 5555`, over Wi-Fi (`-Watch` repeats every
   20 s). It never deletes anything on the phone.
 
+## The board's shape
+
+Everyone prints their own board and lays it on their own table, so it is
+rarely flat: paper bows, curls at the edges, sags into a mat. The core
+measures the shape instead of assuming z = 0
+([`board_surface`](core/algo/src/board_surface.rs)): a smooth height
+polynomial over the board (degree 3 by default, `board_surface.degree`),
+fitted jointly with the camera poses to the corners of views from different
+tilts. Both the pose (IPPE on the plane, then refined against the shape) and
+the laser-plane calibration (each stripe ray met with the shape) use it.
+
+The shape belongs to one placement of the board, not to the user or the
+phone, and needs no extra step:
+
+- The camera calibration measures it from its views, and solves K again
+  with the corners where the shape puts them (a K solved for a flat board
+  absorbs the warp).
+- After that, every steady frame through the calibrated camera offers its
+  corners ([`surface_monitor`](core/algo/src/surface_monitor.rs)). Every 2 s,
+  once the views cover directions at least 30° apart, the recent views are
+  fitted again (off the frame thread) and compared with the shape in use.
+  The same within the fits' uncertainty: verified. Clearly different: the
+  views are dropped, and a second fit from fresh views decides. If it agrees
+  with the doubting fit, it replaces the shape (the board was laid down anew:
+  the open scan ends). If it agrees with the old shape, it confirms it.
+  Otherwise it becomes the new doubt.
+- Views are steady frames with enough corners and an unambiguous pose. Their
+  reprojection error is not checked, because it is computed with the shape in
+  use, which is the thing a moved board makes wrong.
+- A changed shape drops the laser lines collected so far for the plane
+  calibration, since they met the old shape.
+- There is no check at app start: a saved shape is used right away and
+  verified by the first steady frames.
+
+The shape is saved with the board spec it was measured on in
+`board_surface.json`. A board with another spec starts flat and overwrites
+it. The shape is also recorded in
+`recording.jsonl` setups, and shown in the header (`SURFACE_STATE`,
+`SURFACE_PV_MM`, `SURFACE_SIGMA_MM`, `SURFACE_VIEWS`); `FORGET_SURFACE`
+drops it. `board_surface.enabled: false` goes back to a flat board.
+
 ## Viewing scans on the phone
 
 The gallery button (top right, next to Settings) opens **Scans**: every session
@@ -261,9 +302,19 @@ first, which deletes the app's files; copy the sessions out first (Finish,
 or `tools/pull-scans.ps1`).
 
 The engine's end-to-end tests (`core/android/src/e2e_tests.rs`) render ChArUco
-frames from a known pose and laser plane, push them through the engine as YUV
-and check the recovered pose, intrinsics and plane. They need OpenCV, so they
-run on a device or emulator: build the test binary with the same environment
+frames from a known pose, laser plane and board shape, push them through the
+engine as YUV and check the recovered pose, intrinsics, plane and shape. They
+need OpenCV 4.7+ (for the objdetect ChArUco detector). On the host, against a
+local build of OpenCV's `core,imgproc,calib3d,features2d,flann,objdetect`:
+
+```
+export OPENCV_LINK_LIBS=opencv_core,opencv_imgproc,opencv_calib3d,opencv_features2d,opencv_flann,opencv_objdetect
+export OPENCV_LINK_PATHS=<prefix>/lib OPENCV_INCLUDE_PATHS=<prefix>/include/opencv4
+export LD_LIBRARY_PATH=<prefix>/lib
+cd core && cargo test -p easyscanner-core
+```
+
+On a device or emulator: build the test binary with the same environment
 the Gradle task sets (`cargo test --release --target x86_64-linux-android -p
 easyscanner-core --no-run`), then
 

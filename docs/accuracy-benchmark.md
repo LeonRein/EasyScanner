@@ -50,7 +50,7 @@ Distances are the signed distance of every point to the true surface, in mm.
 | ideal | 0.000 | 0.000 | 0.000 | 0.000 | 0 % | 0.000 |
 | corner noise 0.2 px | 0.240 | 0.026 | 0.084 | 0.042 | 0 % | −0.000 |
 | stripe noise 0.3 px | 0.000 | 0.194 | 0.658 | 0.324 | 0.65 % | +0.003 |
-| stripe rendered + detector | 0.000 | 0.079 | 0.308 | 0.262 | 0.34 % | −0.029 |
+| stripe rendered + detector | 0.000 | 0.076 | 0.275 | 0.157 | 0.18 % | −0.032 |
 | rolling shutter 20 ms, uncorrected | 1.796 | 0.099 | 0.299 | 0.158 | 0 % | +0.006 |
 | focal length +0.5 % | 1.849 | 1.392 | 1.793 | 1.362 | 74 % | +0.713 |
 | focal +0.5 %, plane calibrated | 1.849 | 0.128 | 0.234 | 0.147 | 0 % | +0.051 |
@@ -59,8 +59,8 @@ Distances are the signed distance of every point to the true surface, in mm.
 | laser plane shifted 0.5 mm | 0.000 | 1.368 | 1.756 | 1.338 | 74 % | +0.707 |
 | corner + stripe noise | 0.240 | 0.195 | 0.668 | 0.326 | 0.65 % | +0.002 |
 | … + plane calibrated in sim | 0.240 | 0.196 | 0.666 | 0.326 | 0.66 % | −0.007 |
-| realistic, rolling shutter uncorrected | 2.070 | 0.149 | 0.488 | 0.334 | 0.61 % | +0.024 |
-| realistic (all of the above, rendered, gyro, corrected) | 1.261 | 0.099 | 0.381 | 0.288 | 0.43 % | +0.018 |
+| realistic, rolling shutter uncorrected | 2.070 | 0.149 | 0.466 | 0.243 | 0.36 % | +0.030 |
+| realistic (all of the above, rendered, gyro, corrected) | 1.261 | 0.097 | 0.358 | 0.189 | 0.25 % | +0.019 |
 | brisk (~190 mm/s), RS 20 ms, uncorrected | 3.879 | 0.275 | 0.818 | 0.414 | 1.85 % | −0.037 |
 | brisk, RS corrected from the poses | 1.844 | 0.213 | 0.731 | 0.353 | 1.12 % | +0.068 |
 | brisk, RS corrected with the gyro | 1.662 | 0.207 | 0.700 | 0.340 | 0.88 % | +0.066 |
@@ -75,9 +75,10 @@ What it says (for this geometry, synthetic data):
   noise costs 0.32 mm. Sub-pixel stripe quality and per-frame averaging pay
   off more than pose filtering.
 - **The RMS is driven by a few outliers.** With the real detector the median
-  error is 0.08 mm but 0.45 % of the points are off by more than 1 mm (up to
-  ~10 mm): stripe points at depth edges (ball/board silhouette). A per-point
-  filter (neighbour consistency, stripe width) is the cheapest accuracy win.
+  error is 0.08 mm but 0.18 % of the points are off by more than 1 mm: stripe
+  points at depth edges (ball/board silhouette). The detector's ridge test
+  (a peak must stand clear of the background on both sides) halved them; a
+  per-row run-continuity filter was tried on top and gained nothing.
 - **Rolling shutter is small at this speed** (0.16 mm RMS) although the pose
   itself is off by 1.8 mm, because board and stripe are distorted together.
   It grows with speed, and the correction ([`imu-fusion.md`](imu-fusion.md))
@@ -91,6 +92,50 @@ What it says (for this geometry, synthetic data):
   shift already give 1.3–1.6 mm. The app's 6 mm RMS gate for the plane fit
   is far too loose to guarantee that; the simulated calibration reaches
   0.003°.
+
+## Board shape and hard stripe cases
+
+Every user prints and mounts the board themselves, so it is never perfectly
+flat. The app measures its shape per placement (see the README, "The
+board's shape"); the bench checks what that is worth. The bent board curls
+and twists by 1.6 mm peak to valley, with terms up to degree 5 that the
+app's degree-3 model cannot match exactly. The curled board has three times
+the curl, more than the volume's 3 mm board margin. Corner noise is 0.2 px
+and stripe noise 0.3 px:
+
+| Scenario | Pose pos RMS | plane° | mean | RMS | > 1 mm |
+|---|---|---|---|---|---|
+| bent board, taken as flat | 0.501 | 0.044 | −0.199 | 0.399 | 1.89 % |
+| bent board, shape measured (degree 3, from the plane calibration's static views) | 0.242 | 0.003 | −0.012 | 0.322 | 0.46 % |
+| bent board, true shape | 0.240 | 0.003 | −0.010 | 0.322 | 0.46 % |
+| curled board, taken as flat | 1.340 | 0.121 | +15.98 | 48.78 | 26.3 % |
+| curled board, shape measured | 0.245 | 0.009 | +0.035 | 0.327 | 0.56 % |
+
+Taking a bent board as flat biases the whole cloud by −0.2 mm and tilts the
+calibrated laser plane by 0.045°. The measured cubic is as good as the true
+shape, although it cannot match it exactly. Object height is measured from
+the board surface, not from its plane. Taken as flat, the curled board
+rises above the volume's board margin, and its own points leak into the
+cloud; measured, they stay out.
+
+| Scenario | median | p95 | RMS | > 1 mm |
+|---|---|---|---|---|
+| wide (σ 0.8 mm), overexposed stripe | 0.159 | 1.974 | 7.870 | 8.63 % |
+| reddish object | 0.085 | 1.694 | 23.87 | 11.3 % |
+
+- **A reddish object** used to be taken for the stripe on 67 % of its rows
+  (> 1 mm). The ridge test brings that to 11 %. A line's stripe is its most
+  prominent ridge, held against the frame's strongest ridge, not its
+  highest response. A saturated object elsewhere therefore does not drown a
+  weak stripe, and a line whose highest response is on the object still
+  finds the stripe. What remains are lines where the stripe is hidden and
+  the object's red edge is a ridge too.
+- **A wide, clipped stripe** loses its sub-pixel centre where the albedo
+  changes under it (marker edges). This needs exposure control, tuned on real
+  frames.
+
+Run one scenario with `sweep --only <substring>`, for example
+`sweep --only bent`.
 
 ## Real recordings
 

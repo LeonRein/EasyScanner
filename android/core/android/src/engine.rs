@@ -1,12 +1,13 @@
 //! The per-frame pipeline and the scanner's modes — the desktop prototype's `app.py`
 //! main loop without the window: board pose (gyro-fused, rolling-shutter
-//! corrected) → live intrinsics calibration →
+//! corrected, on the board's measured shape) → live intrinsics calibration →
 //! laser stripe in the working volume → laser-plane calibration → plane
 //! triangulation into the board-frame cloud → overlay layers.
 //!
 //! One `Engine` is driven from a single thread (the app's processing thread):
 //! frames, configuration and commands all arrive there, so it needs no locks.
-//! Only the intrinsics solve runs elsewhere (see `calib`).
+//! Only the intrinsics solve and the board-shape fits run elsewhere (see
+//! `calib` and `surface`).
 
 use std::collections::VecDeque;
 use std::fs;
@@ -31,12 +32,14 @@ use scan_algo::recording::session::SessionRecorder;
 use scan_algo::recording::{CornerRec, FrameRec, Header, PlaneRec, PoseObs, ScanOutcome, Setup};
 use scan_algo::rolling::RowClock;
 use scan_algo::stripe::{self, BoardStripe};
+use scan_algo::surface_monitor::Verdict;
 use scan_algo::volume::Volume;
 use serde::Deserialize;
 
 use crate::board::{BoardTracker, PoseResult, corner_bbox, distance};
-use crate::calib::{CalibState, LiveCalibrator, Outcome};
+use crate::calib::{CalibState, Calibration, LiveCalibrator, Outcome};
 use crate::frame_out::{FrameOut, ev, h, laser_state, layer, photo_state};
+use crate::surface::{Settled, SurfaceTracker};
 
 /// Commands from the app (`NativeCore.Cmd`).
 pub mod cmd {
@@ -67,6 +70,8 @@ pub mod cmd {
     pub const CHECKPOINT: i32 = 19;
     /// no more photos in the open session, which keeps the scan (no still stream can be had)
     pub const PHOTOS_OFF: i32 = 20;
+    /// drop the board's measured shape and measure it again
+    pub const FORGET_SURFACE: i32 = 21;
 }
 
 /// The Z-up cloud a session keeps next to orbiter-native's `laser.ply`.
@@ -99,6 +104,7 @@ struct Messages {
     plane: String,
     scan: String,
     photos: String,
+    surface: String,
 }
 
 /// A still written by the app, waiting for its exposure's pose.
@@ -150,6 +156,8 @@ pub struct Engine {
     plane_cal: PlaneCalibrator,
     plane_active: bool,
     plane_solved_at: usize,
+    /// The board's measured shape, kept current from steady frames.
+    surface: SurfaceTracker,
     scan_on: bool,
     cloud: PointCloud,
     /// The cloud has points the open session (or, with none open, any session) has not written.
@@ -189,7 +197,9 @@ impl Engine {
     pub fn new(dir: PathBuf) -> opencv::Result<Engine> {
         let cfg = Config::default();
         let tracker = BoardTracker::new(cfg.board, cfg.detector.aruco3, cfg.detector.roi_tracking)?;
+        let surface = SurfaceTracker::new(&dir, cfg.board, cfg.board_surface);
         let mut e = Engine {
+            surface,
             calib: LiveCalibrator::new(cfg.calib_views),
             plane_cal: PlaneCalibrator::new(cfg.plane_views),
             cloud: PointCloud::new(cfg.max_cloud_points),
@@ -265,6 +275,7 @@ impl Engine {
         self.plane_cal.min_lines = cfg.plane_views.max(3);
         self.plane_cal.fit = cfg.plane_fit;
         self.cloud.max_points = cfg.max_cloud_points;
+        self.surface.configure(&self.dir, cfg.board, cfg.board_surface);
         self.cfg = cfg;
         let k_before = self.k_base;
         self.reload_calibrations();
@@ -282,6 +293,7 @@ impl Engine {
         self.close_photos(why);
         self.plane_cal.reset();
         self.plane_solved_at = 0;
+        self.surface.restart_views();
     }
 
     /// The laser plane, when it was fitted with the current camera model.
@@ -312,7 +324,11 @@ impl Engine {
 
     /// The calibration frames are processed with, for the session's recording.
     fn current_setup(&self) -> Setup {
-        Setup { intrinsics: self.k_base.into(), laser_plane: self.usable_plane().map(|(n, d)| PlaneRec { n, d }) }
+        Setup {
+            intrinsics: self.k_base.into(),
+            laser_plane: self.usable_plane().map(|(n, d)| PlaneRec { n, d }),
+            board_surface: self.surface.measured().map(|m| m.surface.clone()),
+        }
     }
 
     /// Tell the recording the calibration may have changed.
@@ -387,9 +403,11 @@ impl Engine {
         let ts_ns = clock.start_ns;
         let (w, hgt) = (f.width() as u32, f.height() as u32);
         if self.last_wh != (w, hgt) {
-            // sharpness is not comparable across resolutions
+            // sharpness is not comparable across resolutions, nor are the
+            // shape views' pixels
             self.focus_max = 1e-6;
             self.last_wh = (w, hgt);
+            self.surface.restart_views();
         }
         self.frame_no += 1;
         self.poll_calibration();
@@ -406,7 +424,7 @@ impl Engine {
         let n_corners = self.tracker.detect(&gray)?;
         let correction = self.fusion.correction(&clock);
         let expected = self.fusion.expected_rotation(&clock);
-        let pose_res = self.tracker.solve_pose(&k, expected.as_ref(), correction.as_ref())?;
+        let pose_res = self.tracker.solve_pose(&k, self.surface.surface(), expected.as_ref(), correction.as_ref())?;
         let t_board = t0.elapsed();
 
         let sharpness = corner_bbox(&self.tracker.corners)
@@ -450,9 +468,28 @@ impl Engine {
         // calibrate the gyro against and to read the camera's motion from
         self.fusion.observe(&clock, pose_res.as_ref().filter(|_| plane_pose_ok).map(|p| &p.pose));
 
-        // ── live intrinsics calibration: every genuinely new view ──
+        // ── the board's shape: steady frames through a calibrated camera ──
+        let t_s = ts_ns as f64 * 1e-9;
+        // not the scan verdict: its RMS is computed with the shape in use, so
+        // a board laid down with another shape would starve its own re-measurement
+        let view_ok = quality.as_ref().is_some_and(|q| gate.check_view(q).is_ok());
+        if let Some(p) = pose_res.as_ref().filter(|_| self.k_ok() && view_ok) {
+            self.surface.offer(t_s, || p.surface_view());
+        }
+        if let Some(settled) = self.surface.step(&self.dir, t_s, &k) {
+            self.surface_settled(settled);
+        }
+
+        // ── live intrinsics calibration: every genuinely new, steady view ──
+        // (blur and the rolling shutter's shear would go into K)
+        let steady = self.cfg.scan_gate.check_motion(speed).is_ok();
         if self.calib_active && pose_res.is_some() && !self.calib.solving() {
-            if self.calib.capture(&self.tracker.corners, &self.tracker.ids, (w, hgt)) {
+            if !steady {
+                if self.calib.count() < self.calib.target && !self.msgs.calib.starts_with("hold") {
+                    self.msgs.calib = format!("hold the phone steadier — {}/{} views", self.calib.count(), self.calib.target);
+                    self.events |= ev::MESSAGES;
+                }
+            } else if self.calib.capture(&self.tracker.corners, &self.tracker.ids, (w, hgt)) {
                 let (n, t) = (self.calib.count(), self.calib.target);
                 self.msgs.calib = if n < t {
                     format!("collecting {n}/{t} — move the phone around the board")
@@ -461,7 +498,7 @@ impl Engine {
                 };
                 self.events |= ev::MESSAGES;
             }
-            if self.calib.maybe_solve(self.cfg.board, self.k_base) {
+            if self.calib.maybe_solve(self.cfg.board, self.k_base, self.surface.degree()) {
                 self.calib_state = CalibState::Solving;
                 self.msgs.calib = format!("solving over {} views… this takes a few seconds", self.calib.count());
                 self.events |= ev::MESSAGES;
@@ -494,7 +531,7 @@ impl Engine {
                 found = self.laser.detect(f, roi, &params, &mut self.laser_px);
             }
             if let (true, Some(p)) = (found, pose) {
-                board_stripe = stripe::on_board(&self.laser_px, &k, &p, correction.as_ref(), &vol);
+                board_stripe = stripe::on_board(&self.laser_px, &k, &p, correction.as_ref(), self.surface.surface(), &vol);
             }
         }
         if !found {
@@ -534,24 +571,33 @@ impl Engine {
         let classified = !self.plane_active && plane.is_some() && pose.is_some() && found;
         if let (true, Some((n, d)), Some(p)) = (classified, plane, pose) {
             let mut inside = vec![false; self.laser_px.len()];
-            let mut pushed = false;
+            let (mut pushed, mut full) = (false, false);
             // a frame that fails the gate is classified and shown, never kept
             let keep = self.scan_on && scan_verdict == Some(Ok(()));
-            let (cloud, px, scan_on) = (&mut self.cloud, &self.laser_px, keep);
+            let (cloud, px, scan_on, surface) = (&mut self.cloud, &self.laser_px, keep, self.surface.surface());
             stripe::to_laser_plane(px, &k, n, d, |i, x| {
                 // the point in the camera frame of the instant the pose describes
                 let x = correction.as_ref().map_or(x, |c| c.stripe_point(x, px[i][1] as f64));
                 let b = p.to_board(x);
-                if vol.contains(&p, b) {
+                if vol.contains(&p, b, surface) {
                     inside[i] = true;
                     if scan_on {
                         let (u, v) = (px[i][0].round() as usize, px[i][1].round() as usize);
-                        cloud.push(b, f.rgb_at(u, v));
-                        pushed = true;
+                        if cloud.push(b, f.rgb_at(u, v)) {
+                            pushed = true;
+                        } else {
+                            full = true;
+                        }
                     }
                 }
             });
             self.cloud_unsaved |= pushed;
+            if full {
+                // stop rather than drop points unnoticed; the UI sees SCAN_ON fall
+                self.scan_on = false;
+                self.events |= ev::MESSAGES;
+                self.msgs.scan = format!("scan stopped: the point cloud is full ({} points) — export or clear it", self.cloud.len());
+            }
             if self.scan_on
                 && inside.iter().any(|&i| i)
                 && let Some(v) = scan_verdict
@@ -607,6 +653,14 @@ impl Engine {
         }
         o.set(h::GYRO_STATE, self.fusion.gyro_state() as i32 as f64);
         o.set(h::RS_CORRECTED, correction.is_some() as u8 as f64);
+        let (b, (views, views_min)) = (self.cfg.board, self.surface.progress());
+        o.set(h::SURFACE_STATE, self.surface.state() as i32 as f64);
+        if let Some(m) = self.surface.measured() {
+            o.set(h::SURFACE_PV_MM, m.surface.peak_to_valley(b.width_mm(), b.height_mm()));
+            o.set(h::SURFACE_SIGMA_MM, m.height_sigma_mm);
+        }
+        o.set(h::SURFACE_VIEWS, views as f64);
+        o.set(h::SURFACE_VIEWS_MIN, views_min as f64);
         o.set(h::GATE_KEPT, self.gate_stats.kept as f64);
         o.set(h::GATE_REJECTED, self.gate_stats.rejected() as f64);
         o.set(h::EVENTS, self.events as f64);
@@ -620,7 +674,8 @@ impl Engine {
 
     fn poll_calibration(&mut self) {
         match self.calib.poll() {
-            Some(Outcome::Solved { k, rms }) => {
+            Some(Outcome::Solved(c)) => {
+                let Calibration { k, rms, sigma, dropped, surface } = *c;
                 let file = IntrinsicsFile {
                     fx: k.fx,
                     fy: k.fy,
@@ -633,6 +688,7 @@ impl Engine {
                     camera_id: Some(self.cfg.camera.id.clone()),
                     focus_diopters: self.cfg.camera.focus_diopters,
                     rms_px: Some(rms),
+                    sigma_px: Some(sigma),
                 };
                 let saved = config::save_intrinsics(&self.dir, &file);
                 self.k_base = k;
@@ -642,10 +698,17 @@ impl Engine {
                 self.calib.reset();
                 self.calib_state = CalibState::Saved;
                 self.msgs.calib = match saved {
-                    Ok(()) => format!("SAVED | fx {:.0} cx {:.0} rms {rms:.2}px", k.fx, k.cx),
+                    Ok(()) => {
+                        let outliers = if dropped > 0 { format!(", {dropped} poor views dropped") } else { String::new() };
+                        format!("SAVED | fx {:.0} ±{:.1} cx {:.0} ±{:.1} rms {rms:.2}px{outliers}", k.fx, sigma[0], k.cx, sigma[2])
+                    }
                     Err(e) => format!("solved (rms {rms:.2}px) but NOT saved: {e}"),
                 };
                 self.events |= ev::MESSAGES | ev::INTRINSICS_SAVED;
+                // the shape the calibration measured is a first (or another) measurement
+                if let Some(settled) = surface.and_then(|fit| self.surface.propose(&self.dir, fit)) {
+                    self.surface_settled(settled);
+                }
             }
             Some(Outcome::Rejected { reason, .. }) => {
                 // keep collecting and retry — that is why the count climbs past the target
@@ -655,6 +718,46 @@ impl Engine {
             }
             None => {}
         }
+    }
+
+    /// Report what came of a board-shape fit.
+    fn surface_settled(&mut self, Settled { verdict, saved }: Settled) {
+        let verdict_changed = verdict.changed_shape();
+        let moved = matches!(verdict, Verdict::Replaced { .. });
+        let pv = self.surface.measured().map_or(0.0, |m| m.surface.peak_to_valley(self.cfg.board.width_mm(), self.cfg.board.height_mm()));
+        let msg = match verdict {
+            Verdict::Undetermined => return,
+            Verdict::Inconsistent { rms_px } => format!("board shape: views disagree ({rms_px:.2} px) — measuring again"),
+            Verdict::First => format!("board shape measured: {pv:.1} mm off flat"),
+            Verdict::Confirmed { refined: false, .. } => {
+                if self.msgs.surface.starts_with("board shape verified") {
+                    return;
+                }
+                format!("board shape verified ({pv:.1} mm off flat)")
+            }
+            Verdict::Confirmed { refined: true, .. } => format!("board shape refined: {pv:.1} mm off flat"),
+            Verdict::Suspect { difference_mm } => format!("board shape differs by {difference_mm:.1} mm — checking"),
+            Verdict::Replaced { difference_mm } => {
+                format!("board moved: shape re-measured ({pv:.1} mm off flat, {difference_mm:.1} mm change)")
+            }
+        };
+        log::info!("{msg}");
+        if verdict_changed {
+            // the laser lines collected so far were met with the old shape
+            self.plane_cal.reset();
+            self.plane_solved_at = 0;
+            if moved {
+                // the board was laid down anew: the cloud so far is in the old placement's frame
+                self.close_photos("board moved");
+                self.scan_on = false;
+            }
+            self.announce_setup();
+        }
+        self.msgs.surface = match saved {
+            Ok(()) => msg,
+            Err(e) => format!("{msg} — NOT saved: {e}"),
+        };
+        self.events |= ev::MESSAGES;
     }
 
     fn accept_plane(&mut self, fit: PlaneFit, forced: bool) {
@@ -791,13 +894,14 @@ impl Engine {
                 self.out.points(layer::CLOUD, &self.pts);
             }
         }
+        let surface = self.surface.surface();
         if classified {
             self.out.points(layer::LASER_OUT, &self.pts_out);
             self.out.points(layer::LASER_IN, &self.pts_in);
         } else {
             self.out.points(layer::LASER_RAW, &self.laser_px);
             if let (Some(s), Some(p)) = (stripe, pose)
-                && let Some(seg) = overlay::segment(k, &p, [s.fit_a[0], s.fit_a[1], 0.0], [s.fit_b[0], s.fit_b[1], 0.0])
+                && let Some(seg) = overlay::segment(k, &p, surface.point(s.fit_a[0], s.fit_a[1]), surface.point(s.fit_b[0], s.fit_b[1]))
             {
                 self.out.segments(layer::LASER_FIT, &[seg]);
             }
@@ -935,12 +1039,21 @@ impl Engine {
                 self.scan_on = false;
                 "laser plane cleared".to_string()
             }
+            cmd::FORGET_SURFACE => {
+                let removed = self.surface.forget(&self.dir);
+                self.announce_setup();
+                match removed {
+                    Ok(()) => "board shape cleared — measuring it again".to_string(),
+                    Err(e) => format!("board shape cleared, but its file stays: {e}"),
+                }
+            }
             _ => format!("unknown command {code}"),
         };
         match code {
             cmd::CALIB_START..=cmd::CALIB_RESET | cmd::FORGET_INTRINSICS => self.msgs.calib = msg.clone(),
             cmd::PLANE_START..=cmd::PLANE_FORCE | cmd::FORGET_PLANE => self.msgs.plane = msg.clone(),
             cmd::PHOTOS_START..=cmd::PHOTO_FAILED | cmd::PHOTOS_OFF => self.msgs.photos = msg.clone(),
+            cmd::FORGET_SURFACE => self.msgs.surface = msg.clone(),
             _ => self.msgs.scan = msg.clone(),
         }
         msg
@@ -1217,6 +1330,7 @@ impl Engine {
             "plane": self.msgs.plane,
             "scan": self.msgs.scan,
             "photos": self.msgs.photos,
+            "surface": self.msgs.surface,
             "intrinsics": format!("{intr}{focus_note}"),
             "k_focus": self.k_file.as_ref().and_then(|f| f.focus_diopters),
             "plane_file": match (self.plane, self.usable_plane()) {

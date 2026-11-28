@@ -11,6 +11,7 @@
 
 pub mod atomic_file;
 pub mod bench;
+pub mod board_surface;
 pub mod cloud;
 pub mod config;
 pub mod focus;
@@ -21,10 +22,13 @@ pub mod imu;
 pub mod ippe;
 pub mod keyframe;
 pub mod laser;
+pub mod linalg;
 pub mod overlay;
 pub mod photo_session;
 pub mod plane;
+pub mod pnp;
 pub mod recording;
 pub mod rolling;
 pub mod stripe;
+pub mod surface_monitor;
 pub mod volume;

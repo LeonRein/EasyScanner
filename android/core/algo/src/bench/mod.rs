@@ -26,7 +26,6 @@
 //! scan_bench -- sweep`.
 
 pub mod metrics;
-pub mod pnp;
 pub mod reconstruct;
 pub mod scene;
 pub mod sim;
@@ -36,6 +35,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use crate::board_surface::{self, BoardSurface, SurfaceView};
 use crate::fusion::FusionCfg;
 use crate::gate::ScanGateCfg;
 use crate::geom::{Intrinsics, Pose, V3, dot, mat_vec, rodrigues};
@@ -64,6 +64,20 @@ pub enum PlaneSource {
     Calibrated { frames: usize, min_lines: usize },
 }
 
+/// The board shape the pipeline computes with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SurfaceModel {
+    /// The plane z = 0, whatever the board's true shape.
+    #[default]
+    Flat,
+    /// The true shape.
+    Truth,
+    /// Measured as the app's camera calibration does: fitted
+    /// (`board_surface::fit`) to `views` static views of the bare board.
+    Measured { views: usize, degree: u8 },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BenchCfg {
@@ -74,8 +88,14 @@ pub struct BenchCfg {
     /// How the calibration the pipeline uses differs from it.
     pub intrinsics_error: IntrinsicsError,
     pub board: BoardDims,
+    /// The board's true shape (flat by default).
+    pub board_shape: BoardSurface,
+    /// … and the one the pipeline uses.
+    pub surface_model: SurfaceModel,
     pub volume: VolumeDims,
     pub shapes: Vec<Shape>,
+    /// RGB tint of the solids (white = `[1, 1, 1]`).
+    pub shape_tint: [f64; 3],
     pub laser: LaserMount,
     pub plane: PlaneSource,
     pub trajectory: Trajectory,
@@ -102,7 +122,10 @@ impl Default for BenchCfg {
             camera: CameraModel::default(),
             intrinsics_error: IntrinsicsError::default(),
             board: BoardDims::default(),
+            board_shape: BoardSurface::flat(),
+            surface_model: SurfaceModel::Flat,
             volume: VolumeDims::default(),
+            shape_tint: [1.0; 3],
             shapes: vec![Shape::ball_on_board(144.0, 144.0, 25.0), Shape::block_on_board(60.0, 190.0, 40.0, 30.0, 20.0)],
             laser: LaserMount::default(),
             plane: PlaneSource::Truth,
@@ -167,7 +190,7 @@ pub fn scenarios() -> Vec<BenchCfg> {
         rolling_shutter_ms: 20.0,
         trajectory: Trajectory { sweep_hz: 0.75, ..Trajectory::default() },
         gyro: Some(GyroModel::default()),
-        ..noisy
+        ..noisy.clone()
     };
     out.extend([
         BenchCfg { fusion: no_correction, ..brisk.named("brisk, uncorrected") },
@@ -198,7 +221,60 @@ pub fn scenarios() -> Vec<BenchCfg> {
             ..brisk.named("brisk two-axis, gyro, all of the above")
         },
     ]);
+    // A board that does not lie flat (1.6 mm peak to valley), with the plane
+    // calibrated on it: taken as flat, measured like the app does (degree 3,
+    // from the plane calibration's static views), and exact. Curled three
+    // times as much, it rises above the volume's board margin.
+    let bent =
+        BenchCfg { board_shape: bent_board(&ideal.board), plane: PlaneSource::Calibrated { frames: 120, min_lines: 10 }, ..noisy.clone() };
+    let curled = BenchCfg { board_shape: curled_board(&ideal.board), ..bent.clone() };
+    let measured = SurfaceModel::Measured { views: 60, degree: 3 };
+    out.extend([
+        bent.named("bent board, taken as flat"),
+        BenchCfg { surface_model: measured, ..bent.named("bent board, shape measured") },
+        BenchCfg { surface_model: SurfaceModel::Truth, ..bent.named("bent board, true shape") },
+        curled.named("curled board, taken as flat"),
+        BenchCfg { surface_model: measured, ..curled.named("curled board, shape measured") },
+    ]);
+    // The stripe detector's hard cases, rendered: a wide, overexposed line
+    // and a reddish object under a red laser.
+    let rendered = BenchCfg { stripe: StripeModel::render(), corner_noise_px: 0.2, ..ideal.clone() };
+    let wide = LaserMount { sheet_sigma_mm: 0.8, ..LaserMount::default() };
+    out.extend([
+        BenchCfg {
+            laser: wide,
+            stripe: StripeModel::Render { supersample: 2, ambient: 150.0, laser_gain: 1200.0, sensor_noise: 2.0 },
+            ..rendered.named("wide (σ 0.8 mm), overexposed stripe")
+        },
+        BenchCfg { shape_tint: [1.0, 0.55, 0.5], ..rendered.named("reddish object") },
+    ]);
     out
+}
+
+/// A sheet of paper bowed and twisted on a table: 1.6 mm peak to valley.
+/// It has terms up to degree 5, so the app's degree-3 model cannot match
+/// it exactly, as it cannot match real paper.
+pub fn bent_board(b: &BoardDims) -> BoardSurface {
+    bent(b, 1.0)
+}
+
+/// The same sheet curled three times as much: more than the volume's
+/// board margin, so board points measured from the plane would leak.
+pub fn curled_board(b: &BoardDims) -> BoardSurface {
+    bent(b, 3.0)
+}
+
+fn bent(b: &BoardDims, gain: f64) -> BoardSurface {
+    let coeffs = [
+        [-1.5, 0.5, -1.2].as_slice(),       // degree 2
+        &[0.0, 0.15, 0.0, -0.1],            // degree 3
+        &[0.12, 0.0, -0.08, 0.0, 0.1],      // degree 4: edges curling up
+        &[0.0, 0.06, 0.0, 0.0, -0.05, 0.0], // degree 5
+    ]
+    .concat();
+    BoardSurface::for_board(b.width_mm(), b.height_mm(), 5)
+        .with_coeffs(coeffs.into_iter().map(|c| gain * c).collect())
+        .expect("18 terms for degree 5")
 }
 
 fn frac(x: f64) -> f64 {
@@ -218,18 +294,52 @@ fn calibration_pose(b: &BoardDims, i: usize) -> Pose {
     look_at([aim[0] + dist * out[0], aim[1] + dist * out[1], aim[2] + dist * out[2]], aim, side)
 }
 
-fn solve_corners(board: &BoardDims, k: &Intrinsics, corners: &[(u32, [f64; 2])]) -> Option<Pose> {
+fn solve_corners(board: &BoardDims, surface: &BoardSurface, k: &Intrinsics, corners: &[(u32, [f64; 2])]) -> Option<Pose> {
     if corners.len() < reconstruct::MIN_CORNERS {
         return None;
     }
     let ids: Vec<(u32, V3)> = board.corners().collect();
-    let (obj, px): (Vec<V3>, Vec<[f64; 2]>) = corners.iter().map(|&(id, q)| (ids[id as usize].1, q)).unzip();
-    pnp::solve_planar(k, &obj, &px).map(|(p, _)| p)
+    let (flat, px): (Vec<V3>, Vec<[f64; 2]>) = corners.iter().map(|&(id, q)| (ids[id as usize].1, q)).unzip();
+    reconstruct::solve_on(surface, k, &flat, &px, None).map(|(p, _)| p)
 }
 
-/// Replay the app's laser-plane calibration on simulated board-only views.
-pub fn calibrate_plane(cfg: &BenchCfg, frames: usize, min_lines: usize) -> Result<PlaneFit, String> {
-    let scene = Scene { board: cfg.board, shapes: Vec::new() };
+/// The true scene of `cfg`.
+fn scene_of(cfg: &BenchCfg) -> Scene {
+    Scene { board: cfg.board, surface: cfg.board_shape.clone(), shapes: cfg.shapes.clone(), shape_tint: cfg.shape_tint }
+}
+
+/// The board shape the pipeline uses for `cfg` (see [`SurfaceModel`]).
+pub fn model_surface(cfg: &BenchCfg) -> Result<BoardSurface, String> {
+    let (w, h) = (cfg.board.width_mm(), cfg.board.height_mm());
+    match cfg.surface_model {
+        SurfaceModel::Flat => Ok(BoardSurface::flat()),
+        SurfaceModel::Truth => Ok(cfg.board_shape.clone()),
+        SurfaceModel::Measured { views, degree } => {
+            let scene = Scene { shapes: Vec::new(), ..scene_of(cfg) };
+            let k_est: Intrinsics = cfg.intrinsics_error.apply(cfg.camera).into();
+            let mut cam = Camera::new(&scene, cfg.camera.into(), cfg.laser, cfg.stripe, cfg.corner_noise_px, 0.0, cfg.seed ^ 0x5EA7);
+            let ids: Vec<(u32, V3)> = cfg.board.corners().collect();
+            let flat = BoardSurface::flat();
+            let observed: Vec<SurfaceView> = (0..views)
+                .filter_map(|i| {
+                    let truth = calibration_pose(&cfg.board, i);
+                    let obs = cam.observe(&|_| truth, 0.0);
+                    let pose = solve_corners(&cfg.board, &flat, &k_est, &obs.corners)?;
+                    let (xy, px) = obs.corners.iter().map(|&(id, q)| ([ids[id as usize].1[0], ids[id as usize].1[1]], q)).unzip();
+                    Some(SurfaceView { xy, px, pose })
+                })
+                .collect();
+            board_surface::fit(&k_est, &BoardSurface::for_board(w, h, degree), &observed, w, h)
+                .map(|f| f.surface)
+                .ok_or_else(|| format!("the board shape could not be fitted from {} views", observed.len()))
+        }
+    }
+}
+
+/// Replay the app's laser-plane calibration on simulated board-only views,
+/// computed on the board shape `surface`.
+pub fn calibrate_plane(cfg: &BenchCfg, surface: &BoardSurface, frames: usize, min_lines: usize) -> Result<PlaneFit, String> {
+    let scene = Scene { shapes: Vec::new(), ..scene_of(cfg) };
     let k_est: Intrinsics = cfg.intrinsics_error.apply(cfg.camera).into();
     let vol = cfg.volume.volume(&cfg.board);
     let mut cam = Camera::new(&scene, cfg.camera.into(), cfg.laser, cfg.stripe, cfg.corner_noise_px, 0.0, cfg.seed ^ 0xCA1B);
@@ -238,8 +348,8 @@ pub fn calibrate_plane(cfg: &BenchCfg, frames: usize, min_lines: usize) -> Resul
     for i in 0..frames {
         let truth = calibration_pose(&cfg.board, i);
         let obs = cam.observe(&|_| truth, 0.0);
-        let Some(pose) = solve_corners(&cfg.board, &k_est, &obs.corners) else { continue };
-        if let Some(s) = stripe::on_board(&obs.laser_px, &k_est, &pose, None, &vol) {
+        let Some(pose) = solve_corners(&cfg.board, surface, &k_est, &obs.corners) else { continue };
+        if let Some(s) = stripe::on_board(&obs.laser_px, &k_est, &pose, None, surface, &vol) {
             let n = cal.add(&s.cam_pts);
             if cal.ready() && n != solved_at {
                 solved_at = n;
@@ -259,7 +369,8 @@ pub fn calibrate_plane(cfg: &BenchCfg, frames: usize, min_lines: usize) -> Resul
 
 /// Simulate the scan described by `cfg` into a recording with its truth.
 pub fn simulate(cfg: &BenchCfg) -> Result<Synthetic, String> {
-    let scene = Scene { board: cfg.board, shapes: cfg.shapes.clone() };
+    let scene = scene_of(cfg);
+    let surface = model_surface(cfg)?;
     let (tn, td) = cfg.laser.plane();
     let used = match cfg.plane {
         PlaneSource::Truth => PlaneRec { n: tn, d: td },
@@ -269,7 +380,7 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Synthetic, String> {
             PlaneRec { n, d: dot(n, cfg.laser.origin()) + offset_mm }
         }
         PlaneSource::Calibrated { frames, min_lines } => {
-            let fit = calibrate_plane(cfg, frames, min_lines)?;
+            let fit = calibrate_plane(cfg, &surface, frames, min_lines)?;
             PlaneRec { n: fit.n, d: fit.d }
         }
     };
@@ -312,7 +423,14 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Synthetic, String> {
             fusion: cfg.fusion,
             scan_gate: ScanGateCfg::default(),
         },
-        setups: vec![(0, Setup { intrinsics: cfg.intrinsics_error.apply(cfg.camera), laser_plane: Some(used) })],
+        setups: vec![(
+            0,
+            Setup {
+                intrinsics: cfg.intrinsics_error.apply(cfg.camera),
+                laser_plane: Some(used),
+                board_surface: (!surface.is_flat()).then_some(surface),
+            },
+        )],
         frames,
         gyro,
     };
@@ -376,9 +494,26 @@ mod tests {
     }
 
     #[test]
+    fn a_bent_board_needs_its_shape() {
+        let bent = BenchCfg {
+            board_shape: bent_board(&BoardDims::default()),
+            plane: PlaneSource::Calibrated { frames: 120, min_lines: 10 },
+            corner_noise_px: 0.2,
+            ..short(BenchCfg::default())
+        };
+        let flat = run(&bent).unwrap().report;
+        let measured = run(&BenchCfg { surface_model: SurfaceModel::Measured { views: 60, degree: 3 }, ..bent }).unwrap().report;
+        let (f, m) = (flat.surface_mm.unwrap(), measured.surface_mm.unwrap());
+        // taken as flat, the plane calibration and the poses carry the bow
+        assert!(flat.plane_angle_deg.unwrap() > 5.0 * measured.plane_angle_deg.unwrap(), "{flat:?} vs {measured:?}");
+        assert!(f.mean.abs() > 0.1 && m.mean.abs() < 0.05, "mean {} vs {}", f.mean, m.mean);
+        assert!(measured.pose_pos_mm.unwrap().rms < 0.7 * flat.pose_pos_mm.unwrap().rms);
+    }
+
+    #[test]
     fn simulated_plane_calibration_converges() {
         let cfg = BenchCfg { corner_noise_px: 0.2, stripe: StripeModel::Analytic { noise_px: 0.3 }, ..BenchCfg::default() };
-        let fit = calibrate_plane(&cfg, 120, 10).unwrap();
+        let fit = calibrate_plane(&cfg, &BoardSurface::flat(), 120, 10).unwrap();
         let (n, _) = cfg.laser.plane();
         let ang = dot(n, fit.n).abs().min(1.0).acos().to_degrees();
         assert!(ang < 0.5, "plane off by {ang}°");

@@ -96,7 +96,15 @@ class FrameResult(capacity: Int = 32 * 1024) {
         const val GYRO_STATE = 58
         /** 1 when the frame was rolling-shutter corrected. */
         const val RS_CORRECTED = 59
-        const val LEN = 60
+        /** A [Surface] state: how the board's shape is known. */
+        const val SURFACE_STATE = 60
+        /** The measured shape's peak-to-valley and height uncertainty (mm); NaN while unmeasured. */
+        const val SURFACE_PV_MM = 61
+        const val SURFACE_SIGMA_MM = 62
+        /** Views collected toward the next shape fit, and the fewest a fit needs. */
+        const val SURFACE_VIEWS = 63
+        const val SURFACE_VIEWS_MIN = 64
+        const val LEN = 65
     }
 
     /** States in [H.GYRO_STATE], mirroring `scan_algo::fusion::GyroState`. */
@@ -113,6 +121,18 @@ class FrameResult(capacity: Int = 32 * 1024) {
             FITTED_MOUNT -> "calibrated (fitted mount)"
             else -> "?"
         }
+    }
+
+    /** States in [H.SURFACE_STATE], mirroring `scan_algo::surface_monitor::SurfaceState`. */
+    object Surface {
+        /** Nothing measured yet: the board is taken as flat. */
+        const val UNMEASURED = 0
+        /** Collecting views to measure it (again). */
+        const val MEASURING = 1
+        /** The shape in use matches the latest views. */
+        const val VERIFIED = 2
+        /** The board was laid down anew and its shape re-measured. */
+        const val REPLACED = 3
     }
 
     /** Values of [H.LASER_STATE], mirroring `frame_out::laser_state`. */

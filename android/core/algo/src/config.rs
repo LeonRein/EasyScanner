@@ -1,6 +1,7 @@
 //! Runtime configuration (sent by the app as JSON) and the on-disk formats of
-//! the two calibrations, kept compatible with the desktop prototype's
-//! `live_intrinsics.json` / `laser_plane.json`.
+//! the calibrations: the two kept compatible with the desktop prototype's
+//! `live_intrinsics.json` / `laser_plane.json`, and the board's measured
+//! shape (`board_surface.json`).
 
 use std::fs;
 use std::io;
@@ -16,9 +17,10 @@ use crate::geom::{Intrinsics, M3, V3, normalize};
 use crate::keyframe::KeyframeCfg;
 use crate::laser::LaserColor;
 use crate::plane::PlaneFitCfg;
+use crate::surface_monitor::MeasuredSurface;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(default)]
 pub struct BoardSpec {
     pub squares_x: i32,
@@ -176,6 +178,8 @@ pub struct Config {
     pub plane_fit: PlaneFitCfg,
     /// Gyroscope fusion and rolling-shutter correction.
     pub fusion: FusionCfg,
+    /// Measuring the board's shape.
+    pub board_surface: SurfaceCfg,
     pub calib_views: usize,
     pub plane_views: usize,
     pub max_cloud_points: usize,
@@ -199,6 +203,7 @@ impl Default for Config {
             scan_gate: ScanGateCfg::default(),
             plane_fit: PlaneFitCfg::default(),
             fusion: FusionCfg::default(),
+            board_surface: SurfaceCfg::default(),
             calib_views: 64,
             plane_views: 10,
             max_cloud_points: 6_000_000,
@@ -210,6 +215,43 @@ impl Default for Config {
 
 pub const INTRINSICS_FILE: &str = "live_intrinsics.json";
 pub const PLANE_FILE: &str = "laser_plane.json";
+pub const SURFACE_FILE: &str = "board_surface.json";
+
+/// Measuring the board's shape (`surface_monitor`).
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct SurfaceCfg {
+    /// Measure the shape and use it; off, the board is the plane z = 0.
+    pub enabled: bool,
+    /// Highest degree of the height polynomial (2 = a bowl or saddle, 3–4
+    /// for curled edges); clamped to `board_surface::MAX_DEGREE`.
+    pub degree: u8,
+}
+
+impl Default for SurfaceCfg {
+    fn default() -> Self {
+        SurfaceCfg { enabled: true, degree: 3 }
+    }
+}
+
+/// `board_surface.json`: the last measured shape and the board it is of.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SurfaceFile {
+    board: BoardSpec,
+    #[serde(flatten)]
+    measured: MeasuredSurface,
+}
+
+/// The saved shape, when it was measured on this `board`.
+pub fn load_surface(dir: &Path, board: &BoardSpec) -> Option<MeasuredSurface> {
+    let f: SurfaceFile = read_json(&dir.join(SURFACE_FILE))?;
+    (f.board == *board).then_some(f.measured)
+}
+
+pub fn save_surface(dir: &Path, board: &BoardSpec, measured: &MeasuredSurface) -> io::Result<()> {
+    let f = SurfaceFile { board: *board, measured: measured.clone() };
+    write_bytes_atomic(&dir.join(SURFACE_FILE), serde_json::to_string_pretty(&f)?)
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IntrinsicsFile {
@@ -227,6 +269,9 @@ pub struct IntrinsicsFile {
     pub focus_diopters: Option<f64>,
     #[serde(default)]
     pub rms_px: Option<f64>,
+    /// Standard deviations of fx, fy, cx, cy (px), when the solve gave them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigma_px: Option<[f64; 4]>,
 }
 
 impl IntrinsicsFile {
@@ -409,6 +454,7 @@ mod tests {
             camera_id: Some("0".into()),
             focus_diopters: Some(4.0),
             rms_px: Some(0.4),
+            sigma_px: Some([1.2, 1.1, 0.8, 0.9]),
         };
         save_intrinsics(&dir, &file).unwrap();
         let back = load_intrinsics(&dir, "0").unwrap();
@@ -423,6 +469,24 @@ mod tests {
         // a truncated file (the write was cut short) reads as no calibration
         fs::write(dir.join(INTRINSICS_FILE), r#"{"fx":1400.0,"fy":14"#).unwrap();
         assert!(load_intrinsics(&dir, "0").is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_surface_belongs_to_its_board() {
+        use crate::board_surface::BoardSurface;
+        let dir = std::env::temp_dir().join(format!("es-surface-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let board = BoardSpec::default();
+        let surface = BoardSurface::for_board(board.width_mm(), board.height_mm(), 2).with_coeffs(vec![-1.0, 0.2, -0.8]).unwrap();
+        let measured = MeasuredSurface { surface, rms_px: 0.21, flat_rms_px: 0.5, height_sigma_mm: 0.04 };
+        save_surface(&dir, &board, &measured).unwrap();
+        assert_eq!(load_surface(&dir, &board), Some(measured));
+        assert!(load_surface(&dir, &BoardSpec { square_mm: 30.0, ..board }).is_none(), "another board");
+        // a hand-edited file with a wrong number of terms is refused
+        let text = fs::read_to_string(dir.join(SURFACE_FILE)).unwrap().replace("\"degree\": 2", "\"degree\": 3");
+        fs::write(dir.join(SURFACE_FILE), text).unwrap();
+        assert!(load_surface(&dir, &board).is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

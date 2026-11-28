@@ -1,6 +1,6 @@
 //! The per-frame result handed to the app as one flat `float[]`: a fixed
 //! header of numbers, then drawable layers `[kind, stride, count, data…]` in
-//! frame pixel coordinates. `NativeCore.kt` mirrors these indices.
+//! frame pixel coordinates. `FrameResult.kt` mirrors these indices.
 
 /// Header slots.
 pub mod h {
@@ -87,7 +87,18 @@ pub mod h {
     /// views collected toward the next shape fit, and the fewest a fit needs
     pub const SURFACE_VIEWS: usize = 63;
     pub const SURFACE_VIEWS_MIN: usize = 64;
-    pub const LEN: usize = 65;
+    /// Why the last camera calibration solve was not saved
+    /// (`calib::Rejection::code`), while that is its state; 0 otherwise.
+    pub const CALIB_REJECTION: usize = 65;
+    /// The sides still short of tilted calibration views
+    /// (`calib_coverage::SideSet` bits: left, right, above, below).
+    pub const CALIB_MISSING_SIDES: usize = 66;
+    /// 1 when the calibration's set is full: a rejection then needs a reset.
+    pub const CALIB_EXHAUSTED: usize = 67;
+    /// Why the core ended the scan by itself (`scan_stop`); 0 while it runs
+    /// or when the app stopped it.
+    pub const SCAN_STOP_REASON: usize = 68;
+    pub const LEN: usize = 69;
 }
 
 /// One-shot event bits in `h::EVENTS`.
@@ -106,6 +117,15 @@ pub mod laser_state {
     /// on, but no stripe in this frame
     pub const NONE: f64 = 1.0;
     pub const FOUND: f64 = 2.0;
+}
+
+/// Values of `h::SCAN_STOP_REASON`.
+pub mod scan_stop {
+    pub const NONE: f64 = 0.0;
+    /// The point cloud reached its size limit.
+    pub const CLOUD_FULL: f64 = 1.0;
+    /// The board was laid down anew: the cloud is in the old placement's frame.
+    pub const BOARD_MOVED: f64 = 2.0;
 }
 
 /// Values of `h::PHOTO_STATE`.

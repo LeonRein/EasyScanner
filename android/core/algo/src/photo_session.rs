@@ -150,6 +150,14 @@ impl PhotoSession {
         write_atomic(&self.dir.join(LASER_PLY), |w| cloud.write_ply_in(w, &self.frame)).map(Some)
     }
 
+    /// Remove `laser.ply`: the cloud it held was cleared.
+    pub fn remove_laser(&self) -> io::Result<()> {
+        match fs::remove_file(self.dir.join(LASER_PLY)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     fn write_session_json(&self, wh: (u32, u32)) -> io::Result<()> {
         let (i, b, v) = (&self.info, &self.info.board, &self.info.volume);
         let k = i.k.for_frame(wh.0, wh.1);

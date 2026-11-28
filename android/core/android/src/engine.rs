@@ -37,8 +37,8 @@ use scan_algo::volume::Volume;
 use serde::Deserialize;
 
 use crate::board::{BoardTracker, PoseResult, corner_bbox, distance};
-use crate::calib::{CalibState, Calibration, LiveCalibrator, Outcome};
-use crate::frame_out::{FrameOut, ev, h, laser_state, layer, photo_state};
+use crate::calib::{CalibState, Calibration, Capture, LiveCalibrator, Outcome, Start};
+use crate::frame_out::{FrameOut, ev, h, laser_state, layer, photo_state, scan_stop};
 use crate::surface::{Settled, SurfaceTracker};
 
 /// Commands from the app (`NativeCore.Cmd`).
@@ -150,8 +150,6 @@ pub struct Engine {
     k_base: Intrinsics,
     k_file: Option<IntrinsicsFile>,
     calib: LiveCalibrator,
-    calib_active: bool,
-    calib_state: CalibState,
     plane: Option<SavedPlane>,
     plane_cal: PlaneCalibrator,
     plane_active: bool,
@@ -159,6 +157,9 @@ pub struct Engine {
     /// The board's measured shape, kept current from steady frames.
     surface: SurfaceTracker,
     scan_on: bool,
+    /// Why the core stopped the scan by itself (a `scan_stop` value), for
+    /// the app to explain; cleared by the next start.
+    scan_stop: f64,
     cloud: PointCloud,
     /// The cloud has points the open session (or, with none open, any session) has not written.
     cloud_unsaved: bool,
@@ -207,12 +208,11 @@ impl Engine {
             tracker,
             k_base: default_guess(),
             k_file: None,
-            calib_active: false,
-            calib_state: CalibState::Idle,
             plane: None,
             plane_active: false,
             plane_solved_at: 0,
             scan_on: false,
+            scan_stop: scan_stop::NONE,
             cloud_unsaved: false,
             preview: Vec::new(),
             frame_no: 0,
@@ -254,15 +254,13 @@ impl Engine {
         if cfg.board != self.cfg.board {
             // a different board invalidates collected views and lines, and
             // the frame an open photo session's poses are in
-            self.calib.reset();
-            self.plane_cal.reset();
+            self.restart_calibrations("the board changed");
             self.close_photos("board changed");
         }
         if cfg.camera.id != self.cfg.camera.id || cfg.camera.focus_diopters != self.cfg.camera.focus_diopters {
             // views and lines (and a solve in flight) were taken through the
             // old camera or focus; they must not end up in the new one's files
-            self.calib.reset();
-            self.plane_cal.reset();
+            self.restart_calibrations("the camera or its focus changed");
         }
         if cfg.camera.id != self.cfg.camera.id {
             self.close_photos("camera changed");
@@ -271,7 +269,7 @@ impl Engine {
         }
         self.fusion.set_cfg(cfg.fusion);
         self.fusion.set_platform_mount(cfg.camera.cam_from_imu);
-        self.calib.target = cfg.calib_views.max(4);
+        self.calib.set_target(cfg.calib_views);
         self.plane_cal.min_lines = cfg.plane_views.max(3);
         self.plane_cal.fit = cfg.plane_fit;
         self.cloud.max_points = cfg.max_cloud_points;
@@ -285,6 +283,21 @@ impl Engine {
         }
         self.events |= ev::MESSAGES;
         Ok(())
+    }
+
+    /// Drop the views and laser lines collected so far: `why` they no longer
+    /// fit. A calibration that was running says so instead of quietly
+    /// counting from zero.
+    fn restart_calibrations(&mut self, why: &str) {
+        if self.calib.state() != CalibState::Idle {
+            self.msgs.calib = format!("camera calibration stopped: {why} — start it again");
+        }
+        self.calib.reset();
+        if self.plane_active {
+            self.msgs.plane = format!("laser lines dropped: {why}");
+        }
+        self.plane_cal.reset();
+        self.plane_solved_at = 0;
     }
 
     /// `k_base` now holds another camera model: the session's photos and
@@ -483,25 +496,23 @@ impl Engine {
         // ── live intrinsics calibration: every genuinely new, steady view ──
         // (blur and the rolling shutter's shear would go into K)
         let steady = self.cfg.scan_gate.check_motion(speed).is_ok();
-        if self.calib_active && pose_res.is_some() && !self.calib.solving() {
-            if !steady {
-                if self.calib.count() < self.calib.target && !self.msgs.calib.starts_with("hold") {
-                    self.msgs.calib = format!("hold the phone steadier — {}/{} views", self.calib.count(), self.calib.target);
-                    self.events |= ev::MESSAGES;
+        if self.calib.collecting()
+            && let Some(p) = &pose_res
+        {
+            let side = self.calib.side(&p.pose, &self.cfg.board);
+            let msg = if !steady {
+                Some(format!("hold the phone steadier — {}/{} views", self.calib.count(), self.calib.target()))
+            } else {
+                match self.calib.offer(&self.tracker.corners, &self.tracker.ids, (w, hgt), side) {
+                    Capture::Added | Capture::NotNeeded => Some(self.calib_progress()),
+                    _ => None,
                 }
-            } else if self.calib.capture(&self.tracker.corners, &self.tracker.ids, (w, hgt)) {
-                let (n, t) = (self.calib.count(), self.calib.target);
-                self.msgs.calib = if n < t {
-                    format!("collecting {n}/{t} — move the phone around the board")
-                } else {
-                    format!("{n} views — last solve rejected, vary angles & retrying")
-                };
-                self.events |= ev::MESSAGES;
+            };
+            if let Some(m) = msg {
+                self.set_calib_msg(m);
             }
             if self.calib.maybe_solve(self.cfg.board, self.k_base, self.surface.degree()) {
-                self.calib_state = CalibState::Solving;
-                self.msgs.calib = format!("solving over {} views… this takes a few seconds", self.calib.count());
-                self.events |= ev::MESSAGES;
+                self.set_calib_msg(format!("solving over {} views… this takes a few seconds", self.calib.count()));
             }
         }
 
@@ -543,22 +554,26 @@ impl Engine {
             && plane_pose_ok
             && let Some(s) = &board_stripe
         {
+            let before = self.plane_cal.n_lines();
             let n_lines = self.plane_cal.add(&s.cam_pts);
-            let last = self.plane_cal.last_rms.map(|r| format!(" — last fit {r:.1}mm")).unwrap_or_default();
-            self.msgs.plane = format!("vary the phone's tilt between sweeps{last}");
-            self.events |= ev::MESSAGES;
-            if self.plane_cal.ready() && n_lines != self.plane_solved_at {
-                self.plane_solved_at = n_lines;
-                match self.plane_cal.solve(false) {
-                    Some(fit) => self.accept_plane(fit, false),
-                    None => {
-                        self.msgs.plane = format!(
-                            "fit {:.1}mm, {:.0}% inliers (need ≤ {:.1}mm, ≥ {:.0}%) — vary tilt or force",
-                            self.plane_cal.last_rms.unwrap_or(f64::NAN),
-                            100.0 * self.plane_cal.last_inlier_frac.unwrap_or(f64::NAN),
-                            self.cfg.plane_fit.max_rms_mm,
-                            100.0 * self.cfg.plane_fit.min_inlier_frac,
-                        );
+            // only a new line changes the status: a fit's verdict stays
+            // readable until the next line is in
+            if n_lines != before {
+                self.events |= ev::MESSAGES;
+                self.msgs.plane = format!("{n_lines} lines — vary the phone's tilt between sweeps");
+                if self.plane_cal.ready() && n_lines != self.plane_solved_at {
+                    self.plane_solved_at = n_lines;
+                    match self.plane_cal.solve(false) {
+                        Some(fit) => self.accept_plane(fit, false),
+                        None => {
+                            self.msgs.plane = format!(
+                                "{n_lines} lines — fit {:.1}mm, {:.0}% inliers (need ≤ {:.1}mm, ≥ {:.0}%): vary the tilt, or force the fit",
+                                self.plane_cal.last_rms.unwrap_or(f64::NAN),
+                                100.0 * self.plane_cal.last_inlier_frac.unwrap_or(f64::NAN),
+                                self.cfg.plane_fit.max_rms_mm,
+                                100.0 * self.cfg.plane_fit.min_inlier_frac,
+                            );
+                        }
                     }
                 }
             }
@@ -595,6 +610,7 @@ impl Engine {
             if full {
                 // stop rather than drop points unnoticed; the UI sees SCAN_ON fall
                 self.scan_on = false;
+                self.scan_stop = scan_stop::CLOUD_FULL;
                 self.events |= ev::MESSAGES;
                 self.msgs.scan = format!("scan stopped: the point cloud is full ({} points) — export or clear it", self.cloud.len());
             }
@@ -672,6 +688,28 @@ impl Engine {
         self.events = 0;
     }
 
+    /// Where the collection stands, for the calibration's message.
+    fn calib_progress(&self) -> String {
+        let c = &self.calib;
+        let (n, t) = (c.count(), c.target());
+        let missing = c.missing();
+        if n < t {
+            format!("collecting {n}/{t} — move the phone around the board")
+        } else if !missing.is_empty() && !c.exhausted() {
+            let sides: Vec<String> = missing.sides().map(|s| s.to_string()).collect();
+            format!("{n} views — still missing views tilted from: {}", sides.join(", "))
+        } else {
+            format!("{n} views — {} more before the next try", c.views_to_go())
+        }
+    }
+
+    fn set_calib_msg(&mut self, msg: String) {
+        if self.msgs.calib != msg {
+            self.msgs.calib = msg;
+            self.events |= ev::MESSAGES;
+        }
+    }
+
     fn poll_calibration(&mut self) {
         match self.calib.poll() {
             Some(Outcome::Solved(c)) => {
@@ -694,13 +732,10 @@ impl Engine {
                 self.k_base = k;
                 self.camera_model_changed("camera re-calibrated");
                 self.k_file = Some(file);
-                self.calib_active = false;
-                self.calib.reset();
-                self.calib_state = CalibState::Saved;
                 self.msgs.calib = match saved {
                     Ok(()) => {
                         let outliers = if dropped > 0 { format!(", {dropped} poor views dropped") } else { String::new() };
-                        format!("SAVED | fx {:.0} ±{:.1} cx {:.0} ±{:.1} rms {rms:.2}px{outliers}", k.fx, sigma[0], k.cx, sigma[2])
+                        format!("saved | fx {:.0} ±{:.1} cx {:.0} ±{:.1} rms {rms:.2}px{outliers}", k.fx, sigma[0], k.cx, sigma[2])
                     }
                     Err(e) => format!("solved (rms {rms:.2}px) but NOT saved: {e}"),
                 };
@@ -710,14 +745,22 @@ impl Engine {
                     self.surface_settled(settled);
                 }
             }
-            Some(Outcome::Rejected { reason, .. }) => {
-                // keep collecting and retry — that is why the count climbs past the target
-                self.calib_state = CalibState::Rejected;
-                self.msgs.calib = format!("solve REJECTED ({reason}) — add more varied angles");
+            Some(Outcome::Rejected(reason)) => {
+                // the collection stops: the user reads why and decides
+                let next = if self.calib.exhausted() { "reset and start over" } else { "add views from steeper angles, or reset" };
+                self.msgs.calib = format!("not saved: {reason} — {next}");
                 self.events |= ev::MESSAGES;
             }
             None => {}
         }
+    }
+
+    /// The board shape in use changed: the laser lines collected so far
+    /// were met with the old one.
+    fn board_shape_changed(&mut self) {
+        self.plane_cal.reset();
+        self.plane_solved_at = 0;
+        self.announce_setup();
     }
 
     /// Report what came of a board-shape fit.
@@ -743,15 +786,15 @@ impl Engine {
         };
         log::info!("{msg}");
         if verdict_changed {
-            // the laser lines collected so far were met with the old shape
-            self.plane_cal.reset();
-            self.plane_solved_at = 0;
             if moved {
                 // the board was laid down anew: the cloud so far is in the old placement's frame
+                if self.scan_on {
+                    self.scan_stop = scan_stop::BOARD_MOVED;
+                }
                 self.close_photos("board moved");
                 self.scan_on = false;
             }
-            self.announce_setup();
+            self.board_shape_changed();
         }
         self.msgs.surface = match saved {
             Ok(()) => msg,
@@ -831,12 +874,14 @@ impl Engine {
             o.set(h::LASER_LENGTH, s.length_mm);
             o.set(h::LASER_PLANE_RMS, s.plane_rms_mm);
         }
-        let calib_state = if self.calib.solving() { CalibState::Solving } else { self.calib_state };
-        o.set(h::CALIB_STATE, calib_state as i32 as f64);
-        o.set(h::CALIB_ACTIVE, self.calib_active as u8 as f64);
+        o.set(h::CALIB_STATE, self.calib.state() as i32 as f64);
+        o.set(h::CALIB_ACTIVE, self.calib.collecting() as u8 as f64);
         o.set(h::CALIB_COUNT, self.calib.count() as f64);
-        o.set(h::CALIB_TARGET, self.calib.target as f64);
-        o.set(h::CALIB_RMS, self.calib.last_rms.unwrap_or(f64::NAN));
+        o.set(h::CALIB_TARGET, self.calib.target() as f64);
+        o.set(h::CALIB_RMS, self.calib.last_rms().unwrap_or(f64::NAN));
+        o.set(h::CALIB_REJECTION, self.calib.rejection().map_or(0.0, |r| f64::from(r.code())));
+        o.set(h::CALIB_MISSING_SIDES, f64::from(self.calib.missing().bits()));
+        o.set(h::CALIB_EXHAUSTED, self.calib.exhausted() as u8 as f64);
         o.set(h::PLANE_ACTIVE, self.plane_active as u8 as f64);
         o.set(h::PLANE_LINES, self.plane_cal.n_lines() as f64);
         o.set(h::PLANE_TARGET, self.plane_cal.min_lines as f64);
@@ -845,6 +890,7 @@ impl Engine {
         o.set(h::PLANE_OK, plane_ok as u8 as f64);
         o.set(h::PLANE_STALE, (self.plane.is_some() && !plane_ok) as u8 as f64);
         o.set(h::SCAN_ON, self.scan_on as u8 as f64);
+        o.set(h::SCAN_STOP_REASON, self.scan_stop);
         o.set(h::CLOUD_POINTS, self.cloud.len() as f64);
         o.set(h::CLOUD_MB, self.cloud.nbytes() as f64 / 1e6);
         o.set(h::IN_VOLUME, self.pts_in.len() as f64);
@@ -914,46 +960,50 @@ impl Engine {
         let msg = match code {
             cmd::CALIB_START | cmd::CALIB_STOP | cmd::CALIB_RESET if solving => "solving… please wait".to_string(),
             cmd::CALIB_START => {
-                self.calib_active = true;
-                self.calib.reset();
-                self.calib_state = CalibState::Collecting;
+                let how = self.calib.start();
                 self.plane_active = false;
                 self.scan_on = false;
-                self.msgs.calib = "collecting views — move the phone around the board at varied angles".into();
-                return self.msgs.calib.clone();
-            }
-            cmd::CALIB_STOP => {
-                self.calib_active = false;
-                self.calib_state = CalibState::Idle;
-                format!("calibration paused ({} views)", self.calib.count())
-            }
-            cmd::CALIB_CAPTURE => {
-                if solving || self.tracker.corners.len() < 4 {
-                    "no board to capture".to_string()
-                } else if self.calib.capture(&self.tracker.corners, &self.tracker.ids, self.last_wh) {
-                    format!("captured {}/{}", self.calib.count(), self.calib.target)
-                } else {
-                    "view rejected (too few corners or a near-duplicate)".to_string()
+                match how {
+                    Some(Start::Resumed) => self.calib_progress(),
+                    _ => "collecting views — move the phone around the board at varied angles".to_string(),
                 }
             }
+            cmd::CALIB_STOP => {
+                self.calib.pause();
+                format!("calibration paused ({} views kept)", self.calib.count())
+            }
+            cmd::CALIB_CAPTURE => match self.track.latest().map(|p| p.pose) {
+                // the newest frame's pose, which the newest corners belong to
+                Some(pose) if !solving => {
+                    let side = self.calib.side(&pose, &self.cfg.board);
+                    match self.calib.offer(&self.tracker.corners, &self.tracker.ids, self.last_wh, side) {
+                        Capture::Added => format!("captured {}/{}", self.calib.count(), self.calib.target()),
+                        Capture::NotCollecting => "start the calibration first".to_string(),
+                        Capture::Full => "the set is full — reset and start over".to_string(),
+                        Capture::NotNeeded => "view not needed — tilt the phone to the missing sides".to_string(),
+                        Capture::TooFewCorners | Capture::Duplicate => "view rejected (too few corners or a near-duplicate)".to_string(),
+                    }
+                }
+                _ => "no board to capture".to_string(),
+            },
             cmd::CALIB_RESET => {
                 self.calib.reset();
-                self.calib_active = false;
-                self.calib_state = CalibState::Idle;
                 "calibration reset".to_string()
             }
             cmd::PLANE_START => {
+                // lines collected before a pause are kept: a fitted plane
+                // or anything that invalidates them clears them already
                 self.plane_active = true;
-                self.plane_cal.reset();
-                self.plane_solved_at = 0;
-                self.calib_active = false;
+                self.calib.pause();
                 self.scan_on = false;
-                self.msgs.plane = "sweep the laser across the board at varied tilts".into();
-                return self.msgs.plane.clone();
+                match self.plane_cal.n_lines() {
+                    0 => "sweep the laser across the board at varied tilts".to_string(),
+                    n => format!("{n} lines kept — sweep on at other tilts"),
+                }
             }
             cmd::PLANE_STOP => {
                 self.plane_active = false;
-                format!("plane calibration paused ({} lines)", self.plane_cal.n_lines())
+                format!("plane calibration paused ({} lines kept)", self.plane_cal.n_lines())
             }
             cmd::PLANE_FORCE => {
                 if !self.plane_active {
@@ -972,9 +1022,10 @@ impl Engine {
                     "the laser plane was fitted with another camera calibration — calibrate it again".to_string()
                 } else {
                     self.scan_on = true;
+                    self.scan_stop = scan_stop::NONE;
                     self.gate_stats = GateStats::default();
                     self.plane_active = false;
-                    self.calib_active = false;
+                    self.calib.pause();
                     "scanning…".to_string()
                 }
             }
@@ -985,8 +1036,8 @@ impl Engine {
             }
             cmd::CHECKPOINT => {
                 self.scan_on = false;
-                // a still asked for now never comes back: the camera is closing
-                self.trigger.clear_pending();
+                // the camera is closing: a still asked for now never comes back
+                self.trigger.camera_closed();
                 let saved = self.checkpoint();
                 format!("paused — {} pts{saved}", self.cloud.len())
             }
@@ -995,7 +1046,11 @@ impl Engine {
                 self.preview.clear();
                 self.cloud_unsaved = false;
                 self.scan_on = false;
-                "cloud cleared".to_string()
+                // a checkpoint already on disk would bring the points back on finish
+                match self.remove_session_clouds() {
+                    Ok(()) => "cloud cleared".to_string(),
+                    Err(e) => format!("cloud cleared, but the session's saved copy stays: {e}"),
+                }
             }
             cmd::PHOTOS_OFF => {
                 if self.photos.is_none() {
@@ -1025,8 +1080,6 @@ impl Engine {
             cmd::FORGET_INTRINSICS => {
                 // a solve in flight would write the file straight back
                 self.calib.reset();
-                self.calib_active = false;
-                self.calib_state = CalibState::Idle;
                 let _ = fs::remove_file(self.dir.join(config::INTRINSICS_FILE));
                 self.reload_calibrations();
                 self.camera_model_changed("intrinsics reset");
@@ -1035,13 +1088,16 @@ impl Engine {
             cmd::FORGET_PLANE => {
                 let _ = fs::remove_file(self.dir.join(config::PLANE_FILE));
                 self.plane = None;
+                // the lines collected toward a new one go too: a fresh start
+                self.plane_cal.reset();
+                self.plane_solved_at = 0;
                 self.announce_setup();
                 self.scan_on = false;
                 "laser plane cleared".to_string()
             }
             cmd::FORGET_SURFACE => {
                 let removed = self.surface.forget(&self.dir);
-                self.announce_setup();
+                self.board_shape_changed();
                 match removed {
                     Ok(()) => "board shape cleared — measuring it again".to_string(),
                     Err(e) => format!("board shape cleared, but its file stays: {e}"),
@@ -1103,6 +1159,16 @@ impl Engine {
         self.write_scan_ply(&s.dir().join(SESSION_SCAN_PLY))?;
         self.cloud_unsaved = false;
         Ok(n)
+    }
+
+    /// Remove the open session's checkpointed clouds.
+    fn remove_session_clouds(&self) -> std::io::Result<()> {
+        let Some(s) = &self.photos else { return Ok(()) };
+        s.remove_laser()?;
+        match fs::remove_file(s.dir().join(SESSION_SCAN_PLY)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// No more photos in the open session; it carries on with the scan alone.

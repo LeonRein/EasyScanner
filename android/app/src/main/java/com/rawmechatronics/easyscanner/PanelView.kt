@@ -26,11 +26,13 @@ class PanelView(private val b: ActivityMainBinding) {
         b.primaryAction.setOnClickListener { content?.primary?.takeIf { it.enabled }?.run?.invoke() }
         b.secondaryAction.setOnClickListener { content?.secondary?.takeIf { it.enabled }?.run?.invoke() }
         b.overflowButton.setOnClickListener { showOverflow(it) }
-        b.helpButton.setOnClickListener { showHelp() }
+        b.helpButton.setOnClickListener { content?.help?.let { showHelp(it) } }
     }
 
     fun render(c: PanelContent) {
         content = c
+        // the guided steps' header; expert mode's tabs take its place and
+        // offer their help in the overflow menu
         b.stepHeader.showIf(c.stepLabel != null || c.help != null)
         b.stepLabel.showIf(c.stepLabel != null)
         b.stepProgress.showIf(c.stepLabel != null)
@@ -131,11 +133,11 @@ class PanelView(private val b: ActivityMainBinding) {
         menu.show()
     }
 
-    private fun showHelp() {
-        val c = content ?: return
+    /** [text] in a dialog titled after the step on screen. */
+    fun showHelp(text: String) {
         MaterialAlertDialogBuilder(ctx)
-            .setTitle(c.title ?: ctx.getString(R.string.help))
-            .setMessage(c.help)
+            .setTitle(content?.title ?: ctx.getString(R.string.help))
+            .setMessage(text)
             .setPositiveButton(android.R.string.ok, null)
             .show()
     }

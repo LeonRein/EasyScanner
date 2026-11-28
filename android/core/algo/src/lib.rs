@@ -12,6 +12,7 @@
 pub mod atomic_file;
 pub mod bench;
 pub mod board_surface;
+pub mod calib_coverage;
 pub mod cloud;
 pub mod config;
 pub mod focus;

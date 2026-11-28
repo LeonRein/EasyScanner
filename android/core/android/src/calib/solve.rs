@@ -1,15 +1,12 @@
-//! Live intrinsics self-calibration from the stream — port of the desktop prototype's
-//! `calib_live.py`: collect diverse ChArUco views, then one
-//! `cv::calibrateCamera` (USE_INTRINSIC_GUESS | ZERO_TANGENT_DIST | FIX_K3)
-//! behind the same RMS and plausibility gates. The solve runs on its own
-//! thread so the viewfinder keeps going.
+//! The intrinsics solve — port of the desktop prototype's `calib_live.py`:
+//! one `cv::calibrateCamera` (USE_INTRINSIC_GUESS | ZERO_TANGENT_DIST |
+//! FIX_K3) over the collected ChArUco views, behind RMS, plausibility and
+//! focal-uncertainty gates.
 //!
 //! The views also measure the board's shape (`scan_algo::board_surface`):
 //! a printed board is rarely flat, and a K solved for a flat one absorbs
 //! the warp. So the shape is fitted from the solve's poses, and K solved
 //! again with the corners where the shape puts them.
-
-use std::thread::JoinHandle;
 
 use opencv::calib3d;
 use opencv::core::{self, Mat, Point2f, Point3f, Size, TermCriteria, Vector};
@@ -36,15 +33,6 @@ const OUTLIER_MIN_PX: f64 = 0.5;
 /// that is no stray view but a systematic problem, left to the RMS gate.
 const MAX_OUTLIER_FRAC: f64 = 0.2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CalibState {
-    Idle = 0,
-    Collecting = 1,
-    Solving = 2,
-    Saved = 3,
-    Rejected = 4,
-}
-
 /// A camera calibration that passed the gates.
 pub struct Calibration {
     pub k: Intrinsics,
@@ -58,144 +46,94 @@ pub struct Calibration {
     pub surface: Option<SurfaceFit>,
 }
 
+/// Why a solve's result was not saved.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Rejection {
+    /// Fewer views than the target held enough matched corners.
+    TooFewViews { usable: usize, needed: usize },
+    /// The views do not agree on one camera model (blur, misdetections, a
+    /// board other than the one configured).
+    HighRms { rms: f64, limit: f64 },
+    /// The solved K is no camera a phone has.
+    Implausible { rms: f64, k: Intrinsics },
+    /// The views fit, but do not pin the focal length down.
+    FocalUncertain { rms: f64, sigma: f64, f: f64 },
+    /// OpenCV failed, or the solver thread died.
+    SolverFailed(String),
+}
+
+impl Rejection {
+    /// The code the app reads from `h::CALIB_REJECTION` (0 is none).
+    pub fn code(&self) -> u8 {
+        match self {
+            Rejection::TooFewViews { .. } => 1,
+            Rejection::HighRms { .. } => 2,
+            Rejection::Implausible { .. } => 3,
+            Rejection::FocalUncertain { .. } => 4,
+            Rejection::SolverFailed(_) => 5,
+        }
+    }
+
+    /// The solve's reprojection RMS, when it got that far.
+    pub fn rms(&self) -> Option<f64> {
+        match self {
+            Rejection::HighRms { rms, .. } | Rejection::Implausible { rms, .. } | Rejection::FocalUncertain { rms, .. } => Some(*rms),
+            Rejection::TooFewViews { .. } | Rejection::SolverFailed(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Rejection::TooFewViews { usable, needed } => write!(f, "only {usable} usable views of {needed}"),
+            Rejection::HighRms { rms, limit } => write!(f, "rms {rms:.2} px > {limit:.2}"),
+            Rejection::Implausible { k, .. } => {
+                write!(f, "K implausible (fx {:.0} fy {:.0} cx {:.0} cy {:.0} k1 {:.3})", k.fx, k.fy, k.cx, k.cy, k.dist[0])
+            }
+            Rejection::FocalUncertain { sigma, f: focal, .. } => write!(f, "focal length uncertain (±{sigma:.1} px of {focal:.0})"),
+            Rejection::SolverFailed(e) => write!(f, "solver failed: {e}"),
+        }
+    }
+}
+
+/// What came of a solve.
 pub enum Outcome {
     Solved(Box<Calibration>),
-    Rejected { rms: f64, reason: String },
+    Rejected(Rejection),
 }
 
-struct View {
-    corners: Vec<Point2f>,
-    ids: Vec<i32>,
-}
-
-pub struct LiveCalibrator {
-    pub target: usize,
-    min_corners: usize,
-    views: Vec<View>,
-    wh: Option<(u32, u32)>,
-    solved_at: usize,
-    job: Option<JoinHandle<Outcome>>,
-    pub last_rms: Option<f64>,
-}
-
-impl LiveCalibrator {
-    pub fn new(target: usize) -> Self {
-        LiveCalibrator { target, min_corners: 8, views: Vec::new(), wh: None, solved_at: 0, job: None, last_rms: None }
-    }
-
-    pub fn count(&self) -> usize {
-        self.views.len()
-    }
-
-    pub fn solving(&self) -> bool {
-        self.job.is_some()
-    }
-
-    /// Store one detected view. Rejects too few corners and near-duplicates
-    /// (same corner count, centroid moved less than ~8 px at 1920 px), so
-    /// holding the board still does not flood the set. Views must share one
-    /// resolution; a different one starts the set over.
-    pub fn capture(&mut self, corners: &Vector<Point2f>, ids: &Vector<i32>, wh: (u32, u32)) -> bool {
-        if self.job.is_some() || corners.len() < self.min_corners {
-            return false;
-        }
-        if self.wh != Some(wh) {
-            self.views.clear();
-            self.solved_at = 0;
-            self.wh = Some(wh);
-        }
-        let c: Vec<Point2f> = corners.to_vec();
-        let centroid = mean(&c);
-        let tol = 8.0 * (wh.0.max(wh.1) as f32 / 1920.0).max(0.25);
-        let dup = self.views.iter().any(|v| {
-            let m = mean(&v.corners);
-            v.corners.len() == c.len() && ((m.0 - centroid.0).powi(2) + (m.1 - centroid.1).powi(2)).sqrt() < tol
-        });
-        if dup {
-            return false;
-        }
-        self.views.push(View { corners: c, ids: ids.to_vec() });
-        true
-    }
-
-    /// Start the set over. A solve still running is abandoned: its views
-    /// belong to the set being dropped (another camera, focus or board), so
-    /// its result must never be saved. The thread finishes on its own.
-    pub fn reset(&mut self) {
-        self.job = None;
-        self.views.clear();
-        self.solved_at = 0;
-        self.last_rms = None;
-    }
-
-    /// Start a background solve once the set reaches the target, and again
-    /// every `target/12` new views after a rejected attempt. With a
-    /// `surface_degree` the board's shape is measured along.
-    pub fn maybe_solve(&mut self, spec: BoardSpec, seed: Intrinsics, surface_degree: Option<u8>) -> bool {
-        let step = (self.target / 12).max(1);
-        let Some(wh) = self.wh else { return false };
-        if self.job.is_some() || self.views.len() < self.target || self.views.len() - self.solved_at < step {
-            return false;
-        }
-        self.solved_at = self.views.len();
-        let views: Vec<(Vec<Point2f>, Vec<i32>)> = self.views.iter().map(|v| (v.corners.clone(), v.ids.clone())).collect();
-        let (min_corners, min_views) = (self.min_corners, self.target);
-        let limits = Limits { min_corners, min_views, surface_degree };
-        self.job = Some(std::thread::spawn(move || match solve(spec, &views, wh, seed, limits) {
-            Ok(o) => o,
-            Err(e) => Outcome::Rejected { rms: f64::INFINITY, reason: format!("calibrateCamera failed: {e}") },
-        }));
-        true
-    }
-
-    /// The finished background solve, if any.
-    pub fn poll(&mut self) -> Option<Outcome> {
-        if !self.job.as_ref()?.is_finished() {
-            return None;
-        }
-        let out = self.job.take()?.join().unwrap_or(Outcome::Rejected { rms: f64::INFINITY, reason: "solver panicked".into() });
-        match &out {
-            Outcome::Solved(c) => self.last_rms = Some(c.rms),
-            Outcome::Rejected { rms, .. } => self.last_rms = rms.is_finite().then_some(*rms),
-        }
-        Some(out)
-    }
-}
-
-fn mean(c: &[Point2f]) -> (f32, f32) {
-    let n = c.len().max(1) as f32;
-    (c.iter().map(|p| p.x).sum::<f32>() / n, c.iter().map(|p| p.y).sum::<f32>() / n)
+/// One view's matched-up ChArUco detection.
+pub struct ViewCorners {
+    pub corners: Vec<Point2f>,
+    pub ids: Vec<i32>,
 }
 
 /// What a solve needs from the views, and whether it measures the shape.
 #[derive(Clone, Copy)]
-struct Limits {
-    min_corners: usize,
-    min_views: usize,
-    surface_degree: Option<u8>,
+pub struct Limits {
+    pub min_corners: usize,
+    pub min_views: usize,
+    pub surface_degree: Option<u8>,
 }
 
-fn solve(
-    spec: BoardSpec,
-    views: &[(Vec<Point2f>, Vec<i32>)],
-    (w, h): (u32, u32),
-    seed: Intrinsics,
-    limits: Limits,
-) -> opencv::Result<Outcome> {
+/// Solve K from `views`, behind the RMS, plausibility and focal
+/// uncertainty gates.
+pub fn solve(spec: BoardSpec, views: &[ViewCorners], (w, h): (u32, u32), seed: Intrinsics, limits: Limits) -> opencv::Result<Outcome> {
     let Limits { min_corners, min_views, surface_degree } = limits;
     let board = make_board(&spec)?;
     let mut obj_all: Vector<Vector<Point3f>> = Vector::new();
     let mut img_all: Vector<Vector<Point2f>> = Vector::new();
-    for (corners, ids) in views {
+    for v in views {
         let (mut obj, mut img) = (Vector::<Point3f>::new(), Vector::<Point2f>::new());
-        board.match_image_points(&Vector::from_slice(corners), &Vector::from_slice(ids), &mut obj, &mut img)?;
+        board.match_image_points(&Vector::from_slice(&v.corners), &Vector::from_slice(&v.ids), &mut obj, &mut img)?;
         if obj.len() >= min_corners {
             obj_all.push(obj);
             img_all.push(img);
         }
     }
     if obj_all.len() < min_views {
-        return Ok(Outcome::Rejected { rms: f64::INFINITY, reason: format!("only {} usable views of {min_views}", obj_all.len()) });
+        return Ok(Outcome::Rejected(Rejection::TooFewViews { usable: obj_all.len(), needed: min_views }));
     }
 
     // Seed with the camera's own estimate when it is sane, else the classic
@@ -238,28 +176,15 @@ fn solve(
     }
     let Solved { k: out, rms, sigma, .. } = solved;
 
-    let gate = MAX_RMS_PX * (w as f64 / 1920.0).max(1.0);
-    if !rms.is_finite() || rms > gate {
-        return Ok(Outcome::Rejected { rms, reason: format!("rms {rms:.2} px > {gate:.2}") });
+    let limit = MAX_RMS_PX * (w as f64 / 1920.0).max(1.0);
+    if !rms.is_finite() || rms > limit {
+        return Ok(Outcome::Rejected(Rejection::HighRms { rms, limit }));
     }
     if !intrinsics_plausible(&out) {
-        return Ok(Outcome::Rejected {
-            rms,
-            reason: format!(
-                "K implausible (fx {:.0} fy {:.0} cx {:.0} cy {:.0} k1 {:.3}) — more varied angles",
-                out.fx, out.fy, out.cx, out.cy, out.dist[0]
-            ),
-        });
+        return Ok(Outcome::Rejected(Rejection::Implausible { rms, k: out }));
     }
     if !(sigma[0] <= MAX_FOCAL_SIGMA_REL * out.fx && sigma[1] <= MAX_FOCAL_SIGMA_REL * out.fy) {
-        return Ok(Outcome::Rejected {
-            rms,
-            reason: format!(
-                "focal length uncertain (±{:.1} px of {:.0}) — add views from steeper angles and closer",
-                sigma[0].max(sigma[1]),
-                out.fx
-            ),
-        });
+        return Ok(Outcome::Rejected(Rejection::FocalUncertain { rms, sigma: sigma[0].max(sigma[1]), f: out.fx }));
     }
     Ok(Outcome::Solved(Box::new(Calibration { k: out, rms, sigma, dropped, surface })))
 }
@@ -275,8 +200,6 @@ struct Solved {
     poses: Vec<Pose>,
 }
 
-/// `cv::calibrateCamera` from `seed`. Board points off the plane z = 0 need
-/// the intrinsic guess, which is always given.
 /// Which views to keep, given each view's reprojection error: `None` when
 /// there is no outlier, or more than [`MAX_OUTLIER_FRAC`] of them. The drop
 /// may leave fewer views than the target: the solve runs as soon as the
@@ -291,6 +214,8 @@ fn inliers(view_errors: &[f64]) -> Option<Vec<bool>> {
     (outliers > 0 && outliers as f64 <= MAX_OUTLIER_FRAC * view_errors.len() as f64).then_some(keep)
 }
 
+/// `cv::calibrateCamera` from `seed`. Board points off the plane z = 0 need
+/// the intrinsic guess, which is always given.
 fn calibrate(obj: &Vector<Vector<Point3f>>, img: &Vector<Vector<Point2f>>, size: Size, seed: &Intrinsics) -> opencv::Result<Solved> {
     let mut k = Mat::from_slice_2d(&[[seed.fx, 0.0, seed.cx], [0.0, seed.fy, seed.cy], [0.0, 0.0, 1.0]])?;
     let mut d = Mat::from_slice(&seed.dist)?.try_clone()?;

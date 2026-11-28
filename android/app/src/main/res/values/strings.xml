@@ -10,25 +10,33 @@
 
     <string name="act_start">Start</string>
     <string name="act_pause">Pause</string>
-    <string name="act_stop">Stop</string>
     <string name="act_capture">Capture</string>
-    <string name="act_reset">Reset</string>
     <string name="act_forget_k">Forget K</string>
     <string name="act_force">Force fit</string>
     <string name="act_forget_plane">Forget plane</string>
     <string name="act_forget_surface">Forget board shape</string>
     <string name="act_export">Export PLY</string>
     <string name="act_clear">Clear</string>
-    <string name="act_laser_on">Laser: on</string>
-    <string name="act_laser_off">Laser: off</string>
-    <string name="act_photos_on">Photos ■</string>
-    <string name="act_photos_off">Photos ▶</string>
+    <string name="confirm_forget_k">The saved camera calibration is deleted; the camera falls back to its own estimate.</string>
+    <string name="confirm_forget_plane">The saved laser calibration is deleted, with the lines collected toward a new one.</string>
+    <string name="confirm_forget_surface">The measured board shape is deleted and measured again from the next views.</string>
+    <string name="confirm_clear">The points scanned so far are deleted.</string>
+    <string name="act_laser_turn_off">Turn laser detection off</string>
+    <string name="act_laser_turn_on">Turn laser detection on</string>
+    <string name="act_photos_stop">Stop photos</string>
+    <string name="act_photos_start">Start photos</string>
+    <string name="act_add_views">Add views</string>
+    <string name="act_start_over">Start over</string>
+    <string name="act_calibrate_again">Calibrate again</string>
 
     <string name="hint_view">Point the phone at the ChArUco board: the overlay shows the pose and its error.</string>
-    <string name="hint_camera">Calibrate the camera: Start, then move and tilt the phone slowly around the board, so the board visits every part of the frame, until SAVED.</string>
+    <string name="hint_camera">Calibrate the camera: Start, then move and tilt the phone slowly around the board, so the board visits every part of the frame. It saves on its own.</string>
     <string name="hint_laser">Calibrate the laser plane: Start, then sweep the stripe across the board at varied tilts.</string>
     <string name="hint_scan">Start, then sweep the laser over the object. Export writes the cloud as a PLY to Download/EasyScanner.</string>
-    <string name="help_expert_scan">Export writes a Z-up PLY over the board (mm) to Download/EasyScanner and offers to share it.\n\nPhotos (in the overflow menu) takes posed full-resolution keyframes into an orbiter-native session; stopping it adds laser.ply.</string>
+    <string name="help_expert_view">The viewfinder: the overlay shows the board pose and its fit. Long-press the board status for the debug overlay with every number.</string>
+    <string name="help_expert_camera">Start collects steady views of the board; Pause keeps them. The solve runs once the target is reached and the board was seen tilted from every side. A rejected solve stops with its reason: add views, or start over.\n\nCapture adds the current view by hand. Forget K deletes the saved calibration.</string>
+    <string name="help_expert_laser">Start collects laser lines on the board; Pause keeps them. The plane is fitted and saved on its own once the lines are varied enough. Force fit saves it with the lines so far.</string>
+    <string name="help_expert_scan">Export writes a Z-up PLY over the board (mm) to Download/EasyScanner and offers to share it.\n\nStart photos (in the overflow menu) takes posed full-resolution keyframes into a photogrammetry session; stopping it adds laser.ply.</string>
     <string name="share_scan">Share scan</string>
     <string name="scan_saved">Saved to Download/%1$s</string>
     <string name="scan_copy_failed">Could not copy the scan to Downloads; it stays in the app\'s files.</string>
@@ -40,6 +48,8 @@
     <string name="act_open_settings">Open settings</string>
     <string name="act_ask_again">Ask again</string>
     <string name="no_camera">No back camera found.</string>
+    <string name="camera_unavailable">The camera cannot be used: %1$s</string>
+    <string name="camera_lost">Another app took the camera. The scanner goes on when it is free again.</string>
 
     <!-- the scanner screen -->
     <string name="help">Help</string>
@@ -94,10 +104,30 @@
     <string name="instr_camera">Move the phone slowly around the board, tilted to every side, near and far.</string>
     <string name="help_camera">The calibration measures the lens. Press Start, then move the phone slowly around the board: tilt it 30–45° to every side, near and far, so the board visits every part of the picture. It saves on its own when it has enough views.</string>
     <string name="camera_progress">%1$d of %2$d views</string>
+    <string name="camera_solving">Computing the calibration…</string>
+    <string name="camera_saved">Calibration saved</string>
+    <string name="note_camera_saved">Camera calibrated and saved.</string>
+    <string name="note_camera_saved_rms">Camera calibrated and saved (error %1$.2f px; below 0.5 is good).</string>
+    <string name="note_laser_saved">Laser plane calibrated and saved.</string>
+    <string name="note_next_laser">Next: the laser plane.</string>
+    <string name="note_next_scan">Next: scanning.</string>
+    <string name="camera_needs_tilt">Enough views, but still too few tilted ones. Tilt the phone about 30° so it looks at the board from %1$s.</string>
+    <string name="side_left">the left</string>
+    <string name="side_right">the right</string>
+    <string name="side_above">above</string>
+    <string name="side_below">below</string>
+    <string name="list_and">%1$s and %2$s</string>
+    <string name="camera_rejected_few_views">Not saved: too few views showed enough of the board.</string>
+    <string name="camera_rejected_rms">Not saved: the views do not agree. Blurred views, or the board in Settings is not the printed one.</string>
+    <string name="camera_rejected_implausible">Not saved: the result is not a plausible camera.</string>
+    <string name="camera_rejected_focal">Not saved: the views do not pin down the focal length. More tilted views help, also closer to the board.</string>
+    <string name="camera_rejected_failed">Not saved: the calculation failed.</string>
+    <string name="camera_rejected_add_views">Add views to try again, or start over.</string>
+    <string name="camera_rejected_start_over">The set is full: start over.</string>
 
     <string name="title_laser">Calibrate the laser</string>
     <string name="instr_laser">Laser on, board empty. Sweep the stripe across the board, and change the tilt between sweeps.</string>
-    <string name="help_laser">This finds where the laser line lies relative to the camera. Switch the laser on and clear the board. Press Start, then sweep the stripe across the board, changing the phone\'s tilt between sweeps. It saves on its own; \"Fit now\" saves early with the lines so far.</string>
+    <string name="help_laser">This finds where the laser line lies relative to the camera. Switch the laser on and clear the board. Press Start, then sweep the stripe across the board, changing the phone\'s tilt between sweeps. It saves on its own; \"Force fit\" saves early with the lines so far.</string>
     <string name="laser_stale">The saved laser calibration belongs to an earlier camera calibration: calibrate the laser again.</string>
     <string name="laser_progress">%1$d of %2$d lines</string>
 
@@ -111,7 +141,8 @@
     <string name="photo_taking">taking a photo…</string>
     <string name="photo_hold_board">photo due: board out of view</string>
     <string name="photo_hold_steady">photo due: hold steady</string>
-    <string name="scan_stopped">The scan stopped by itself. Resume it or finish the scan.</string>
+    <string name="scan_stopped_full">The scan stopped: the point cloud is full. Finish the scan to save it.</string>
+    <string name="scan_stopped_board_moved">The scan stopped: the board was moved. The points so far belong to its old position: export or clear them before scanning on.</string>
     <string name="act_resume">Resume</string>
     <string name="act_finish">Finish</string>
     <string name="act_discard">Discard scan</string>
@@ -132,7 +163,7 @@
     <string name="done_saving">Saving to Download/EasyScanner…</string>
     <string name="done_saved">Saved to %1$s</string>
     <string name="done_contents">%1$s (%2$d files)</string>
-    <string name="help_done">scan.ply is the point cloud in millimetres, Z up, over the board. The folder as a whole is a session for orbiter-recon.\n\nOn a computer: connect the phone over USB and open Download/EasyScanner.</string>
+    <string name="help_done">scan.ply is the point cloud in millimetres, Z up, over the board. The folder as a whole is a session for photogrammetry software.\n\nOn a computer: connect the phone over USB and open Download/EasyScanner.</string>
     <plurals name="photos">
         <item quantity="one">%d photo</item>
         <item quantity="other">%d photos</item>
@@ -145,10 +176,16 @@
     <string name="act_share_ply">Share PLY</string>
 
     <string name="pending_title">Unsaved scans</string>
-    <string name="pending_body">%1$d scan(s) were never copied to Download (latest %2$s, %3$d photos). Copy them now?</string>
+    <plurals name="pending_body">
+        <item quantity="one">A scan was never copied to Download (%2$s, %3$s). Copy it now?</item>
+        <item quantity="other">%1$d scans were never copied to Download (latest %2$s, %3$s). Copy them now?</item>
+    </plurals>
     <string name="act_save_now">Copy to Download</string>
     <string name="act_later">Later</string>
-    <string name="pending_saved">%1$d scan(s) copied to Download/EasyScanner</string>
+    <plurals name="pending_saved">
+        <item quantity="one">%1$d scan copied to Download/EasyScanner</item>
+        <item quantity="other">%1$d scans copied to Download/EasyScanner</item>
+    </plurals>
 
     <!-- the on-phone viewer: scans, their clouds and photos -->
     <string name="library">Scans</string>

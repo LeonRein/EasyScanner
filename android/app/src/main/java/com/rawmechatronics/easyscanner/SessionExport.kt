@@ -21,9 +21,9 @@ import java.util.TimeZone
  */
 object SessionExport {
     const val DOWNLOADS_DIR = "EasyScanner"
-    private const val MARKER = "exported.json"
+    internal const val MARKER = "exported.json"
     /** Files of a copy that broke off, one relative path a line: a retry skips them instead of doubling them. */
-    private const val PROGRESS = ".export_progress"
+    internal const val PROGRESS = ".export_progress"
     const val SCAN_PLY = "scan.ply"
 
     /** [names]: the top-level files copied (scan.ply, session.json, ...). */

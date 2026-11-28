@@ -78,7 +78,9 @@ What you need:
    2. **Focus**: hold the phone at the scanning distance and lock the focus
       where autofocus settled (a calibration holds only at its focus).
    3. **Camera**: Start, then move the phone slowly around the board at
-      varied tilts until it says SAVED.
+      varied tilts until it is saved. It waits for views tilted from every
+      side (it says which are missing); a rejected solve stops with its
+      reason, and you add views or start over.
    4. **Laser plane**: Start, then sweep the stripe across the empty board at
       varied tilts. A plane fitted with an earlier camera calibration is
       refused, so a re-calibrated camera always gets a fresh plane.

@@ -18,7 +18,7 @@ the four tool modes underneath instead:
 | mode | does |
 |------|------|
 | **View** | ChArUco pose overlay (grid, outline, axes, working volume) + 6-DOF pose, reprojection RMS, pose-flip margin, focus |
-| **Camera** | live intrinsics calibration from varied board views, solved in the background, gated on RMS and plausibility |
+| **Camera** | live intrinsics calibration from steady board views tilted to every side (`calib_coverage`), solved in the background, gated on RMS, plausibility and focal-length uncertainty; a rejection stops with its reason |
 | **Laser** | laser-plane calibration: on-board stripes at varied tilts → RANSAC plane `n·X = d` (camera frame) |
 | **Scan** | triangulate the stripe against the plane, keep points inside the working volume, accumulate in the board frame, export PLY; **Photos** takes posed full-resolution keyframes for the photogrammetry pass |
 

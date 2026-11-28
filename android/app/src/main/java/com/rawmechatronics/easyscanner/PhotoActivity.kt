@@ -12,7 +12,7 @@ import java.util.concurrent.Executors
 class PhotoActivity : AppCompatActivity() {
     private lateinit var b: ActivityPhotoBinding
     private lateinit var photos: List<File>
-    private var index = 0
+    @Volatile private var index = 0
     private var rotation = 0
     private val decoder = Executors.newSingleThreadExecutor()
 
@@ -58,7 +58,13 @@ class PhotoActivity : AppCompatActivity() {
         b.counter.text = getString(R.string.photo_counter, i + 1, photos.size, photos[i].name)
         val px = maxOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
         decoder.execute {
-            val bmp = Photos.decode(photos[i], px, rotation)
+            // paged past while queued: decode only the photo still on screen
+            if (index != i) return@execute
+            val bmp = try {
+                Photos.decode(photos[i], px, rotation)
+            } catch (e: OutOfMemoryError) {
+                null
+            }
             runOnUiThread { if (index == i && !isDestroyed) b.image.setImageBitmap(bmp) }
         }
     }

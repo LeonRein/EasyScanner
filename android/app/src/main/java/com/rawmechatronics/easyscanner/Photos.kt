@@ -32,14 +32,15 @@ object Photos {
         }.getOrDefault(90)
     }
 
-    /** The photo decoded to roughly [maxPx] on its long side and turned by [degrees]. */
+    /** The photo decoded to at most [maxPx] on its long side and turned by [degrees]. */
     fun decode(file: File, maxPx: Int, degrees: Int): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
         val long = maxOf(bounds.outWidth, bounds.outHeight)
         if (long <= 0) return null
         var sample = 1
-        while (long / (sample * 2) >= maxPx) sample *= 2
+        // a full-size still is tens of MB (twice that while it is turned)
+        while (long / sample > maxPx) sample *= 2
         val bmp = BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
         if (degrees % 360 == 0) return bmp
         val turned = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(degrees.toFloat()) }, true)

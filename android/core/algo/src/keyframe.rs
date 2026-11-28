@@ -235,7 +235,8 @@ pub enum Due {
 /// only while the camera is steady and the pose is good.
 #[derive(Default)]
 pub struct Trigger {
-    last: Option<(i64, Pose)>,
+    /// The last keyframe's pose, and its sensor time while that clock runs.
+    last: Option<(Option<i64>, Pose)>,
     /// The frame a still was requested at (or a failure backs off from).
     pending_since: Option<i64>,
     forced: bool,
@@ -264,10 +265,16 @@ impl Trigger {
         self.pending_since.is_some()
     }
 
-    /// Forget a requested still: it will not come back (the camera closed),
-    /// and a restarted sensor clock would hold the next one forever.
-    pub fn clear_pending(&mut self) {
+    /// The camera is closing: a requested still will not come back, and
+    /// the sensor clock may restart when it opens again. So the request and
+    /// the last keyframe's time are forgotten (an old time ahead of the new
+    /// clock would hold the interval forever, and keep the next keyframe
+    /// from counting as newer); its pose still measures the movement.
+    pub fn camera_closed(&mut self) {
         self.pending_since = None;
+        if let Some((t, _)) = &mut self.last {
+            *t = None;
+        }
     }
 
     /// Stills that failed in a row since the last one that was taken.
@@ -285,11 +292,15 @@ impl Trigger {
             self.pending_since = None;
         }
         let cur = track.latest();
+        if let Some((t @ None, _)) = &mut self.last {
+            // the first frame after a camera restart: the interval counts from here
+            *t = Some(ts);
+        }
         let due = self.forced
             || match self.last {
                 None => true,
                 Some((t, last)) => {
-                    (cfg.interval_s > 0.0 && (ts - t) as f64 * 1e-9 >= cfg.interval_s)
+                    (cfg.interval_s > 0.0 && t.is_some_and(|t| (ts - t) as f64 * 1e-9 >= cfg.interval_s))
                         || cur.is_some_and(|c| {
                             let moved = norm(sub(c.pose.camera_position(), last.camera_position()));
                             let turned = rotation_distance(&last.r, &c.pose.r).to_degrees();
@@ -320,8 +331,8 @@ impl Trigger {
     /// after the outstanding request answers it — a late one from a request
     /// that already timed out does not.
     pub fn taken(&mut self, ts_ns: i64, pose: Pose) {
-        if self.last.is_none_or(|(t, _)| ts_ns > t) {
-            self.last = Some((ts_ns, pose));
+        if self.last.is_none_or(|(t, _)| t.is_none_or(|t| ts_ns > t)) {
+            self.last = Some((Some(ts_ns), pose));
         }
         if self.pending_since.is_some_and(|t| ts_ns >= t) {
             self.pending_since = None;
@@ -450,6 +461,27 @@ mod tests {
             }
         };
         assert!((50.0..=51.0).contains(&due), "{due}");
+    }
+
+    #[test]
+    fn a_restarted_camera_clock_neither_holds_nor_floods_keyframes() {
+        let cfg = KeyframeCfg { interval_s: 5.0, move_mm: 50.0, turn_deg: 10.0, ..Default::default() };
+        let (mut trig, mut t) = (Trigger::default(), PoseTrack::new(64));
+        let c = [0.0, 0.0, -300.0];
+        // a keyframe late on the old clock, then the camera closes
+        trig.taken(100_000 * FRAME, pose_at(c, 0.0));
+        trig.camera_closed();
+        t.clear();
+        // the new clock starts near zero: the interval counts from its first frame
+        let mut f = 1;
+        while run(&mut trig, &cfg, &mut t, f, c, 0.0) == Due::No {
+            f += 1;
+            assert!(f < 1000, "the interval never fired on the new clock");
+        }
+        assert_eq!(f, 1 + 151, "5 s after the first frame on the new clock");
+        // that keyframe counts as the newest, so the next waits again
+        trig.taken(f * FRAME, pose_at(c, 0.0));
+        assert_eq!(run(&mut trig, &cfg, &mut t, f + 1, c, 0.0), Due::No);
     }
 
     #[test]

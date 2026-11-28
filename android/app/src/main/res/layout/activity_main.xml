@@ -7,15 +7,26 @@
     android:background="?attr/colorSurfaceContainerLowest"
     android:fitsSystemWindows="true">
 
+    <!-- the panel keeps at least the bottom third: on a short screen the
+         camera picture shrinks (letterboxed) rather than squeeze the buttons -->
+    <androidx.constraintlayout.widget.Guideline
+        android:id="@+id/previewLimit"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        app:layout_constraintGuide_percent="0.66" />
+
     <!-- the camera picture; its aspect is set in code, the overlay maps onto it -->
     <FrameLayout
         android:id="@+id/previewFrame"
         android:layout_width="0dp"
         android:layout_height="0dp"
+        app:layout_constraintBottom_toTopOf="@id/previewLimit"
         app:layout_constraintDimensionRatio="3:4"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toTopOf="parent">
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintVertical_bias="0">
 
         <TextureView
             android:id="@+id/texture"
@@ -320,16 +331,18 @@
                 android:id="@+id/secondaryAction"
                 style="@style/Widget.Material3.Button.TonalButton"
                 android:layout_width="wrap_content"
-                android:layout_height="56dp"
+                android:layout_height="wrap_content"
                 android:layout_marginEnd="8dp"
                 android:maxWidth="160dp"
+                android:minHeight="56dp"
                 tools:text="Finish" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/primaryAction"
                 style="@style/Widget.Material3.Button"
                 android:layout_width="0dp"
-                android:layout_height="56dp"
+                android:layout_height="wrap_content"
+                android:minHeight="56dp"
                 android:layout_weight="1"
                 android:textAppearance="?attr/textAppearanceLabelLarge"
                 tools:text="Start" />

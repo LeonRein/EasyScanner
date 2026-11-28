@@ -70,6 +70,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private var calibActive = false
     private var planeActive = false
     private var scanOn = false
+    /** This side asked the scan to stop; any other stop came from the core (cloud full, board moved). */
+    private var scanStopRequested = false
 
     /** The open photo session's directory (set on the UI thread, read on the still thread). */
     /** Back while a scan session is open asks first instead of leaving it behind. */
@@ -364,6 +366,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             dir?.let { exportClosed(it) }
         }
         if (newCalib != calibActive || newPlane != planeActive || newScan != scanOn) {
+            if (scanOn && !newScan && !scanStopRequested && !closedByCore) explainScanStop()
+            if (!newScan) scanStopRequested = false
             calibActive = newCalib
             planeActive = newPlane
             scanOn = newScan
@@ -445,7 +449,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             Mode.CAMERA -> if (m != Mode.CAMERA && calibActive) processor.command(Cmd.CALIB_STOP)
             Mode.LASER -> if (m != Mode.LASER && planeActive) processor.command(Cmd.PLANE_STOP)
             Mode.SCAN -> if (m != Mode.SCAN) {
-                if (scanOn) processor.command(Cmd.SCAN_STOP)
+                if (scanOn) stopScan()
                 if (!keepSession && photoDir != null) stopPhotos()
             }
             Mode.VIEW -> {}
@@ -539,7 +543,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 primary = PanelAction(
                     getString(if (scanOn) R.string.act_stop else R.string.act_start),
                     icon = if (scanOn) R.drawable.ic_pause else R.drawable.ic_play_arrow,
-                ) { processor.command(if (scanOn) Cmd.SCAN_STOP else Cmd.SCAN_START, done = show) },
+                ) { if (scanOn) stopScan(show) else processor.command(Cmd.SCAN_START, done = show) },
                 secondary = PanelAction(getString(R.string.act_export), icon = R.drawable.ic_share) { exportPly() },
                 overflow = listOfNotNull(
                     PanelAction(getString(if (photoDir != null) R.string.act_photos_on else R.string.act_photos_off)) {
@@ -855,10 +859,21 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         applySettingsLive()
     }
 
+    private fun stopScan(done: (String) -> Unit = {}) {
+        scanStopRequested = true
+        processor.command(Cmd.SCAN_STOP, done = done)
+    }
+
+    /** The core ended the scan by itself: say why, or the user keeps sweeping for nothing. */
+    private fun explainScanStop() {
+        val why = listOf("scan", "surface").map { messages.optString(it, "") }.firstOrNull { it.isNotEmpty() }
+        showNote(why ?: getString(R.string.scan_stopped))
+    }
+
     /** Start (a new session for the first start), pause or resume the scan. */
     private fun toggleScan() {
         if (scanOn) {
-            processor.command(Cmd.SCAN_STOP)
+            stopScan()
             return
         }
         ensureLaserOn()

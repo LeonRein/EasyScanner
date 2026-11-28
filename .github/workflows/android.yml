@@ -81,9 +81,10 @@ jobs:
         with:
           components: clippy
 
-      - name: OpenCV build cache
+      # restore and save separately: a run whose tests fail still keeps the build
+      - name: Restore the OpenCV build
         id: opencv-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.OPENCV_PREFIX }}
           key: opencv-${{ env.OPENCV_VERSION }}-core-imgproc-calib3d-objdetect-v1
@@ -92,6 +93,8 @@ jobs:
         if: steps.opencv-cache.outputs.cache-hit != 'true'
         working-directory: ${{ runner.temp }}
         run: |
+          set -o pipefail
+          sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ninja-build > /dev/null
           curl -sSfL "https://github.com/opencv/opencv/archive/refs/tags/$OPENCV_VERSION.tar.gz" | tar xz
           cmake -S "opencv-$OPENCV_VERSION" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -99,8 +102,16 @@ jobs:
             -DBUILD_LIST=core,imgproc,calib3d,features2d,flann,objdetect \
             -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_opencv_apps=OFF \
             -DWITH_IPP=OFF -DWITH_ITT=OFF -DWITH_OPENCL=OFF -DWITH_ADE=OFF -DWITH_PROTOBUF=OFF \
-            -DWITH_FFMPEG=OFF -DWITH_GTK=OFF -DBUILD_JAVA=OFF -DBUILD_opencv_python3=OFF > /dev/null
-          cmake --build build --target install > /dev/null
+            -DWITH_FFMPEG=OFF -DWITH_GTK=OFF -DBUILD_JAVA=OFF -DBUILD_opencv_python3=OFF | tail -n 20
+          # Ninja prints a failed command's output on stdout: keep its end
+          cmake --build build --target install | tail -n 60
+
+      - name: Save the OpenCV build
+        if: steps.opencv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.OPENCV_PREFIX }}
+          key: ${{ steps.opencv-cache.outputs.cache-primary-key }}
 
       # the opencv crate generates its bindings with libclang
       - name: libclang
@@ -121,10 +132,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: android/core
-          key: engine-host
+          # the opencv crate's build script does not watch OpenCV's headers:
+          # its generated bindings must not outlive a version bump
+          key: engine-host-opencv-${{ env.OPENCV_VERSION }}
 
       - run: cargo clippy --locked -p easyscanner-core --all-targets -- -D warnings
-      - run: cargo test --locked --release -p easyscanner-core
+      # the test profile is optimised already; --release would build it all twice
+      - run: cargo test --locked -p easyscanner-core
 
   apk:
     name: APK (arm64-v8a)

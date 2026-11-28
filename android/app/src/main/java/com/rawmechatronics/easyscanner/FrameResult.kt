@@ -104,7 +104,15 @@ class FrameResult(capacity: Int = 32 * 1024) {
         /** Views collected toward the next shape fit, and the fewest a fit needs. */
         const val SURFACE_VIEWS = 63
         const val SURFACE_VIEWS_MIN = 64
-        const val LEN = 65
+        /** Why the last calibration solve was not saved, a [Calib] reason; 0 unless rejected. */
+        const val CALIB_REJECTION = 65
+        /** The sides still short of tilted calibration views, [Calib] side bits. */
+        const val CALIB_MISSING_SIDES = 66
+        /** 1 when the calibration's set is full: a rejection then needs a fresh start. */
+        const val CALIB_EXHAUSTED = 67
+        /** Why the core ended the scan by itself, a [ScanStop] reason. */
+        const val SCAN_STOP_REASON = 68
+        const val LEN = 69
     }
 
     /** States in [H.GYRO_STATE], mirroring `scan_algo::fusion::GyroState`. */
@@ -199,6 +207,14 @@ class FrameResult(capacity: Int = 32 * 1024) {
         const val LASER_FIT = 12
     }
 
+    /** Reasons in [H.SCAN_STOP_REASON], mirroring `frame_out::scan_stop`. */
+    object ScanStop {
+        /** Running, or stopped by the app. */
+        const val NONE = 0
+        const val CLOUD_FULL = 1
+        const val BOARD_MOVED = 2
+    }
+
     /** Calibration states in [H.CALIB_STATE], mirroring `calib::CalibState`. */
     object Calib {
         const val IDLE = 0
@@ -206,6 +222,21 @@ class FrameResult(capacity: Int = 32 * 1024) {
         const val SOLVING = 2
         const val SAVED = 3
         const val REJECTED = 4
+        /** Stopped with its views kept; Start goes on with them. */
+        const val PAUSED = 5
+
+        /** Reasons in [H.CALIB_REJECTION], mirroring `calib::Rejection::code`. */
+        const val REJECT_TOO_FEW_VIEWS = 1
+        const val REJECT_HIGH_RMS = 2
+        const val REJECT_IMPLAUSIBLE = 3
+        const val REJECT_FOCAL_UNCERTAIN = 4
+        const val REJECT_SOLVER_FAILED = 5
+
+        /** Bits of [H.CALIB_MISSING_SIDES], mirroring `calib_coverage::SideSet`. */
+        const val SIDE_LEFT = 1
+        const val SIDE_RIGHT = 2
+        const val SIDE_ABOVE = 4
+        const val SIDE_BELOW = 8
     }
 }
 

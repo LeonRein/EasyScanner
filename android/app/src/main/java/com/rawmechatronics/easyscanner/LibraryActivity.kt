@@ -34,7 +34,12 @@ class LibraryActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        val files = getExternalFilesDir(null) ?: return
+        val files = getExternalFilesDir(null)
+        if (files == null) {
+            // no shared storage mounted: nothing can be listed, which the empty state says
+            b.empty.visibility = View.VISIBLE
+            return
+        }
         Thread {
             val found = ScanLibrary.list(files)
             runOnUiThread {

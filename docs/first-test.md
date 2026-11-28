@@ -44,6 +44,10 @@ calibrated; the plane fit's RMS shows how flat it is.
    the focus.
 3. **Camera**: Start, then move the phone slowly around the board at varied
    tilts and distances until it is saved; the wizard then moves on by itself.
+   Tilt the phone about 30° to each side: the solve waits until the board was
+   seen from the left, the right, above and below, and the panel names the
+   sides still missing. A rejected solve stops with its reason; *Add views*
+   goes on with the views so far, *Start over* drops them.
    The RMS stays in the HUD's camera line (`calibrated <size> rms <x>px`);
    below 0.5 px is good.
 

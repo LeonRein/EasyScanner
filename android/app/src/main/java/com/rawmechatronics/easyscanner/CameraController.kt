@@ -5,6 +5,7 @@ import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CaptureFailure
+import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
@@ -126,8 +127,10 @@ data class CameraInfo(
 
         fun query(mgr: CameraManager, id: String, targetFps: Int, maxLongSide: Int): CameraInfo {
             val c = mgr.getCameraCharacteristics(id)
-            val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-            val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)!!
+            val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?: throw CameraAccessException(CameraAccessException.CAMERA_ERROR, "camera $id has no stream configurations")
+            val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                ?: throw CameraAccessException(CameraAccessException.CAMERA_ERROR, "camera $id reports no sensor size")
             val aspect = active.width().toDouble() / active.height()
             val frameNs = 1e9 / targetFps
             // same tolerance as Intrinsics::for_frame, which scales K exactly within it
@@ -258,6 +261,11 @@ class CameraController(
      * can be had at all, so asking again is pointless.
      */
     private val onStillFailed: (msg: String, fatal: Boolean) -> Unit,
+    /**
+     * The open camera was taken away (another app, split screen, a policy;
+     * camera thread). It is closed; opening it again is up to the caller.
+     */
+    private val onDisconnected: () -> Unit,
 ) : RowTimingSource {
     private val thread = HandlerThread("es-camera").apply { start() }
     private val handler = Handler(thread.looper)
@@ -337,7 +345,10 @@ class CameraController(
 
                 override fun onDisconnected(d: CameraDevice) {
                     d.close()
-                    if (device === d) device = null
+                    if (device === d) {
+                        device = null
+                        onDisconnected()
+                    }
                 }
 
                 override fun onError(d: CameraDevice, error: Int) {

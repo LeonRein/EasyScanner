@@ -351,6 +351,11 @@ fn live_calibration_converges_from_a_wrong_guess() {
     let start = Instant::now();
     let saved = calibrate_from(&mut e, &frames);
     assert!(saved, "calibration never saved: {}", e.messages());
+    // the calibration ends there, and says so
+    let out = step(&mut e, &frames[0]);
+    assert_eq!(out[h::CALIB_STATE], 3.0, "saved: {}", e.messages());
+    assert_eq!(out[h::CALIB_ACTIVE], 0.0);
+    assert_eq!(out[h::CALIB_COUNT], 0.0);
     let f = config::load_intrinsics(&dir, "test").unwrap();
     eprintln!(
         "calibrated fx {:.2} fy {:.2} cx {:.2} cy {:.2} rms {:?} in {:.1}s",
@@ -364,6 +369,51 @@ fn live_calibration_converges_from_a_wrong_guess() {
     assert!((f.fx / k.fx - 1.0).abs() < 0.005, "fx {}", f.fx);
     assert!((f.fy / k.fy - 1.0).abs() < 0.005, "fy {}", f.fy);
     assert!((f.cx - k.cx).abs() < 3.0 && (f.cy - k.cy).abs() < 3.0);
+}
+
+/// Views of a board seen nearly square-on: positions and spins vary, the
+/// tilt stays within a few degrees.
+fn frontal_viewpoints(n: usize) -> Vec<Pose> {
+    (0..n)
+        .map(|i| {
+            let f = i as f64;
+            pose(
+                420.0 + 80.0 * (f * 0.7).sin(),
+                0.05 * (f * 1.3).sin(),
+                0.05 * (f * 0.9).cos(),
+                0.6 * (f * 0.5).sin(),
+                [60.0 * (f * 1.7).cos(), 45.0 * (f * 2.3).sin()],
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn square_on_views_wait_for_tilted_ones_instead_of_solving() {
+    let k = truth_k();
+    let (mut e, _dir) = engine("calib_frontal", k);
+    e.command(cmd::CALIB_START, "");
+    let r = Renderer::new();
+    let frames: Vec<Yuv> = frontal_viewpoints(90).iter().map(|p| r.render(&k, p, None)).collect();
+    let mut out = Vec::new();
+    for yuv in &frames {
+        for _ in 0..HOLD_FRAMES {
+            out = step(&mut e, yuv);
+        }
+    }
+    assert_eq!(out[h::CALIB_STATE], 1.0, "still collecting: {}", e.messages());
+    assert_eq!(out[h::CALIB_ACTIVE], 1.0);
+    // the target is reached, but no view beyond it: none adds a tilted side
+    assert_eq!(out[h::CALIB_COUNT], out[h::CALIB_TARGET], "{}", e.messages());
+    assert_eq!(out[h::CALIB_MISSING_SIDES], 15.0, "every side missing");
+    assert!(e.messages().contains("still missing views tilted from"), "{}", e.messages());
+    // pausing keeps the views, starting again goes on with them
+    e.command(cmd::CALIB_STOP, "");
+    let paused = step(&mut e, &frames[0]);
+    assert_eq!(paused[h::CALIB_STATE], 5.0);
+    assert_eq!(paused[h::CALIB_COUNT], out[h::CALIB_COUNT]);
+    e.command(cmd::CALIB_START, "");
+    assert_eq!(step(&mut e, &frames[0])[h::CALIB_COUNT], out[h::CALIB_COUNT]);
 }
 
 #[test]

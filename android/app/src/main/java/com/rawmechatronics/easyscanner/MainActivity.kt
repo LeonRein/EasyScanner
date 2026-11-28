@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.hardware.SensorManager
+import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
@@ -26,10 +27,10 @@ import androidx.core.content.ContextCompat
 import androidx.preference.PreferenceManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
-import com.rawmechatronics.easyscanner.FrameResult.Calib
 import com.rawmechatronics.easyscanner.FrameResult.Ev
 import com.rawmechatronics.easyscanner.FrameResult.H
 import com.rawmechatronics.easyscanner.FrameResult.Photo
+import com.rawmechatronics.easyscanner.FrameResult.ScanStop
 import com.rawmechatronics.easyscanner.databinding.ActivityMainBinding
 import org.json.JSONObject
 import java.io.File
@@ -70,8 +71,6 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private var calibActive = false
     private var planeActive = false
     private var scanOn = false
-    /** This side asked the scan to stop; any other stop came from the core (cloud full, board moved). */
-    private var scanStopRequested = false
 
     /** The open photo session's directory (set on the UI thread, read on the still thread). */
     /** Back while a scan session is open asks first instead of leaving it behind. */
@@ -93,6 +92,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     private val wizard = Wizard()
     private var readiness = Readiness(boardConfirmed = false, focusLocked = false, calibrated = false, planeReady = false)
     private lateinit var panel: PanelView
+    private lateinit var calibPanel: CameraCalibrationPanel
     /** The last copy to Download, for the Saved step, and the session it is of. */
     private var copied: SessionExport.Copied? = null
     private var exporting: File? = null
@@ -122,6 +122,21 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     /** The camera was (re)opened for the current resume; reset by onPause. */
     private var cameraStarted = false
+    /** Another client took the camera while resumed; it reopens once available. */
+    private var cameraLost = false
+    /** Analysis sizes the camera refused to stream: never asked for again this process. */
+    private val refusedSizes = mutableSetOf<android.util.Size>()
+    /** The note that the camera is unavailable (denied, lost), dismissed once it opens. */
+    private var cameraNote: Snackbar? = null
+
+    private val cameraAvailability = object : CameraManager.AvailabilityCallback() {
+        override fun onCameraAvailable(id: String) {
+            if (cameraLost && id == info?.id) {
+                cameraLost = false
+                startCamera()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -137,6 +152,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             onSizeFailed = { size -> main.post { fallBackFrom(size) } },
             onStill = ::onStill,
             onStillFailed = { msg, fatal -> main.post { onStillFailed(msg, fatal) } },
+            onDisconnected = { main.post { onCameraLost() } },
         )
         gyro = GyroStream(getSystemService(SensorManager::class.java))
         processor.gyro = gyro
@@ -145,6 +161,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         settings = AppSettings.load(this)
 
         panel = PanelView(b)
+        calibPanel = CameraCalibrationPanel(this)
         b.settingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
         b.libraryButton.setOnClickListener { startActivity(Intent(this, LibraryActivity::class.java)) }
         b.stepLabel.setOnClickListener { showSteps() }
@@ -175,6 +192,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     override fun onResume() {
         super.onResume()
+        mgr.registerAvailabilityCallback(cameraAvailability, main)
         when {
             ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED -> {
                 // granted, possibly in Settings after a denial
@@ -192,9 +210,11 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         // settings change the board or the camera); its cloud goes to disk now,
         // in case the process does not come back
         if (photoDir != null) processor.command(Cmd.CHECKPOINT)
+        mgr.unregisterAvailabilityCallback(cameraAvailability)
         camera.close()
         gyro.stop()
         cameraStarted = false
+        cameraLost = false
         super.onPause()
     }
 
@@ -211,13 +231,23 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         val st = AppSettings.load(this)
         settings = st
         applyInterface()
-        val ids = CameraInfo.backCameraIds(mgr)
-        if (ids.isEmpty()) {
-            showNote(getString(R.string.no_camera), Snackbar.LENGTH_INDEFINITE)
+        // the camera service can refuse even the lookup (camera disabled by a policy, a service error)
+        val inf = try {
+            val ids = CameraInfo.backCameraIds(mgr)
+            if (ids.isEmpty()) {
+                showNote(getString(R.string.no_camera), Snackbar.LENGTH_INDEFINITE)
+                return
+            }
+            CameraInfo.query(mgr, st.cameraId.takeIf { it in ids } ?: ids.first(), st.targetFps, st.maxLongSide)
+        } catch (e: CameraAccessException) {
+            Log.w(TAG, "camera lookup failed", e)
+            showNote(getString(R.string.camera_unavailable, e.message ?: e.reason.toString()), Snackbar.LENGTH_INDEFINITE)
+            cameraStarted = false
             return
         }
-        val inf = CameraInfo.query(mgr, st.cameraId.takeIf { it in ids } ?: ids.first(), st.targetFps, st.maxLongSide)
         info = inf
+        cameraNote?.dismiss()
+        cameraNote = null
         val pv = inf.previewSize
         val portrait = inf.sensorOrientation % 180 != 0
         (b.previewFrame.layoutParams as ConstraintLayout.LayoutParams).dimensionRatio =
@@ -228,11 +258,13 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         processor.configure(st.nativeConfig(inf))
         if (inf.gyroClockShared) gyro.start() else gyro.stop()
         val sizes = inf.analysisSizes
+        // a size the camera refused before is not tried again on every resume
+        val first = sizes.indexOfFirst { it !in refusedSizes }.takeIf { it >= 0 } ?: sizes.lastIndex
         governor = if (st.autoResolution) {
-            ResolutionGovernor(sizes.map { FrameSize(it.width, it.height) }, st.targetFps, 0)
-                .also { it.reset(0, System.nanoTime()) }
+            ResolutionGovernor(sizes.map { FrameSize(it.width, it.height) }, st.targetFps, first)
+                .also { it.limitTo(first, System.nanoTime()) }
         } else null
-        camera.open(inf, b.texture.surfaceTexture!!, sizes.first(), st)
+        camera.open(inf, b.texture.surfaceTexture!!, sizes[first], st)
         renderPanel()
         offerPending()
     }
@@ -245,6 +277,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             onError("camera session failed at ${size.width}x${size.height}")
             return
         }
+        refusedSizes += size
         showNote("camera refused ${size.width}x${size.height}, using ${sizes[next].width}x${sizes[next].height}")
         processor.handler.post { governor?.limitTo(next, System.nanoTime()) }
         camera.setAnalysisSize(sizes[next])
@@ -267,9 +300,9 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         fps.tick(r.timestampNs)
         governor?.let { g ->
             val photos = r[H.PHOTO_STATE].toInt()
-            // one size per calibration solve, and per photo session (its stills share one K)
-            g.frozen = r.flag(H.CALIB_ACTIVE) || r[H.CALIB_STATE].toInt() == Calib.SOLVING ||
-                (photos != Photo.OFF && photos != Photo.NO_PHOTOS)
+            // one size per calibration set (a new size starts it over), and per
+            // photo session (its stills share one K)
+            g.frozen = CalibrationStatus.of(r).holdsViews || (photos != Photo.OFF && photos != Photo.NO_PHOTOS)
             val from = g.size
             // frames still in flight from before a switch say nothing about the new size
             if (r[H.FRAME_W].toInt() != from.width || r[H.FRAME_H].toInt() != from.height) return@let
@@ -331,7 +364,9 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         renderPanel()
     }
 
-    override fun onError(msg: String) = showNote(msg)
+    override fun onError(msg: String) {
+        showNote(msg)
+    }
 
     // ── preview overlays and the panel ───────────────────────────────────────
 
@@ -365,9 +400,9 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             // its files are kept: hand them to Download right away rather than at the next start
             dir?.let { exportClosed(it) }
         }
+        val stopReason = r[H.SCAN_STOP_REASON].toInt()
         if (newCalib != calibActive || newPlane != planeActive || newScan != scanOn) {
-            if (scanOn && !newScan && !scanStopRequested && !closedByCore) explainScanStop()
-            if (!newScan) scanStopRequested = false
+            if (scanOn && !newScan && !closedByCore) explainScanStop(stopReason)
             calibActive = newCalib
             planeActive = newPlane
             scanOn = newScan
@@ -379,7 +414,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     /** The core's latest messages, for the debug overlay and expert mode. */
     private fun coreMessages(): List<String> =
-        messages.keys().asSequence().map { messages.optString(it, "") }.filter { it.isNotEmpty() }.toList()
+        messages.keys().asSequence().mapNotNull { messages.opt(it) as? String }.filter { it.isNotEmpty() }.toList()
 
     private fun boardStatusOf(r: FrameResult) = when {
         r.flag(H.DETECTED) -> BoardStatus(getString(R.string.board_status_found), BoardStatus.Kind.FOUND)
@@ -484,12 +519,11 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
     }
 
     /** A short note at the bottom of the screen, above the actions. */
-    private fun showNote(text: String, duration: Int = Snackbar.LENGTH_LONG) {
+    private fun showNote(text: String, duration: Int = Snackbar.LENGTH_LONG): Snackbar =
         Snackbar.make(b.root, text, duration)
             .setAnchorView(b.primaryAction)
             .setTextMaxLines(SNACKBAR_LINES)
-            .show()
-    }
+            .also { it.show() }
 
     private fun startPauseAction(running: Boolean, idle: Int = R.string.act_start, run: () -> Unit) = PanelAction(
         getString(if (running) R.string.act_pause else idle),
@@ -501,59 +535,93 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     private fun expertPanel(): PanelContent {
         val show: (String) -> Unit = { renderPanel() }
+        val r = processor.results.latest()
         val details = coreMessages().joinToString("\n").ifEmpty { null }
+        // every tab: what to do, its live state, a main action with an icon,
+        // and its help as the last entry of the overflow menu
+        fun help(text: Int) = PanelAction(getString(R.string.help)) { panel.showHelp(getString(text)) }
         return when (mode) {
             Mode.VIEW -> PanelContent(
                 instruction = getString(R.string.hint_view),
                 detail = details,
-                primary = PanelAction(getString(if (laserEnabled()) R.string.act_laser_on else R.string.act_laser_off)) {
+                primary = PanelAction(
+                    getString(if (laserEnabled()) R.string.act_laser_turn_off else R.string.act_laser_turn_on),
+                    icon = R.drawable.ic_power,
+                ) {
                     prefs().edit().putBoolean("laser_enabled", !laserEnabled()).apply()
                     applySettingsLive()
                     renderPanel()
                 },
+                overflow = listOf(help(R.string.help_expert_view)),
             )
-            Mode.CAMERA -> PanelContent(
-                instruction = getString(R.string.hint_camera),
-                detail = details,
-                primary = startPauseAction(calibActive) {
-                    processor.command(if (calibActive) Cmd.CALIB_STOP else Cmd.CALIB_START, done = show)
-                },
-                secondary = PanelAction(getString(R.string.act_capture)) { processor.command(Cmd.CALIB_CAPTURE, done = show) },
-                overflow = listOf(
-                    PanelAction(getString(R.string.act_reset)) { processor.command(Cmd.CALIB_RESET, done = show) },
-                    PanelAction(getString(R.string.act_forget_k)) { processor.command(Cmd.FORGET_INTRINSICS, done = show) },
-                ),
-            )
+            Mode.CAMERA -> {
+                val s = r?.let { CalibrationStatus.of(it) }
+                val send: (Cmd) -> Unit = { processor.command(it, done = show) }
+                PanelContent(
+                    instruction = getString(R.string.hint_camera),
+                    progress = s?.let { calibPanel.progress(it) },
+                    notice = s?.let { calibPanel.notice(it) },
+                    detail = details,
+                    primary = s?.let { calibPanel.primary(it, send) }
+                        ?: startPauseAction(false) { send(Cmd.CALIB_START) },
+                    secondary = PanelAction(getString(R.string.act_capture), enabled = s?.collecting == true) {
+                        send(Cmd.CALIB_CAPTURE)
+                    },
+                    overflow = listOfNotNull(
+                        s?.let { calibPanel.reset(it, send) },
+                        destructive(R.string.act_forget_k, R.string.confirm_forget_k) { send(Cmd.FORGET_INTRINSICS) },
+                        help(R.string.help_expert_camera),
+                    ),
+                )
+            }
             Mode.LASER -> PanelContent(
                 instruction = getString(R.string.hint_laser),
+                progress = r?.let { countProgress(it[H.PLANE_LINES], it[H.PLANE_TARGET], R.string.laser_progress) },
                 detail = details,
-                primary = startPauseAction(planeActive) {
+                primary = startPauseAction(planeActive, idle = if ((r?.get(H.PLANE_LINES) ?: 0f) > 0f) R.string.act_resume else R.string.act_start) {
                     processor.command(if (planeActive) Cmd.PLANE_STOP else Cmd.PLANE_START, done = show)
                 },
-                secondary = PanelAction(getString(R.string.act_force)) { processor.command(Cmd.PLANE_FORCE, done = show) },
+                secondary = PanelAction(
+                    getString(R.string.act_force),
+                    enabled = planeActive && (r?.get(H.PLANE_LINES) ?: 0f) >= MIN_PLANE_LINES,
+                ) { processor.command(Cmd.PLANE_FORCE) { msg -> renderPanel(); showNote(msg) } },
                 overflow = listOf(
-                    PanelAction(getString(R.string.act_forget_plane)) { processor.command(Cmd.FORGET_PLANE, done = show) },
-                    PanelAction(getString(R.string.act_forget_surface)) { processor.command(Cmd.FORGET_SURFACE, done = show) },
+                    destructive(R.string.act_forget_plane, R.string.confirm_forget_plane) {
+                        processor.command(Cmd.FORGET_PLANE, done = show)
+                    },
+                    destructive(R.string.act_forget_surface, R.string.confirm_forget_surface) {
+                        processor.command(Cmd.FORGET_SURFACE, done = show)
+                    },
+                    help(R.string.help_expert_laser),
                 ),
             )
             Mode.SCAN -> PanelContent(
                 instruction = getString(R.string.hint_scan),
-                help = getString(R.string.help_expert_scan),
                 detail = details,
-                primary = PanelAction(
-                    getString(if (scanOn) R.string.act_stop else R.string.act_start),
-                    icon = if (scanOn) R.drawable.ic_pause else R.drawable.ic_play_arrow,
-                ) { if (scanOn) stopScan(show) else processor.command(Cmd.SCAN_START, done = show) },
+                primary = startPauseAction(scanOn, idle = if ((r?.get(H.CLOUD_POINTS) ?: 0f) > 0f) R.string.act_resume else R.string.act_start) {
+                    if (scanOn) stopScan(show) else processor.command(Cmd.SCAN_START, done = show)
+                },
                 secondary = PanelAction(getString(R.string.act_export), icon = R.drawable.ic_share) { exportPly() },
                 overflow = listOfNotNull(
-                    PanelAction(getString(if (photoDir != null) R.string.act_photos_on else R.string.act_photos_off)) {
+                    PanelAction(getString(if (photoDir != null) R.string.act_photos_stop else R.string.act_photos_start)) {
                         if (photoDir == null) startPhotos() else stopPhotos()
                     },
                     photoDir?.let { PanelAction(getString(R.string.act_photo_now)) { processor.command(Cmd.PHOTO_SNAP, done = show) } },
-                    PanelAction(getString(R.string.act_clear)) { processor.command(Cmd.CLOUD_CLEAR, done = show) },
+                    destructive(R.string.act_clear, R.string.confirm_clear) { processor.command(Cmd.CLOUD_CLEAR, done = show) },
+                    help(R.string.help_expert_scan),
                 ),
             )
         }
+    }
+
+    /** An overflow entry that deletes something: it asks first ([question]). */
+    private fun destructive(label: Int, question: Int, run: () -> Unit) = PanelAction(getString(label)) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(label)
+            .setMessage(question)
+            .setPositiveButton(label) { _, _ -> run() }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     /** Write the cloud as a PLY into the app's files, then copy it to Download and offer it. */
@@ -700,16 +768,19 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                     },
                 )
             }
-            Step.CAMERA -> PanelContent(
-                title = getString(R.string.title_camera),
-                instruction = getString(R.string.instr_camera),
-                help = getString(R.string.help_camera),
-                progress = countProgress(f(H.CALIB_COUNT), f(H.CALIB_TARGET), R.string.camera_progress),
-                primary = startPauseAction(calibActive) {
-                    processor.command(if (calibActive) Cmd.CALIB_STOP else Cmd.CALIB_START)
-                },
-                overflow = listOf(PanelAction(getString(R.string.act_reset)) { processor.command(Cmd.CALIB_RESET) }),
-            )
+            Step.CAMERA -> {
+                val s = r?.let { CalibrationStatus.of(it) }
+                val send: (Cmd) -> Unit = { processor.command(it) }
+                PanelContent(
+                    title = getString(R.string.title_camera),
+                    instruction = getString(R.string.instr_camera),
+                    help = getString(R.string.help_camera),
+                    progress = s?.let { calibPanel.progress(it) },
+                    notice = s?.let { calibPanel.notice(it) },
+                    primary = s?.let { calibPanel.primary(it, send) } ?: startPauseAction(false) { send(Cmd.CALIB_START) },
+                    overflow = listOfNotNull(s?.let { calibPanel.reset(it, send) }),
+                )
+            }
             Step.LASER -> {
                 val stale = r?.flag(H.PLANE_STALE) == true && !planeActive
                 PanelContent(
@@ -718,7 +789,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                     help = getString(R.string.help_laser),
                     progress = countProgress(f(H.PLANE_LINES), f(H.PLANE_TARGET), R.string.laser_progress),
                     notice = if (stale) Notice(getString(R.string.laser_stale), Notice.Level.WARNING) else null,
-                    primary = startPauseAction(planeActive) {
+                    primary = startPauseAction(planeActive, idle = if (f(H.PLANE_LINES) > 0f) R.string.act_resume else R.string.act_start) {
                         if (planeActive) processor.command(Cmd.PLANE_STOP) else {
                             ensureLaserOn()
                             processor.command(Cmd.PLANE_START)
@@ -726,7 +797,10 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                     },
                     secondary = if (planeActive) PanelAction(
                         getString(R.string.act_force), enabled = f(H.PLANE_LINES) >= MIN_PLANE_LINES,
-                    ) { processor.command(Cmd.PLANE_FORCE) } else null,
+                    ) {
+                        // a refused fit says why; a saved one moves the steps on
+                        processor.command(Cmd.PLANE_FORCE) { msg -> if (!msg.startsWith("SAVED")) showNote(msg) }
+                    } else null,
                 )
             }
             Step.SCAN -> {
@@ -757,7 +831,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                     },
                     overflow = listOfNotNull(
                         if (photos) PanelAction(getString(R.string.act_photo_now)) { processor.command(Cmd.PHOTO_SNAP) } else null,
-                        PanelAction(getString(R.string.act_discard), enabled = open) { discardScan() },
+                        // nothing to discard before a session is open: no menu at all then
+                        if (open) PanelAction(getString(R.string.act_discard)) { discardScan() } else null,
                     ),
                 )
             }
@@ -859,15 +934,20 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         applySettingsLive()
     }
 
-    private fun stopScan(done: (String) -> Unit = {}) {
-        scanStopRequested = true
-        processor.command(Cmd.SCAN_STOP, done = done)
-    }
+    private fun stopScan(done: (String) -> Unit = {}) = processor.command(Cmd.SCAN_STOP, done = done)
 
-    /** The core ended the scan by itself: say why, or the user keeps sweeping for nothing. */
-    private fun explainScanStop() {
-        val why = listOf("scan", "surface").map { messages.optString(it, "") }.firstOrNull { it.isNotEmpty() }
-        showNote(why ?: getString(R.string.scan_stopped))
+    /**
+     * The core ended the scan by itself ([reason], a `scan_stop` value): say
+     * why, or the user keeps sweeping for nothing. Stops this side asked for
+     * (pause, finish, discard, leaving the app) have no reason and need no note.
+     */
+    private fun explainScanStop(reason: Int) {
+        val why = when (reason) {
+            ScanStop.CLOUD_FULL -> R.string.scan_stopped_full
+            ScanStop.BOARD_MOVED -> R.string.scan_stopped_board_moved
+            else -> return
+        }
+        showNote(getString(why))
     }
 
     /** Start (a new session for the first start), pause or resume the scan. */
@@ -898,12 +978,22 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         exporting = dir
         copyNote = getString(R.string.done_saving)
         copyDetail = null
-        wizard.finished()
+        // expert mode has no Saved step: the copy reports in a note instead
+        if (expert) showNote(copyNote) else wizard.finished()
+    }
+
+    /** Another app took the camera: say so, and reopen it once it is free again. */
+    private fun onCameraLost() {
+        if (!cameraStarted) return
+        camera.close()
+        cameraStarted = false
+        cameraLost = true
+        cameraNote = showNote(getString(R.string.camera_lost), Snackbar.LENGTH_INDEFINITE)
     }
 
     /** Why nothing works without the camera, and the way to grant it in Settings. */
     private fun explainCameraDenied() {
-        showNote(getString(R.string.need_camera), Snackbar.LENGTH_INDEFINITE)
+        cameraNote = showNote(getString(R.string.need_camera), Snackbar.LENGTH_INDEFINITE)
         if (cameraDeniedDialog?.isShowing == true) return
         cameraDeniedDialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.camera_denied_title)
@@ -960,7 +1050,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 // the core leaves no session behind when nothing was captured
                 { if (dir.exists()) getString(R.string.done_failed, it.message, dir.absolutePath) else getString(R.string.done_empty) },
             )
-            renderWizard()
+            if (expert) showNote(copyNote) else renderWizard()
         }
     }.start()
 
@@ -982,7 +1072,8 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
         val res = runCatching { SessionExport.copyToDownloads(this, dir) }
         runOnUiThread {
             if (isFinishing || isDestroyed) return@runOnUiThread
-            val why = messages.optString("photos", "")
+            // the core's own account is for expert mode; the note says it plainly
+            val why = if (expert) messages.optString("photos", "") else ""
             val note = res.fold({ getString(R.string.closed_saved, it.relativeDir) }, { getString(R.string.closed_kept, dir.name) })
             showNote(if (why.isEmpty()) note else "$note\n$why")
         }
@@ -1002,7 +1093,12 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 MaterialAlertDialogBuilder(this)
                     .setTitle(R.string.pending_title)
-                    .setMessage(getString(R.string.pending_body, pending.size, latest.name, SessionExport.photoCount(latest)))
+                    .setMessage(
+                        resources.getQuantityString(
+                            R.plurals.pending_body, pending.size, pending.size, latest.name,
+                            resources.getQuantityString(R.plurals.photos, SessionExport.photoCount(latest), SessionExport.photoCount(latest)),
+                        )
+                    )
                     .setPositiveButton(R.string.act_save_now) { _, _ -> copyPending(pending) }
                     .setNegativeButton(R.string.act_later, null)
                     .show()
@@ -1012,7 +1108,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
 
     private fun copyPending(dirs: List<File>) = Thread {
         val ok = dirs.count { runCatching { SessionExport.copyToDownloads(this, it) }.onFailure { e -> Log.w(TAG, "copy ${it.name}", e) }.isSuccess }
-        runOnUiThread { showNote(getString(R.string.pending_saved, ok)) }
+        runOnUiThread { showNote(resources.getQuantityString(R.plurals.pending_saved, ok, ok)) }
     }.start()
 
     private fun sharePly(uri: Uri) {

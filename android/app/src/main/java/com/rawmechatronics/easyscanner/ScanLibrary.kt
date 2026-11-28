@@ -31,5 +31,11 @@ object ScanLibrary {
         (File(dir, "photos").listFiles { f -> f.name.endsWith(".jpg") && !f.name.startsWith(".") } ?: emptyArray())
             .sortedBy { it.name }
 
-    private fun newest(dir: File): Long = dir.walkTopDown().filter { it.isFile }.maxOfOrNull { it.lastModified() } ?: dir.lastModified()
+    /**
+     * When the session was last scanned into: its newest file, leaving out
+     * the copy-to-Download bookkeeping, which a later copy rewrites.
+     */
+    private fun newest(dir: File): Long = dir.walkTopDown()
+        .filter { it.isFile && it.name != SessionExport.MARKER && it.name != SessionExport.PROGRESS }
+        .maxOfOrNull { it.lastModified() } ?: dir.lastModified()
 }

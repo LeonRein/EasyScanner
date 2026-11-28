@@ -2,11 +2,12 @@
 //! camera. It bounds where the laser is searched for (its projected hull is
 //! the detection ROI) and which triangulated points count as the object.
 
+use crate::board_surface::BoardSurface;
 use crate::geom::{Intrinsics, Pose, V3};
 use crate::laser::Roi;
 
-/// Points closer to the board than this (mm) are the board itself, not the
-/// object.
+/// Points closer to the board's surface than this (mm) are the board
+/// itself, not the object.
 pub const BOARD_EPS_MM: f64 = 3.0;
 
 #[derive(Clone, Copy, Debug)]
@@ -61,11 +62,13 @@ impl Volume {
         c
     }
 
-    /// Whether a board-frame point lies inside the volume and above the board
-    /// surface — the scan's "object" test.
+    /// Whether a board-frame point lies inside the volume and above the
+    /// board's `surface` — the scan's "object" test. Measured from the
+    /// surface, a board that bows or curls more than [`BOARD_EPS_MM`] does
+    /// not leak into the scan.
     #[inline]
-    pub fn contains(&self, pose: &Pose, p: V3) -> bool {
-        let up = pose.up_sign() * p[2];
+    pub fn contains(&self, pose: &Pose, p: V3, surface: &BoardSurface) -> bool {
+        let up = pose.up_sign() * (p[2] - surface.height(p[0], p[1]));
         up > BOARD_EPS_MM && up <= self.height && self.in_footprint(p)
     }
 
@@ -199,9 +202,16 @@ mod tests {
         assert!(a as usize <= cx && cx < b as usize);
         // up is toward the camera: board +Z points away from it here
         let up = pose.up_sign();
-        assert!(vol.contains(&pose, [100.0, 100.0, up * 50.0]));
-        assert!(!vol.contains(&pose, [100.0, 100.0, -up * 50.0]));
-        assert!(!vol.contains(&pose, [100.0, 100.0, up * 1.0]));
-        assert!(!vol.contains(&pose, [400.0, 100.0, up * 50.0]));
+        let flat = BoardSurface::flat();
+        assert!(vol.contains(&pose, [100.0, 100.0, up * 50.0], &flat));
+        assert!(!vol.contains(&pose, [100.0, 100.0, -up * 50.0], &flat));
+        assert!(!vol.contains(&pose, [100.0, 100.0, up * 1.0], &flat));
+        assert!(!vol.contains(&pose, [400.0, 100.0, up * 50.0], &flat));
+        // a board curled up by 4 mm at this point is still the board there
+        let curled = BoardSurface::for_board(288.0, 288.0, 2).with_coeffs(vec![up * 8.0, 0.0, 0.0]).unwrap();
+        let on = curled.point(20.0, 100.0);
+        assert!(vol.contains(&pose, [20.0, 100.0, up * 4.0], &flat), "taken as flat, it would be the object");
+        assert!(!vol.contains(&pose, [20.0, 100.0, on[2] + up * 1.0], &curled));
+        assert!(vol.contains(&pose, [20.0, 100.0, on[2] + up * 10.0], &curled));
     }
 }

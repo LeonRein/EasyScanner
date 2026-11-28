@@ -666,7 +666,11 @@ fn a_bent_board_is_measured_and_a_moved_one_noticed() {
     let doubted = seen.iter().position(|&s| s == SurfaceState::Measuring as i32);
     let replaced = seen.iter().position(|&s| s == SurfaceState::Replaced as i32);
     assert!(matches!((doubted, replaced), (Some(a), Some(b)) if a < b), "{seen:?}: {}", e.messages());
-    assert!(config::load_surface(&dir, &spec()).unwrap().surface.peak_to_valley(bw, bh) < 0.15);
+    // flat within the fit's noise (sigma ~0.13 mm), and clearly not the old shape
+    let replaced = config::load_surface(&dir, &spec()).unwrap();
+    let (pv, from_old) = (replaced.surface.peak_to_valley(bw, bh), replaced.surface.max_difference(&bent, bw, bh));
+    eprintln!("replaced: p-v {pv:.3} mm, sigma {:.3} mm, {from_old:.2} mm from the old shape", replaced.height_sigma_mm);
+    assert!(pv < 0.3 && from_old > 1.0, "p-v {pv:.3} mm, {from_old:.2} mm from the old shape");
 }
 
 #[test]

@@ -533,6 +533,7 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 secondary = PanelAction(getString(R.string.act_force)) { processor.command(Cmd.PLANE_FORCE, done = show) },
                 overflow = listOf(
                     PanelAction(getString(R.string.act_forget_plane)) { processor.command(Cmd.FORGET_PLANE, done = show) },
+                    PanelAction(getString(R.string.act_forget_surface)) { processor.command(Cmd.FORGET_SURFACE, done = show) },
                 ),
             )
             Mode.SCAN -> PanelContent(
@@ -660,8 +661,12 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                     title = getString(R.string.title_board),
                     instruction = getString(R.string.instr_board),
                     help = getString(R.string.help_board),
-                    detail = getString(R.string.board_detail, name),
-                    notice = if (mismatch) Notice(getString(R.string.board_mismatch), Notice.Level.WARNING) else null,
+                    detail = listOfNotNull(getString(R.string.board_detail, name), r?.let { surfaceText(it) })
+                        .joinToString("\n"),
+                    notice = when {
+                        mismatch -> Notice(getString(R.string.board_mismatch), Notice.Level.WARNING)
+                        else -> r?.let { surfaceNotice(it) }
+                    },
                     primary = PanelAction(
                         getString(R.string.act_board_ok),
                         enabled = seen && f(H.N_CORNERS) >= MIN_BOARD_CORNERS,
@@ -735,11 +740,15 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                     instruction = instruction,
                     help = getString(R.string.help_scan),
                     metric = if (open) getString(R.string.scan_points, pointsText(f(H.CLOUD_POINTS))) else null,
-                    detail = if (photos) getString(
-                        R.string.scan_photos_state,
-                        resources.getQuantityString(R.plurals.photos, f(H.PHOTO_COUNT).toInt(), f(H.PHOTO_COUNT).toInt()),
-                        photoStateText(photoState),
-                    ) else null,
+                    detail = listOfNotNull(
+                        if (photos) getString(
+                            R.string.scan_photos_state,
+                            resources.getQuantityString(R.plurals.photos, f(H.PHOTO_COUNT).toInt(), f(H.PHOTO_COUNT).toInt()),
+                            photoStateText(photoState),
+                        ) else null,
+                        r?.let { surfaceText(it) },
+                    ).joinToString("\n").ifEmpty { null },
+                    notice = r?.let { surfaceNotice(it) },
                     primary = startPauseAction(scanOn, idle = if (open) R.string.act_resume else R.string.act_start) {
                         toggleScan()
                     },
@@ -767,6 +776,22 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
             }
         }
     }
+
+    /** How the board's shape is known, measured on its own while the phone moves. */
+    private fun surfaceText(r: FrameResult): String? = when (r[H.SURFACE_STATE].toInt()) {
+        FrameResult.Surface.UNMEASURED -> getString(R.string.surface_flat)
+        FrameResult.Surface.MEASURING ->
+            getString(R.string.surface_measuring, r[H.SURFACE_VIEWS].toInt(), r[H.SURFACE_VIEWS_MIN].toInt())
+        FrameResult.Surface.VERIFIED, FrameResult.Surface.REPLACED ->
+            r[H.SURFACE_PV_MM].takeUnless { it.isNaN() }?.let { getString(R.string.surface_verified, it) }
+        else -> null
+    }
+
+    /** The board was laid down anew and re-measured: tell the user why the numbers changed. */
+    private fun surfaceNotice(r: FrameResult): Notice? =
+        if (r[H.SURFACE_STATE].toInt() == FrameResult.Surface.REPLACED) {
+            Notice(getString(R.string.surface_replaced), Notice.Level.INFO)
+        } else null
 
     /** "7 of 20 views" with its bar; nothing before the core reports a target. */
     private fun countProgress(done: Float, target: Float, label: Int): Progress? {

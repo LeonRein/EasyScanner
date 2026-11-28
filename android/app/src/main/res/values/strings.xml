@@ -16,6 +16,7 @@
     <string name="act_forget_k">Forget K</string>
     <string name="act_force">Force fit</string>
     <string name="act_forget_plane">Forget plane</string>
+    <string name="act_forget_surface">Forget board shape</string>
     <string name="act_export">Export PLY</string>
     <string name="act_clear">Clear</string>
     <string name="act_laser_on">Laser: on</string>
@@ -64,8 +65,12 @@
 
     <string name="title_board">Check the board</string>
     <string name="instr_board">Lay the printed board flat and point the phone at it.</string>
-    <string name="help_board">The app has to know which board you printed: its size, squares and markers are printed on the sheet. When the board is in view, the grid drawn over the picture must lie exactly on the printed squares. If it does not, or the app reports a wrong board, pick the board you printed.</string>
+    <string name="help_board">The app has to know which board you printed: its size, squares and markers are printed on the sheet. When the board is in view, the grid drawn over the picture must lie exactly on the printed squares. If it does not, or the app reports a wrong board, pick the board you printed.\n\nThe board does not have to lie perfectly flat: while you move the phone, the app measures its shape and corrects for it.</string>
     <string name="board_detail">Board: %1$s</string>
+    <string name="surface_flat">Board shape: taken as flat until measured</string>
+    <string name="surface_measuring">Board shape: measuring, %1$d of %2$d views</string>
+    <string name="surface_verified">Board shape: measured, %1$.1f mm off flat</string>
+    <string name="surface_replaced">The board was moved, so its shape was measured again.</string>
     <string name="board_mismatch">Markers seen, but they do not fit this board: pick the board you printed.</string>
     <string name="act_board_ok">Board is right</string>
     <string name="act_board_change">Other board</string>

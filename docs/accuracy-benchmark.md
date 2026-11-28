@@ -98,27 +98,38 @@ What it says (for this geometry, synthetic data):
 Every user prints and mounts the board themselves, so it is never perfectly
 flat. The app measures its shape per placement (see the README, "The
 board's shape"); the bench checks what that is worth. The bent board curls
-and twists by 1.6 mm peak to valley, with corner noise 0.2 px and stripe noise 0.3 px:
+and twists by 1.6 mm peak to valley, with terms up to degree 5 that the
+app's degree-3 model cannot match exactly. The curled board has three times
+the curl, more than the volume's 3 mm board margin. Corner noise is 0.2 px
+and stripe noise 0.3 px:
 
 | Scenario | Pose pos RMS | plane° | mean | RMS | > 1 mm |
 |---|---|---|---|---|---|
-| bent board, taken as flat | 0.504 | 0.045 | −0.204 | 0.402 | 1.92 % |
-| bent board, shape measured (from the scan's own views) | 0.242 | 0.003 | −0.013 | 0.322 | 0.46 % |
+| bent board, taken as flat | 0.501 | 0.044 | −0.199 | 0.399 | 1.89 % |
+| bent board, shape measured (degree 3, from the plane calibration's static views) | 0.242 | 0.003 | −0.012 | 0.322 | 0.46 % |
 | bent board, true shape | 0.240 | 0.003 | −0.010 | 0.322 | 0.46 % |
+| curled board, taken as flat | 1.340 | 0.121 | +15.98 | 48.78 | 26.3 % |
+| curled board, shape measured | 0.245 | 0.009 | +0.035 | 0.327 | 0.56 % |
 
 Taking a bent board as flat biases the whole cloud by −0.2 mm and tilts the
-calibrated laser plane by 0.045°. The measured shape is as good as the true
-one. Object height is measured from the board surface, not from its plane,
-so the board's own curl does not leak into the cloud.
+calibrated laser plane by 0.045°. The measured cubic is as good as the true
+shape, although it cannot match it exactly. Object height is measured from
+the board surface, not from its plane. Taken as flat, the curled board
+rises above the volume's board margin, and its own points leak into the
+cloud; measured, they stay out.
 
 | Scenario | median | p95 | RMS | > 1 mm |
 |---|---|---|---|---|
 | wide (σ 0.8 mm), overexposed stripe | 0.159 | 1.974 | 7.870 | 8.63 % |
-| reddish object | 0.084 | 1.553 | 14.996 | 9.72 % |
+| reddish object | 0.085 | 1.694 | 23.87 | 11.3 % |
 
 - **A reddish object** used to be taken for the stripe on 67 % of its rows
-  (> 1 mm). The ridge test brings that to 9.7 %. What remains are rows where
-  the stripe is hidden and the object's red edge is a ridge too.
+  (> 1 mm). The ridge test brings that to 11 %. A line's stripe is its most
+  prominent ridge, held against the frame's strongest ridge, not its
+  highest response. A saturated object elsewhere therefore does not drown a
+  weak stripe, and a line whose highest response is on the object still
+  finds the stripe. What remains are lines where the stripe is hidden and
+  the object's red edge is a ridge too.
 - **A wide, clipped stripe** loses its sub-pixel centre where the albedo
   changes under it (marker edges). This needs exposure control, tuned on real
   frames.

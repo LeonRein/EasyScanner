@@ -43,7 +43,8 @@ pub struct LaserParams {
     pub min_mass: f32,
     pub min_points: usize,
     pub max_points: usize,
-    /// Adaptive threshold as a fraction of the frame's response peak.
+    /// Adaptive threshold as a fraction of the frame's response peak, and
+    /// of its strongest ridge for a scan line's stripe candidate.
     pub frac: f32,
 }
 
@@ -339,13 +340,15 @@ struct Band {
 pub struct LaserDetector {
     resp: Vec<u8>,
     row_cen: Vec<f32>,
-    /// How far each row's stripe candidate stands out of its surroundings
-    /// ([`ScanLine::ridge`]), held against the frame's level.
+    /// How far each row's stripe candidate stands above its background
+    /// ([`ScanLine::ridge`]).
     row_ridge: Vec<u8>,
     bands: Vec<Band>,
     col_val: Vec<u8>,
     col_row: Vec<u32>,
     col_pts: Vec<[f32; 2]>,
+    /// Ridge of each column point's line.
+    col_ridge: Vec<u8>,
     row_pts: Vec<[f32; 2]>,
     pub stats: LaserStats,
 }
@@ -409,7 +412,7 @@ impl LaserDetector {
             .zip(self.row_ridge[y0..y1].par_chunks_mut(band_rows))
             .zip(self.bands[..n_bands].par_iter_mut())
             .enumerate()
-            .for_each(|(bi, (((resp_band, cen_band), peak_band), band))| {
+            .for_each(|(bi, (((resp_band, cen_band), ridge_band), band))| {
                 band.col_val.clear();
                 band.col_val.resize(w, 0);
                 band.col_row.clear();
@@ -421,7 +424,7 @@ impl LaserDetector {
                 let by0 = y0 + bi * band_rows;
                 let ps = f.layout.uv_pixel_stride;
                 for (ri, ((row_out, cen), row_ridge)) in
-                    resp_band.chunks_mut(w).zip(cen_band.iter_mut()).zip(peak_band.iter_mut()).enumerate()
+                    resp_band.chunks_mut(w).zip(cen_band.iter_mut()).zip(ridge_band.iter_mut()).enumerate()
                 {
                     let y = by0 + ri;
                     let (sx0, sx1) = roi.spans[y - roi.y0];
@@ -471,9 +474,12 @@ impl LaserDetector {
                         continue;
                     }
                     let line = ScanLine { lo: sx0, hi: sx1, win, min_mass };
-                    *row_ridge = line.ridge(&|x| row_out[x], best_x);
-                    if let Some(c) = line.centroid(|x| row_out[x], best_x) {
+                    let resp = |x: usize| row_out[x];
+                    if let Some((pk, ridge)) = line.stripe_peak(&resp, best_x, p.thresh)
+                        && let Some(c) = line.centroid(resp, pk)
+                    {
                         *cen = c;
+                        *row_ridge = ridge;
                     }
                 }
             });
@@ -508,28 +514,35 @@ impl LaserDetector {
         }
 
         // ── pass 2: column-axis centroids (the stripe runs left-right) ──
-        // A scan line crosses the stripe only where its peak stands out of
-        // the response on both sides by the level: a reddish surface has a
-        // response of its own, a plateau or a step, not a ridge.
+        // A scan line holds the stripe only at a ridge ([`ScanLine::stripe_peak`]):
+        // a reddish surface has a response of its own, a plateau or a step.
         self.col_pts.clear();
+        self.col_ridge.clear();
         for x in 0..w {
             if self.col_val[x] == 0 {
                 continue;
             }
             let line = ScanLine { lo: y0, hi: y1, win, min_mass };
             let resp = |yy: usize| self.resp[yy * w + x];
-            let peak = self.col_row[x] as usize;
-            if f32::from(line.ridge(&resp, peak)) < level {
-                continue;
-            }
-            if let Some(c) = line.centroid(resp, peak) {
+            if let Some((pk, ridge)) = line.stripe_peak(&resp, self.col_row[x] as usize, p.thresh)
+                && let Some(c) = line.centroid(resp, pk)
+            {
                 self.col_pts.push([x as f32, c]);
+                self.col_ridge.push(ridge);
             }
         }
+        // The lines' ridges are held against the strongest one, not against
+        // the frame's peak response: a saturated object has no ridge, so it
+        // cannot raise the bar for a weak stripe, while the stripe's own
+        // strength drops the faint ridges of an object's texture.
+        let strongest = self.col_ridge.iter().chain(&self.row_ridge[y0..y1]).copied().max().unwrap_or(0);
+        let ridge_level = (p.thresh as f32).max(p.frac * strongest as f32);
+        let mut ridges = self.col_ridge.iter();
+        self.col_pts.retain(|_| ridges.next().is_some_and(|&r| f32::from(r) >= ridge_level));
         self.row_pts.clear();
         for y in y0..y1 {
             let c = self.row_cen[y];
-            if !c.is_nan() && f32::from(self.row_ridge[y]) >= level {
+            if !c.is_nan() && f32::from(self.row_ridge[y]) >= ridge_level {
                 self.row_pts.push([c, y as f32]);
             }
         }
@@ -573,6 +586,9 @@ impl ScanLine {
     const EXTENT_FRACTION: u8 = 4;
     /// Pixels of background kept on each side of the stripe's extent.
     const MARGIN: usize = 2;
+    /// A ridge stands above its background by at least this fraction
+    /// (as a divisor) of its own response.
+    const RIDGE_FRACTION: u8 = 3;
 
     /// Sub-pixel centre of the stripe crossing this line, starting from the
     /// response peak at `peak`: the centroid of the response above the local
@@ -622,14 +638,20 @@ impl ScanLine {
     /// The response the stripe stands on around `peak`: the higher of the
     /// two sides' least responses within `4·win`. On a reddish surface that
     /// is the surface's own response; at the edge of one, the surface side.
+    /// A side cut short by the line's end (less than `win`) may hold nothing
+    /// but the stripe's flank, so it counts only when both sides are short,
+    /// and then the lower one.
     fn background(&self, resp: &impl Fn(usize) -> u8, peak: usize) -> u8 {
         let reach = 4 * self.win;
-        let left = (peak.saturating_sub(reach).max(self.lo)..peak).map(resp).min();
-        let right = (peak + 1..(peak + reach + 1).min(self.hi)).map(resp).min();
-        match (left, right) {
-            (Some(l), Some(r)) => l.max(r),
-            (Some(side), None) | (None, Some(side)) => side,
-            (None, None) => 0,
+        let left = peak.saturating_sub(reach).max(self.lo)..peak;
+        let right = peak + 1..(peak + reach + 1).min(self.hi);
+        let full = |r: &std::ops::Range<usize>| r.len() >= self.win;
+        let least = |r: std::ops::Range<usize>| r.map(resp).min();
+        match (full(&left), full(&right)) {
+            (true, true) => least(left).max(least(right)).unwrap_or(0),
+            (true, false) => least(left).unwrap_or(0),
+            (false, true) => least(right).unwrap_or(0),
+            (false, false) => least(left).into_iter().chain(least(right)).min().unwrap_or(0),
         }
     }
 
@@ -638,6 +660,29 @@ impl ScanLine {
     /// a plateau or a step.
     fn ridge(&self, resp: &impl Fn(usize) -> u8, peak: usize) -> u8 {
         resp(peak).saturating_sub(self.background(resp, peak))
+    }
+
+    /// A ridge at `i`: it stands above its background by `thresh` and by
+    /// [`Self::RIDGE_FRACTION`] of its own response.
+    fn is_ridge(&self, resp: &impl Fn(usize) -> u8, i: usize, thresh: u8) -> bool {
+        let r = self.ridge(resp, i);
+        r >= thresh && r >= resp(i) / Self::RIDGE_FRACTION
+    }
+
+    /// Where this line crosses the stripe, and its [ridge](Self::ridge): its
+    /// highest response `peak` when that is a [ridge](Self::is_ridge), else
+    /// the local maximum that is the most prominent ridge. The highest
+    /// response can sit on a reddish object while the stripe crosses the
+    /// same line elsewhere.
+    fn stripe_peak(&self, resp: &impl Fn(usize) -> u8, peak: usize, thresh: u8) -> Option<(usize, u8)> {
+        if self.is_ridge(resp, peak, thresh) {
+            return Some((peak, self.ridge(resp, peak)));
+        }
+        (self.lo + 1..self.hi.saturating_sub(1))
+            .filter(|&i| resp(i) >= thresh && resp(i) > resp(i - 1) && resp(i) >= resp(i + 1))
+            .filter(|&i| self.is_ridge(resp, i, thresh))
+            .map(|i| (i, self.ridge(resp, i)))
+            .max_by_key(|&(_, r)| r)
     }
 
     /// The contiguous run `a..b` around `peak` where the response stays
@@ -902,23 +947,24 @@ mod tests {
         assert!(stripe_rms(600.0, 0.12, 4.0, 0.0) < 0.5);
     }
 
-    #[test]
-    fn a_reddish_object_is_not_taken_for_the_stripe() {
+    const SCENE_W: usize = 640;
+    const SCENE_H: usize = 160;
+
+    /// A horizontal red stripe of `gain` over the colour `rgb`, centred on
+    /// row `row`, at row `v`.
+    fn stripe(rgb: [f64; 3], v: usize, row: f64, gain: f64) -> [f64; 3] {
+        let g = gain * (-0.5 * ((v as f64 - row) / 1.5).powi(2)).exp();
+        [rgb[0] + g, rgb[1] + 0.12 * g, rgb[2] + 0.12 * g]
+    }
+
+    /// Detect the stripe in a 640×160 scene painted by `paint(u, v)`.
+    fn detect_in(paint: impl Fn(usize, usize) -> [f64; 3]) -> Vec<[f32; 2]> {
         use crate::bench::sim::YuvImage;
-        // a red stripe along row 40 over the left half; a reddish object
-        // (terracotta, chroma ~50) fills the right half's lower rows
-        let (w, h) = (640usize, 160usize);
+        let (w, h) = (SCENE_W, SCENE_H);
         let mut rgb = vec![0u8; w * h * 3];
         for v in 0..h {
             for u in 0..w {
-                let mut px = [120.0f64, 120.0, 120.0];
-                if u >= 320 && v >= 60 {
-                    px = [105.0, 58.0, 52.0];
-                }
-                if u < 320 {
-                    let g = 300.0 * (-0.5 * ((v as f64 - 40.3) / 1.5).powi(2)).exp();
-                    px = [px[0] + g, px[1] + 0.12 * g, px[2] + 0.12 * g];
-                }
+                let px = paint(u, v);
                 for c in 0..3 {
                     rgb[(v * w + u) * 3 + c] = px[c].round().clamp(0.0, 255.0) as u8;
                 }
@@ -926,10 +972,67 @@ mod tests {
         }
         let img = YuvImage::from_rgb(&rgb, w, h);
         let mut out = Vec::new();
-        assert!(LaserDetector::default().detect(&img.frame().unwrap(), &Roi::full(w, h), &LaserParams::default(), &mut out));
-        let stray = out.iter().filter(|q| (q[1] - 40.3).abs() > 1.0).count();
+        LaserDetector::default().detect(&img.frame().unwrap(), &Roi::full(w, h), &LaserParams::default(), &mut out);
+        out
+    }
+
+    const GREY: [f64; 3] = [120.0, 120.0, 120.0];
+    const TERRACOTTA: [f64; 3] = [105.0, 58.0, 52.0];
+    const SATURATED_RED: [f64; 3] = [200.0, 30.0, 30.0];
+
+    fn near_row(out: &[[f32; 2]], row: f32) -> usize {
+        out.iter().filter(|q| (q[1] - row).abs() <= 1.0).count()
+    }
+
+    #[test]
+    fn a_reddish_object_is_not_taken_for_the_stripe() {
+        // the stripe along row 40 over the left half; a reddish object fills
+        // the right half's lower rows
+        let out = detect_in(|u, v| match (u < 320, v >= 60) {
+            (true, _) => stripe(GREY, v, 40.3, 300.0),
+            (false, true) => TERRACOTTA,
+            (false, false) => GREY,
+        });
+        assert!(!out.is_empty());
+        let stray = out.len() - near_row(&out, 40.3);
         assert_eq!(stray, 0, "{stray} of {} points on the object", out.len());
         assert!(out.iter().all(|q| q[0] < 330.0));
+    }
+
+    #[test]
+    fn a_saturated_object_elsewhere_does_not_drown_a_weak_stripe() {
+        // a weak stripe on a bright surface has little saturation; a
+        // saturated red object in a corner sets a far higher frame peak
+        let out = detect_in(|u, v| match (u >= 560 && v >= 120, v < 80) {
+            (true, _) => SATURATED_RED,
+            (false, true) => stripe([180.0; 3], v, 40.3, 120.0),
+            (false, false) => [180.0; 3],
+        });
+        assert!(near_row(&out, 40.3) >= 300, "{} stripe points", near_row(&out, 40.3));
+    }
+
+    #[test]
+    fn the_stripe_is_found_in_a_column_whose_highest_response_is_an_object() {
+        // the object below the stripe responds more than the stripe does
+        let out = detect_in(|u, v| {
+            let surface = if u >= 480 && v >= 100 { SATURATED_RED } else { GREY };
+            stripe(surface, v, 40.3, 200.0)
+        });
+        // the output is thinned evenly: the object's quarter of the columns
+        // should hold a quarter of the stripe points
+        let in_object_columns = out.iter().filter(|q| q[0] >= 480.0 && (q[1] - 40.3).abs() <= 1.0).count();
+        let all = near_row(&out, 40.3);
+        assert!(in_object_columns * 4 >= all * 9 / 10, "{in_object_columns} of {all} points under the object");
+    }
+
+    #[test]
+    fn a_stripe_at_the_frame_edge_is_found() {
+        // two rows from the edge: the side cut short holds only the stripe's
+        // flank and must not count as its background (closer still, the
+        // centroid has no floor on that side and drops the line)
+        let free = near_row(&detect_in(|_, v| stripe(GREY, v, 80.3, 300.0)), 80.3);
+        let edge = near_row(&detect_in(|_, v| stripe(GREY, v, 157.6, 300.0)), 157.6);
+        assert!(edge * 10 >= free * 9, "{edge} points at the edge, {free} in the middle");
     }
 
     #[test]

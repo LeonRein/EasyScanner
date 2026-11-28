@@ -313,9 +313,14 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 }
             }
         }
-        if (r.events() and (Ev.INTRINSICS_SAVED or Ev.PLANE_SAVED) != 0) {
-            // a re-done calibration step is complete: the guided flow moves on
-            main.post { wizard.completed(currentReadiness()) }
+        val saved = r.events() and (Ev.INTRINSICS_SAVED or Ev.PLANE_SAVED)
+        if (saved != 0) {
+            val rms = r[H.CALIB_RMS]
+            main.post {
+                // a calibration step is complete: say so, as the guided flow moves on to the next step
+                showNote(savedNote(saved, rms))
+                wizard.completed(currentReadiness())
+            }
         }
         b.overlay.postInvalidateOnAnimation()
         if (hudPending.compareAndSet(false, true)) {
@@ -324,6 +329,22 @@ class MainActivity : AppCompatActivity(), FrameProcessor.Listener {
                 renderHud()
             }, HUD_PERIOD_MS)
         }
+    }
+
+    /** What a calibration that was just saved ([events] bits) means, and what comes next. */
+    private fun savedNote(events: Int, rms: Float): String {
+        val camera = events and Ev.INTRINSICS_SAVED != 0
+        val what = if (camera) {
+            if (rms.isNaN()) getString(R.string.note_camera_saved) else getString(R.string.note_camera_saved_rms, rms)
+        } else {
+            getString(R.string.note_laser_saved)
+        }
+        val next = when {
+            expert -> null
+            camera -> getString(R.string.note_next_laser)
+            else -> getString(R.string.note_next_scan)
+        }
+        return listOfNotNull(what, next).joinToString(" ")
     }
 
     override fun onPhotoDue() {

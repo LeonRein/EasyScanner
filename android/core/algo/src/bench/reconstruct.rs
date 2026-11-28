@@ -18,7 +18,7 @@ use crate::rolling::{Correction, solve_corrected};
 use crate::stripe;
 use crate::volume::Volume;
 
-use super::pnp;
+use crate::pnp;
 
 /// Where a frame's pose comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

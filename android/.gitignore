@@ -9,6 +9,8 @@ captures/
 
 # Rust build output
 core/target/
+# engine e2e test scratch directories (cargo test on the host)
+core/android/e2e_*/
 
 # Local machine config (SDK path, libclang) — generated per machine
 local.properties

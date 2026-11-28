@@ -3,8 +3,9 @@
 //! through `Engine::process` as YUV 4:2:0, and the recovered pose,
 //! intrinsics and laser plane are checked against the truth.
 //!
-//! They need `libopencv_java4.so`, so they run on an Android device or
-//! emulator (see README → Toolchain), not on the host.
+//! They need OpenCV with the objdetect module (4.7 or later): on an Android
+//! device or emulator, or on the host against a local build (see README →
+//! Toolchain).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -13,7 +14,8 @@ use std::time::{Duration, Instant};
 use opencv::core::{self, Mat, Scalar, Size};
 use opencv::imgproc;
 use opencv::prelude::*;
-use scan_algo::config::{self, BoardSpec};
+use scan_algo::board_surface::BoardSurface;
+use scan_algo::config::{self, BoardSpec, IntrinsicsFile};
 use scan_algo::gate::Reject;
 use scan_algo::geom::{Intrinsics, M3, Pose, V3, dot, mat_mul, mat_vec, normalize, rodrigues, sub};
 use scan_algo::laser::{YuvFrame, YuvLayout};
@@ -22,6 +24,7 @@ use scan_algo::rolling::RowClock;
 use crate::board::make_board;
 use crate::engine::{Engine, cmd};
 use crate::frame_out::{ev, h, photo_state};
+use scan_algo::surface_monitor::SurfaceState;
 
 const W: usize = 1280;
 const H: usize = 960;
@@ -131,6 +134,36 @@ impl Renderer {
     }
 }
 
+impl Renderer {
+    /// Grey frame of a board bent to `surface` at `pose`: every pixel's ray
+    /// is met with the surface and samples the board image there.
+    fn render_warped(&self, k: &Intrinsics, pose: &Pose, surface: &BoardSurface) -> Yuv {
+        let (w, hh) = (k.width as usize, k.height as usize);
+        let s = BOARD_PX as f64 / spec().width_mm();
+        let mut map_x = Mat::new_rows_cols_with_default(hh as i32, w as i32, core::CV_32FC1, Scalar::all(-1.0)).unwrap();
+        let mut map_y = map_x.clone();
+        for y in 0..hh {
+            for x in 0..w {
+                if let Some((_, b)) = surface.intersect(pose, k.ray(x as f64, y as f64)) {
+                    *map_x.at_2d_mut::<f32>(y as i32, x as i32).unwrap() = (b[0] * s) as f32;
+                    *map_y.at_2d_mut::<f32>(y as i32, x as i32).unwrap() = (b[1] * s) as f32;
+                }
+            }
+        }
+        let mut warped = Mat::default();
+        imgproc::remap(&self.board_img, &mut warped, &map_x, &map_y, imgproc::INTER_LINEAR, core::BORDER_CONSTANT, Scalar::all(110.0))
+            .unwrap();
+        let gray = warped.data_typed::<u8>().unwrap();
+        let rgb: Vec<u8> = gray.iter().flat_map(|&g| [g, g, g]).collect();
+        Yuv::from_rgb(&rgb, w, hh)
+    }
+}
+
+/// A board that does not lie flat: 1.5 mm of sag in the middle and a twist.
+fn bent_board() -> BoardSurface {
+    BoardSurface::for_board(spec().width_mm(), spec().height_mm(), 3).with_coeffs(vec![-1.5, 0.5, -1.2, 0.0, 0.15, 0.0, -0.1]).unwrap()
+}
+
 /// Camera-ISP-like YUV 4:2:0 (JFIF matrix, 2x2-averaged chroma).
 struct Yuv {
     w: usize,
@@ -190,12 +223,18 @@ fn engine(name: &str, guess: Intrinsics) -> (Engine, PathBuf) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut e = Engine::new(dir.clone()).unwrap();
+    configure(&mut e, guess, "");
+    (e, dir)
+}
+
+/// The test camera with `guess` as its estimate, plus `extra` top-level
+/// settings (`,"key":value…`).
+fn configure(e: &mut Engine, guess: Intrinsics, extra: &str) {
     let cfg = format!(
-        r#"{{"camera":{{"id":"test","guess":{{"fx":{},"fy":{},"cx":{},"cy":{},"dist":[0,0,0,0,0],"width":{},"height":{}}}}}}}"#,
+        r#"{{"camera":{{"id":"test","guess":{{"fx":{},"fy":{},"cx":{},"cy":{},"dist":[0,0,0,0,0],"width":{},"height":{}}}}}{extra}}}"#,
         guess.fx, guess.fy, guess.cx, guess.cy, guess.width, guess.height
     );
     e.configure(&cfg).unwrap();
-    (e, dir)
 }
 
 /// A spread of viewpoints: distances, tilts about both board axes, spins.
@@ -416,6 +455,9 @@ fn photo_keyframes_carry_the_pose_of_their_exposure() {
 fn failing_photos_stop_the_photos_not_the_session() {
     let k = truth_k();
     let (mut e, dir) = engine("photo_fail", k);
+    // a recorded session is kept even when it caught nothing (it is the one
+    // worth replaying); without a recording it is removed
+    configure(&mut e, k, r#","record_sessions":false"#);
     // a directory that already holds a session is never written into
     let taken = dir.join("session");
     std::fs::create_dir_all(&taken).unwrap();
@@ -528,4 +570,139 @@ fn gyro_and_row_timing_reach_the_pose() {
     let got = [out[h::CAM_X] as f64, out[h::CAM_Y] as f64, out[h::CAM_Z] as f64];
     let err = scan_algo::geom::norm(sub(got, p.camera_position()));
     assert!(err < 1.5, "a correction for no motion moved the camera by {err:.2} mm");
+}
+
+/// The truth K saved as this camera's calibration, so the engine trusts it.
+fn calibrated(e: &mut Engine, dir: &std::path::Path, k: Intrinsics) {
+    let file = IntrinsicsFile {
+        fx: k.fx,
+        fy: k.fy,
+        cx: k.cx,
+        cy: k.cy,
+        dist: k.dist.to_vec(),
+        calibrated: true,
+        width: k.width as u32,
+        height: k.height as u32,
+        camera_id: Some("test".into()),
+        focus_diopters: None,
+        rms_px: Some(0.1),
+    };
+    config::save_intrinsics(dir, &file).unwrap();
+    configure(e, k, "");
+}
+
+/// Steady views of the board from a ring of directions, each held long
+/// enough for the scan gate to call it steady, then the same frame until
+/// the shape monitor reaches `until` (its fits run on their own thread).
+/// Returns the last frame's result and every shape state seen on the way.
+fn hold_views(e: &mut Engine, r: &Renderer, k: &Intrinsics, surface: &BoardSurface, until: SurfaceState) -> (Vec<f32>, Vec<i32>) {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    let note = |out: &[f32], seen: &mut Vec<i32>| {
+        let s = out[h::SURFACE_STATE] as i32;
+        if seen.last() != Some(&s) {
+            seen.push(s);
+        }
+    };
+    for (i, tilt) in [0.3, 0.45, 0.6].into_iter().enumerate() {
+        for j in 0..8 {
+            let phi = std::f64::consts::TAU * (j as f64 + 0.33 * i as f64) / 8.0;
+            let p = pose(520.0, tilt * phi.cos(), tilt * phi.sin(), 0.3 * phi.sin(), [0.0, 0.0]);
+            let yuv = r.render_warped(k, &p, surface);
+            for _ in 0..10 {
+                out = step(e, &yuv);
+                note(&out, &mut seen);
+            }
+        }
+    }
+    let last = r.render_warped(k, &pose(520.0, 0.3, 0.0, 0.0, [0.0, 0.0]), surface);
+    // wall time, not frames: the fit thread competes with the other tests
+    let start = Instant::now();
+    while !seen.contains(&(until as i32)) && start.elapsed() < Duration::from_secs(30) {
+        out = step(e, &last);
+        note(&out, &mut seen);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (out, seen)
+}
+
+#[test]
+fn a_bent_board_is_measured_and_a_moved_one_noticed() {
+    let k = truth_k();
+    let (mut e, dir) = engine("surface", k);
+    calibrated(&mut e, &dir, k);
+    let r = Renderer::new();
+    let bent = bent_board();
+    let (bw, bh) = (spec().width_mm(), spec().height_mm());
+
+    // steady frames of the bent board measure it, with nothing to start
+    let (out, seen) = hold_views(&mut e, &r, &k, &bent, SurfaceState::Verified);
+    assert!(seen.contains(&(SurfaceState::Verified as i32)), "{seen:?}: {}", e.messages());
+    let saved = config::load_surface(&dir, &spec()).expect("the shape is saved");
+    let err = saved.surface.max_difference(&bent, bw, bh);
+    eprintln!(
+        "measured p-v {:.2} mm (truth {:.2}), off by {err:.3} mm, sigma {:.3} mm",
+        out[h::SURFACE_PV_MM],
+        bent.peak_to_valley(bw, bh),
+        out[h::SURFACE_SIGMA_MM]
+    );
+    assert!(err < 0.15, "shape off by {err:.3} mm");
+    // the pose is solved on it: the corners fit as well as on a flat board
+    assert!(out[h::REPROJ_RMS] < 0.5, "rms {} px", out[h::REPROJ_RMS]);
+
+    // the board laid down anew, flat this time: doubted, then re-measured
+    let flat = BoardSurface::flat();
+    // The first fit after the move mixes views of both placements and
+    // raises the doubt; it drops the views, so later fits see the flat board
+    // only. A replacement needs two of them that agree: up to three rounds.
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.extend(hold_views(&mut e, &r, &k, &flat, SurfaceState::Replaced).1);
+        if seen.contains(&(SurfaceState::Replaced as i32)) {
+            break;
+        }
+    }
+    eprintln!("states after the move: {seen:?}");
+    let doubted = seen.iter().position(|&s| s == SurfaceState::Measuring as i32);
+    let replaced = seen.iter().position(|&s| s == SurfaceState::Replaced as i32);
+    assert!(matches!((doubted, replaced), (Some(a), Some(b)) if a < b), "{seen:?}: {}", e.messages());
+    // flat within the fit's noise (sigma ~0.13 mm), and clearly not the old shape
+    let replaced = config::load_surface(&dir, &spec()).unwrap();
+    let (pv, from_old) = (replaced.surface.peak_to_valley(bw, bh), replaced.surface.max_difference(&bent, bw, bh));
+    eprintln!("replaced: p-v {pv:.3} mm, sigma {:.3} mm, {from_old:.2} mm from the old shape", replaced.height_sigma_mm);
+    assert!(pv < 0.3 && from_old > 1.0, "p-v {pv:.3} mm, {from_old:.2} mm from the old shape");
+}
+
+#[test]
+fn the_camera_calibration_measures_a_bent_board() {
+    let k = truth_k();
+    let guess = Intrinsics { fx: k.fx * 1.08, fy: k.fy * 1.08, ..k };
+    let (mut e, dir) = engine("calib_bent", guess);
+    e.command(cmd::CALIB_START, "");
+    let r = Renderer::new();
+    let bent = bent_board();
+    let frames: Vec<Yuv> = viewpoints(96).iter().map(|p| r.render_warped(&k, p, &bent)).collect();
+    let start = Instant::now();
+    let mut saved = false;
+    'outer: while start.elapsed() < Duration::from_secs(60) {
+        for yuv in &frames {
+            let out = step(&mut e, yuv);
+            if out[h::EVENTS] as u32 & ev::INTRINSICS_SAVED != 0 {
+                saved = true;
+                break 'outer;
+            }
+            if e.messages().contains("solving") {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    assert!(saved, "calibration never saved: {}", e.messages());
+    let f = config::load_intrinsics(&dir, "test").unwrap();
+    eprintln!("calibrated fx {:.2} fy {:.2} cx {:.2} cy {:.2} rms {:?}", f.fx, f.fy, f.cx, f.cy, f.rms_px);
+    assert!((f.fx / k.fx - 1.0).abs() < 0.005 && (f.fy / k.fy - 1.0).abs() < 0.005, "fx {} fy {}", f.fx, f.fy);
+    let (bw, bh) = (spec().width_mm(), spec().height_mm());
+    let measured = config::load_surface(&dir, &spec()).expect("the calibration measured the board");
+    let err = measured.surface.max_difference(&bent, bw, bh);
+    eprintln!("shape off by {err:.3} mm, sigma {:.3} mm", measured.height_sigma_mm);
+    assert!(err < 0.15, "shape off by {err:.3} mm");
 }

@@ -1,51 +1,57 @@
-//! Turning detected stripe pixels into 3-D points: onto the board plane (for
-//! the viewfinder read-out and the laser-plane calibration) and onto the
+//! Turning detected stripe pixels into 3-D points: onto the board surface
+//! (for the viewfinder read-out and the laser-plane calibration) and onto the
 //! calibrated laser plane (the scan).
 
-use crate::geom::{Intrinsics, Pose, V3, dot, ray_plane};
+use crate::board_surface::BoardSurface;
+use crate::geom::{Intrinsics, Pose, V3, ray_plane};
 use crate::rolling::Correction;
 use crate::volume::Volume;
 
 /// The stripe reconstructed onto the board, with a robust straight-line fit —
-/// the laser on a flat board IS a line, so the clean fit is drawn instead of
-/// the noisy per-pixel polyline.
+/// seen from above, the laser on a (nearly) flat board is a line, so the clean
+/// fit is drawn instead of the noisy per-pixel polyline.
 #[derive(Clone, Debug, Default)]
 pub struct BoardStripe {
     /// Camera frame, mm.
     pub cam_pts: Vec<V3>,
-    /// Board frame, mm (z ≈ 0).
+    /// Board frame, mm, on the board surface.
     pub board_pts: Vec<V3>,
     pub fit_a: [f64; 2],
     pub fit_b: [f64; 2],
     pub mean: [f64; 2],
     pub angle_deg: f64,
     pub length_mm: f64,
-    /// Off-plane residual (≈ 0 by construction).
+    /// Off-surface residual (≈ 0 by construction).
     pub plane_rms_mm: f64,
 }
 
-/// Intersect each pixel's camera ray with the board plane, keep hits inside
-/// the volume footprint (grazing rays meet the infinite plane far away), and
-/// fit the line with a median-based outlier pass. `None` when fewer than two
-/// points survive.
+/// Intersect each pixel's camera ray with the board `surface` (its measured
+/// height profile, or [`BoardSurface::flat`]), keep hits inside the volume
+/// footprint (grazing rays meet the surface far away), and fit the line with
+/// a median-based outlier pass. `None` when fewer than two points survive.
 ///
 /// `pose` is the frame's pose at its reference instant. With a
 /// rolling-shutter `corr`ection each pixel is intersected with the board as
 /// its own row saw it, and its camera point stays in that row's frame —
 /// the frame the laser, rigid to the camera, is calibrated in.
-pub fn on_board(pixels: &[[f32; 2]], k: &Intrinsics, pose: &Pose, corr: Option<&Correction>, vol: &Volume) -> Option<BoardStripe> {
+pub fn on_board(
+    pixels: &[[f32; 2]],
+    k: &Intrinsics,
+    pose: &Pose,
+    corr: Option<&Correction>,
+    surface: &BoardSurface,
+    vol: &Volume,
+) -> Option<BoardStripe> {
     let mut cam_pts = Vec::with_capacity(pixels.len());
     let mut board_pts = Vec::with_capacity(pixels.len());
     for &[u, v] in pixels {
         let (u, v) = (f64::from(u), f64::from(v));
         let row_pose = corr.map_or(*pose, |c| c.pose_at_row(pose, v));
-        let n = row_pose.board_normal();
-        if let Some(x) = ray_plane(k.ray(u, v), n, dot(n, row_pose.t)) {
-            let b = row_pose.to_board(x);
-            if vol.in_footprint(b) {
-                cam_pts.push(x);
-                board_pts.push(b);
-            }
+        if let Some((x, b)) = surface.intersect(&row_pose, k.ray(u, v))
+            && vol.in_footprint(b)
+        {
+            cam_pts.push(x);
+            board_pts.push(b);
         }
     }
     if board_pts.len() < 2 {
@@ -72,7 +78,7 @@ pub fn on_board(pixels: &[[f32; 2]], k: &Intrinsics, pose: &Pose, corr: Option<&
         lo = lo.min(t);
         hi = hi.max(t);
     }
-    let plane_rms_mm = (board_pts.iter().map(|b| b[2] * b[2]).sum::<f64>() / board_pts.len() as f64).sqrt();
+    let plane_rms_mm = (board_pts.iter().map(|b| (b[2] - surface.height(b[0], b[1])).powi(2)).sum::<f64>() / board_pts.len() as f64).sqrt();
     Some(BoardStripe {
         fit_a: [mean[0] + dir[0] * lo, mean[1] + dir[1] * lo],
         fit_b: [mean[0] + dir[0] * hi, mean[1] + dir[1] * hi],
@@ -120,7 +126,7 @@ pub fn to_laser_plane(pixels: &[[f32; 2]], k: &Intrinsics, n: V3, d: f64, mut hi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom::rodrigues;
+    use crate::geom::{dot, rodrigues};
 
     fn setup() -> (Intrinsics, Pose, Volume) {
         let k = Intrinsics { fx: 900.0, fy: 900.0, cx: 480.0, cy: 360.0, dist: [0.02, -0.01, 0.0, 0.0, 0.0], width: 960.0, height: 720.0 };
@@ -140,13 +146,31 @@ mod tests {
                 k.project(pose.to_cam(p)).map(|q| [q[0] as f32, q[1] as f32])
             })
             .collect();
-        let s = on_board(&pixels, &k, &pose, None, &vol).unwrap();
+        let s = on_board(&pixels, &k, &pose, None, &BoardSurface::flat(), &vol).unwrap();
         let ang = (b[1] - a[1]).atan2(b[0] - a[0]).to_degrees();
         let da = (s.angle_deg - ang).rem_euclid(180.0);
         assert!(!(0.05..=179.95).contains(&da), "angle {} vs {}", s.angle_deg, ang);
         let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
         assert!((s.length_mm - len).abs() < 0.2, "length {} vs {len}", s.length_mm);
         assert!(s.plane_rms_mm < 1e-6);
+    }
+
+    #[test]
+    fn stripe_lands_on_a_warped_board() {
+        let (k, pose, vol) = setup();
+        let surface = BoardSurface::for_board(288.0, 288.0, 2).with_coeffs(vec![-1.5, 0.3, -1.0]).unwrap();
+        let truth: Vec<V3> = (0..=60).map(|i| surface.point(40.0 + 3.5 * f64::from(i), 140.0)).collect();
+        let pixels: Vec<[f32; 2]> = truth.iter().filter_map(|&p| k.project(pose.to_cam(p)).map(|q| [q[0] as f32, q[1] as f32])).collect();
+        let s = on_board(&pixels, &k, &pose, None, &surface, &vol).unwrap();
+        // f32 pixels limit the round trip to ~1e-4 px, a few µm on the board
+        for (b, p) in s.board_pts.iter().zip(&truth) {
+            assert!(crate::geom::norm(crate::geom::sub(*b, *p)) < 0.01, "{b:?} vs {p:?}");
+        }
+        // the flat model puts the same pixels where the rays meet z = 0: the
+        // points the laser-plane calibration gets are off by the sag
+        let flat = on_board(&pixels, &k, &pose, None, &BoardSurface::flat(), &vol).unwrap();
+        let worst = flat.board_pts.iter().zip(&truth).map(|(b, p)| crate::geom::norm(crate::geom::sub(*b, *p))).fold(0.0, f64::max);
+        assert!(worst > 0.3, "a flat model misplaces the stripe by {worst:.2} mm");
     }
 
     #[test]

@@ -11,8 +11,9 @@ use crate::geom::{V3, dot, norm, rotation_distance, sub};
 
 use crate::imu::MountSource;
 
-use super::pnp::{pose_error, solve_dense};
 use super::reconstruct::Reconstruction;
+use crate::linalg::solve_dense;
+use crate::pnp::pose_error;
 use crate::recording::Recording;
 
 use super::scene::Shape;

@@ -26,7 +26,6 @@
 //! scan_bench -- sweep`.
 
 pub mod metrics;
-pub mod pnp;
 pub mod reconstruct;
 pub mod scene;
 pub mod sim;
@@ -36,11 +35,13 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use crate::board_surface::BoardSurface;
 use crate::fusion::FusionCfg;
 use crate::gate::ScanGateCfg;
 use crate::geom::{Intrinsics, Pose, V3, dot, mat_vec, rodrigues};
 use crate::plane::Rng;
 use crate::plane::{PlaneCalibrator, PlaneFit};
+use crate::pnp;
 use crate::recording::{BoardDims, CameraModel, CornerRec, FrameRec, Header, PlaneRec, Recording, Setup, VolumeDims};
 use crate::stripe;
 
@@ -239,7 +240,7 @@ pub fn calibrate_plane(cfg: &BenchCfg, frames: usize, min_lines: usize) -> Resul
         let truth = calibration_pose(&cfg.board, i);
         let obs = cam.observe(&|_| truth, 0.0);
         let Some(pose) = solve_corners(&cfg.board, &k_est, &obs.corners) else { continue };
-        if let Some(s) = stripe::on_board(&obs.laser_px, &k_est, &pose, None, &vol) {
+        if let Some(s) = stripe::on_board(&obs.laser_px, &k_est, &pose, None, &BoardSurface::flat(), &vol) {
             let n = cal.add(&s.cam_pts);
             if cal.ready() && n != solved_at {
                 solved_at = n;
@@ -312,7 +313,7 @@ pub fn simulate(cfg: &BenchCfg) -> Result<Synthetic, String> {
             fusion: cfg.fusion,
             scan_gate: ScanGateCfg::default(),
         },
-        setups: vec![(0, Setup { intrinsics: cfg.intrinsics_error.apply(cfg.camera), laser_plane: Some(used) })],
+        setups: vec![(0, Setup { intrinsics: cfg.intrinsics_error.apply(cfg.camera), laser_plane: Some(used), board_surface: None })],
         frames,
         gyro,
     };

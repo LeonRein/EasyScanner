@@ -214,7 +214,7 @@ mod tests {
     }
 
     pub(crate) fn setup(d: f64) -> Setup {
-        Setup { intrinsics: CameraModel::default(), laser_plane: Some(PlaneRec { n: [0.0, -0.6, 0.8], d }) }
+        Setup { intrinsics: CameraModel::default(), laser_plane: Some(PlaneRec { n: [0.0, -0.6, 0.8], d }), board_surface: None }
     }
 
     pub(crate) fn frame(ts_ns: i64) -> FrameRec<'static> {

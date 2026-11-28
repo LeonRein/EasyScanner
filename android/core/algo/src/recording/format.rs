@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
+use crate::board_surface::BoardSurface;
 use crate::config::{BoardSpec, VolumeCfg};
 use crate::fusion::FusionCfg;
 use crate::gate::{Reject, ScanGateCfg};
@@ -33,13 +34,16 @@ pub struct Header {
 
 /// The calibration the frames after it were processed with. A new one is
 /// written whenever the device (re)loads its calibration.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Setup {
     /// The camera calibration, at its own size; each frame scales it to its
     /// size ([`Intrinsics::for_frame`]).
     pub intrinsics: CameraModel,
     /// The laser plane; `None` while the device had no usable one.
     pub laser_plane: Option<PlaneRec>,
+    /// The board's measured shape; `None` while it was taken as flat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_surface: Option<BoardSurface>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

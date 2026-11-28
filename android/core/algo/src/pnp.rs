@@ -1,44 +1,18 @@
-//! Planar PnP in pure Rust: homography initialisation, then Levenberg–
-//! Marquardt on the full reprojection error through the distortion model.
+//! PnP in pure Rust: Levenberg–Marquardt on the full reprojection error
+//! through the distortion model ([`refine`]), and a homography
+//! initialisation for a planar target ([`solve_planar`]).
 //!
-//! The app gets its pose from OpenCV (`solvePnPGeneric` with IPPE in
-//! `easyscanner-core/src/board.rs`). This solver reaches the same
-//! least-squares optimum for a planar target, so the benchmark measures how
+//! The app finds the pose and its branch with OpenCV's IPPE
+//! (`easyscanner-core/src/board.rs`), which is closed-form and assumes a
+//! flat board, then refines it here against the board's measured shape
+//! ([`crate::board_surface`]). The benchmark solves from scratch with
+//! [`solve_planar`]: the same least-squares optimum, so it measures how
 //! corner noise, occlusion and rolling shutter propagate into the pose
 //! without needing OpenCV on the host. It does not model IPPE's flip
 //! ambiguity.
 
 use crate::geom::{Intrinsics, M3, Pose, V3, mat_mul, nearest_rotation, rodrigues};
-
-/// Solve the dense `n×n` system `a·x = b` by Gaussian elimination with
-/// partial pivoting. `None` when singular.
-#[allow(clippy::needless_range_loop)]
-pub fn solve_dense(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
-    let n = b.len();
-    for c in 0..n {
-        let p = (c..n).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs()))?;
-        if a[p][c].abs() < 1e-300 {
-            return None;
-        }
-        a.swap(c, p);
-        b.swap(c, p);
-        for r in c + 1..n {
-            let f = a[r][c] / a[c][c];
-            if f != 0.0 {
-                for k in c..n {
-                    a[r][k] -= f * a[c][k];
-                }
-                b[r] -= f * b[c];
-            }
-        }
-    }
-    let mut x = vec![0.0; n];
-    for r in (0..n).rev() {
-        let s: f64 = (r + 1..n).map(|k| a[r][k] * x[k]).sum();
-        x[r] = (b[r] - s) / a[r][r];
-    }
-    x.iter().all(|v| v.is_finite()).then_some(x)
-}
+use crate::linalg::solve_dense;
 
 /// Similarity that maps points to zero mean and √2 mean distance (Hartley).
 fn normaliser(pts: impl Iterator<Item = [f64; 2]> + Clone) -> (f64, f64, f64) {
@@ -209,12 +183,6 @@ mod tests {
 
     fn k() -> Intrinsics {
         Intrinsics { fx: 920.0, fy: 925.0, cx: 641.0, cy: 478.0, dist: [0.06, -0.12, 0.001, -0.0005, 0.02], width: 1280.0, height: 960.0 }
-    }
-
-    #[test]
-    fn dense_solver() {
-        let x = solve_dense(vec![vec![2.0, 1.0], vec![1.0, 3.0]], vec![3.0, 5.0]).unwrap();
-        assert!((x[0] - 0.8).abs() < 1e-12 && (x[1] - 1.4).abs() < 1e-12);
     }
 
     #[test]

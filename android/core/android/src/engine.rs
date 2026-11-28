@@ -37,7 +37,7 @@ use scan_algo::volume::Volume;
 use serde::Deserialize;
 
 use crate::board::{BoardTracker, PoseResult, corner_bbox, distance};
-use crate::calib::{CalibState, LiveCalibrator, Outcome};
+use crate::calib::{CalibState, Calibration, LiveCalibrator, Outcome};
 use crate::frame_out::{FrameOut, ev, h, laser_state, layer, photo_state};
 use crate::surface::{Settled, SurfaceTracker};
 
@@ -480,9 +480,16 @@ impl Engine {
             self.surface_settled(settled);
         }
 
-        // ── live intrinsics calibration: every genuinely new view ──
+        // ── live intrinsics calibration: every genuinely new, steady view ──
+        // (blur and the rolling shutter's shear would go into K)
+        let steady = self.cfg.scan_gate.check_motion(speed).is_ok();
         if self.calib_active && pose_res.is_some() && !self.calib.solving() {
-            if self.calib.capture(&self.tracker.corners, &self.tracker.ids, (w, hgt)) {
+            if !steady {
+                if self.calib.count() < self.calib.target && !self.msgs.calib.starts_with("hold") {
+                    self.msgs.calib = format!("hold the phone steadier — {}/{} views", self.calib.count(), self.calib.target);
+                    self.events |= ev::MESSAGES;
+                }
+            } else if self.calib.capture(&self.tracker.corners, &self.tracker.ids, (w, hgt)) {
                 let (n, t) = (self.calib.count(), self.calib.target);
                 self.msgs.calib = if n < t {
                     format!("collecting {n}/{t} — move the phone around the board")
@@ -564,7 +571,7 @@ impl Engine {
         let classified = !self.plane_active && plane.is_some() && pose.is_some() && found;
         if let (true, Some((n, d)), Some(p)) = (classified, plane, pose) {
             let mut inside = vec![false; self.laser_px.len()];
-            let mut pushed = false;
+            let (mut pushed, mut full) = (false, false);
             // a frame that fails the gate is classified and shown, never kept
             let keep = self.scan_on && scan_verdict == Some(Ok(()));
             let (cloud, px, scan_on, surface) = (&mut self.cloud, &self.laser_px, keep, self.surface.surface());
@@ -576,12 +583,21 @@ impl Engine {
                     inside[i] = true;
                     if scan_on {
                         let (u, v) = (px[i][0].round() as usize, px[i][1].round() as usize);
-                        cloud.push(b, f.rgb_at(u, v));
-                        pushed = true;
+                        if cloud.push(b, f.rgb_at(u, v)) {
+                            pushed = true;
+                        } else {
+                            full = true;
+                        }
                     }
                 }
             });
             self.cloud_unsaved |= pushed;
+            if full {
+                // stop rather than drop points unnoticed; the UI sees SCAN_ON fall
+                self.scan_on = false;
+                self.events |= ev::MESSAGES;
+                self.msgs.scan = format!("scan stopped: the point cloud is full ({} points) — export or clear it", self.cloud.len());
+            }
             if self.scan_on
                 && inside.iter().any(|&i| i)
                 && let Some(v) = scan_verdict
@@ -658,7 +674,8 @@ impl Engine {
 
     fn poll_calibration(&mut self) {
         match self.calib.poll() {
-            Some(Outcome::Solved { k, rms, surface }) => {
+            Some(Outcome::Solved(c)) => {
+                let Calibration { k, rms, sigma, dropped, surface } = *c;
                 let file = IntrinsicsFile {
                     fx: k.fx,
                     fy: k.fy,
@@ -671,6 +688,7 @@ impl Engine {
                     camera_id: Some(self.cfg.camera.id.clone()),
                     focus_diopters: self.cfg.camera.focus_diopters,
                     rms_px: Some(rms),
+                    sigma_px: Some(sigma),
                 };
                 let saved = config::save_intrinsics(&self.dir, &file);
                 self.k_base = k;
@@ -680,7 +698,10 @@ impl Engine {
                 self.calib.reset();
                 self.calib_state = CalibState::Saved;
                 self.msgs.calib = match saved {
-                    Ok(()) => format!("SAVED | fx {:.0} cx {:.0} rms {rms:.2}px", k.fx, k.cx),
+                    Ok(()) => {
+                        let outliers = if dropped > 0 { format!(", {dropped} poor views dropped") } else { String::new() };
+                        format!("SAVED | fx {:.0} ±{:.1} cx {:.0} ±{:.1} rms {rms:.2}px{outliers}", k.fx, sigma[0], k.cx, sigma[2])
+                    }
                     Err(e) => format!("solved (rms {rms:.2}px) but NOT saved: {e}"),
                 };
                 self.events |= ev::MESSAGES | ev::INTRINSICS_SAVED;

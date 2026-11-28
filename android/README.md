@@ -311,7 +311,7 @@ local build of OpenCV's `core,imgproc,calib3d,features2d,flann,objdetect`:
 export OPENCV_LINK_LIBS=opencv_core,opencv_imgproc,opencv_calib3d,opencv_features2d,opencv_flann,opencv_objdetect
 export OPENCV_LINK_PATHS=<prefix>/lib OPENCV_INCLUDE_PATHS=<prefix>/include/opencv4
 export LD_LIBRARY_PATH=<prefix>/lib
-cd core && cargo test --release -p easyscanner-core
+cd core && cargo test -p easyscanner-core
 ```
 
 On a device or emulator: build the test binary with the same environment

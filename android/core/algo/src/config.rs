@@ -269,6 +269,9 @@ pub struct IntrinsicsFile {
     pub focus_diopters: Option<f64>,
     #[serde(default)]
     pub rms_px: Option<f64>,
+    /// Standard deviations of fx, fy, cx, cy (px), when the solve gave them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigma_px: Option<[f64; 4]>,
 }
 
 impl IntrinsicsFile {
@@ -451,6 +454,7 @@ mod tests {
             camera_id: Some("0".into()),
             focus_diopters: Some(4.0),
             rms_px: Some(0.4),
+            sigma_px: Some([1.2, 1.1, 0.8, 0.9]),
         };
         save_intrinsics(&dir, &file).unwrap();
         let back = load_intrinsics(&dir, "0").unwrap();
